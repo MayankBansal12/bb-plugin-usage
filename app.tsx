@@ -71,6 +71,7 @@ type HeaderControlsState = {
   dateLabel: string;
   syncing: boolean;
   lastSyncedAt: string | null;
+  stackedView: boolean;
   setMachine: (value: string) => void;
   setRange: (value: Range) => void;
   sync: () => void;
@@ -167,14 +168,20 @@ function ToggleGroup<T extends string | number>({
   options,
   onChange,
   label,
+  fill = false,
 }: {
   value: T;
   options: Array<{ value: T; label: string }>;
   onChange: (value: T) => void;
   label: string;
+  fill?: boolean;
 }) {
   return (
-    <div className="inline-flex h-8 items-center rounded-md border border-border/70 bg-muted/30 p-0.5" role="group" aria-label={label}>
+    <div
+      className={`${fill ? "flex w-full" : "inline-flex"} h-8 items-center rounded-md border border-border/70 bg-muted/30 p-0.5`}
+      role="group"
+      aria-label={label}
+    >
       {options.map((option) => {
         const active = option.value === value;
         return (
@@ -183,7 +190,7 @@ function ToggleGroup<T extends string | number>({
             type="button"
             aria-pressed={active}
             onClick={() => onChange(option.value)}
-            className={`inline-flex h-6 items-center justify-center rounded-[5px] px-2.5 text-xs font-medium leading-none transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${
+            className={`inline-flex h-6 items-center justify-center rounded-[5px] px-2.5 text-xs font-medium leading-none transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${fill ? "flex-1" : ""} ${
               active
                 ? "bg-background text-foreground shadow-sm"
                 : "text-muted-foreground hover:text-foreground"
@@ -201,17 +208,19 @@ function MachineFilter({
   value,
   onChange,
   options,
+  fill = false,
 }: {
   value: string;
   onChange: (value: string) => void;
   options: Array<{ value: string; label: string }>;
+  fill?: boolean;
 }) {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger
         aria-label="Filter usage by machine"
         className="h-8 border-border/70 bg-muted/20 px-2.5 py-0 text-xs font-medium shadow-none hover:bg-muted/40 focus:ring-1 data-[state=open]:bg-muted/40 [&>svg]:size-3.5 [&>svg]:opacity-60"
-        style={{ width: 180 }}
+        style={{ width: fill ? "100%" : 180 }}
       >
         <SelectValue />
       </SelectTrigger>
@@ -233,10 +242,10 @@ function MachineFilter({
 
 function UsageHeaderControls() {
   const controls = useHeaderControls();
-  if (!controls) return null;
+  if (!controls || controls.stackedView) return null;
 
   return (
-    <div className="hidden items-center gap-2 md:flex">
+    <div className="flex items-center gap-2">
       <ToggleGroup
         value={controls.range}
         onChange={controls.setRange}
@@ -267,17 +276,21 @@ function UsageChart({
   providers,
   range,
   mode,
+  compactView = false,
 }: {
   records: UsageRecord[];
   providers: Array<{ id: string; name: string }>;
   range: Range;
   mode: ChartMode;
+  compactView?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [measuredWidth, setMeasuredWidth] = useState(980);
-  const width = Math.max(360, measuredWidth);
-  const height = 322;
-  const inset = { top: 14, right: 8, bottom: 32, left: 62 };
+  const width = Math.max(compactView ? 240 : 360, measuredWidth);
+  const height = compactView ? 250 : 322;
+  const inset = compactView
+    ? { top: 12, right: 4, bottom: 30, left: 48 }
+    : { top: 14, right: 8, bottom: 32, left: 62 };
   const days = useMemo(() => rangeDays(range), [range]);
   const totalsByKey = new Map<string, number>();
 
@@ -310,8 +323,8 @@ function UsageChart({
   const formatValue = mode === "cost" ? money : compact;
 
   return (
-    <div ref={containerRef} className="overflow-x-auto">
-      <svg width={width} height={height} className="block min-w-[360px]" role="img" aria-label={`Daily ${mode} by provider`}>
+    <div ref={containerRef} className="min-w-0 overflow-hidden">
+      <svg width={width} height={height} className="block max-w-full" role="img" aria-label={`Daily ${mode} by provider`}>
         <defs>
           {providers.map((provider) => (
             <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
@@ -396,6 +409,8 @@ function UsageDashboard() {
   const [syncing, setSyncing] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);
+  const compactView = contentWidth < 640;
+  const stackedView = contentWidth < 900;
 
   const load = useCallback(() => {
     setError(null);
@@ -473,11 +488,12 @@ function UsageDashboard() {
       dateLabel: `${formatDay(days[0])}–${formatDay(days[days.length - 1])}`,
       syncing,
       lastSyncedAt: data.lastSyncedAt,
+      stackedView,
       setMachine,
       setRange,
       sync,
     });
-  }, [data, days, machine, range, sync, syncing]);
+  }, [data, days, machine, range, stackedView, sync, syncing]);
 
   useEffect(() => () => publishHeaderControls(null), []);
 
@@ -525,31 +541,43 @@ function UsageDashboard() {
       <main
         ref={mainRef}
         className="mx-auto w-full max-w-[1440px] px-4 py-4 md:px-5 md:py-5 lg:px-6"
-        style={{ boxSizing: "border-box", width: "100%", maxWidth: 1440, margin: "0 auto", padding: "20px 24px" }}
+        style={{
+          boxSizing: "border-box",
+          width: "100%",
+          maxWidth: 1440,
+          margin: "0 auto",
+          padding: compactView ? "16px" : "20px 24px",
+        }}
       >
-        <div className="flex flex-wrap items-center gap-2 border-b border-border/70 pb-4 md:hidden">
+        {stackedView && <div className="grid gap-2 border-b border-border/70 pb-4">
           <ToggleGroup
             value={range}
             onChange={setRange}
             label={`Date range, ${formatDay(days[0])}–${formatDay(days[days.length - 1])}`}
             options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
+            fill
           />
-          <MachineFilter
-            value={machine}
-            onChange={setMachine}
-            options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]}
-          />
-          <button
-            type="button"
-            onClick={sync}
-            disabled={syncing}
-            aria-label="Sync usage now"
-            title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-            className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
-          >
-            <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
-          </button>
-        </div>
+          <div className="flex min-w-0 gap-2">
+            <div className="min-w-0 flex-1">
+              <MachineFilter
+                value={machine}
+                onChange={setMachine}
+                options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]}
+                fill
+              />
+            </div>
+            <button
+              type="button"
+              onClick={sync}
+              disabled={syncing}
+              aria-label="Sync usage now"
+              title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
+              className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+            >
+              <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
+            </button>
+          </div>
+        </div>}
 
         {sourceIssues.length > 0 && (
           <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
@@ -566,62 +594,104 @@ function UsageDashboard() {
         ) : (
           <>
             <section
-              className="grid gap-8 py-6 min-[900px]:grid-cols-[minmax(250px,0.72fr)_minmax(0,1.8fr)] min-[900px]:items-start lg:gap-10"
+              className="grid py-6"
               style={{
-                display: "grid",
-                gridTemplateColumns: contentWidth >= 900 ? "minmax(250px, 0.72fr) minmax(0, 1.8fr)" : "minmax(0, 1fr)",
+                gridTemplateColumns: stackedView ? "minmax(0, 1fr)" : "minmax(250px, 0.72fr) minmax(0, 1.8fr)",
                 alignItems: "start",
-                gap: contentWidth >= 1024 ? 40 : 32,
-                padding: "24px 0",
+                gap: stackedView ? 20 : contentWidth >= 1024 ? 40 : 32,
               }}
             >
-              <div className="pt-1">
+              <div
+                className="min-w-0"
+                style={stackedView ? {
+                  border: "1px solid hsl(var(--border) / 0.7)",
+                  borderRadius: 12,
+                  background: "hsl(var(--muted) / 0.18)",
+                  padding: compactView ? 20 : 24,
+                } : undefined}
+              >
                 <div className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</div>
                 <div
-                  className="mt-2 text-4xl font-semibold tracking-tight tabular-nums md:text-[42px]"
-                  style={{ marginTop: 8, fontSize: 42, lineHeight: "46px", fontWeight: 600, letterSpacing: "-0.025em" }}
+                  className="mt-2 font-semibold tracking-tight tabular-nums"
+                  style={{
+                    fontSize: compactView ? 36 : 42,
+                    lineHeight: compactView ? "40px" : "46px",
+                    letterSpacing: "-0.025em",
+                  }}
                 >
                   {money(totals.cost)}*
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
 
-                <div className="mt-6 space-y-5">
-                  {providerTotals.map((item) => (
-                    <div key={item.id}>
-                      <div className="flex items-center justify-between gap-4 text-sm">
-                        <span className="flex min-w-0 items-center gap-2 font-medium">
-                          <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
-                          <span className="truncate">{item.name}</span>
-                        </span>
-                        <span className="tabular-nums">{money(item.cost)}</span>
+                {!stackedView && (
+                  <div className="mt-6 space-y-5">
+                    {providerTotals.map((item) => (
+                      <div key={item.id}>
+                        <div className="flex items-center justify-between gap-4 text-sm">
+                          <span className="flex min-w-0 items-center gap-2 font-medium">
+                            <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
+                            <span className="truncate">{item.name}</span>
+                          </span>
+                          <span className="tabular-nums">{money(item.cost)}</span>
+                        </div>
+                        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
+                              backgroundColor: providerColor(item.id),
+                            }}
+                          />
+                        </div>
+                        <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, totals.cost)} of cost · {compact(item.tokens)} tokens</div>
                       </div>
-                      <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-                        <div
-                          className="h-full rounded-full"
-                          style={{
-                            width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
-                            backgroundColor: providerColor(item.id),
-                          }}
-                        />
-                      </div>
-                      <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, totals.cost)} of cost · {compact(item.tokens)} tokens</div>
+                    ))}
+                  </div>
+                )}
+
+                {stackedView && (
+                  <div className="mt-5 min-w-0 border-t border-border/60 pt-4">
+                    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
+                      <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                      <ToggleGroup
+                        value={chartMode}
+                        onChange={setChartMode}
+                        label="Chart value"
+                        options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+                      />
                     </div>
-                  ))}
-                </div>
+                    <div className="mt-3">
+                      <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} compactView={compactView} />
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label="Usage providers">
+                      {activeProviders.map((item) => (
+                        <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
+                          <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
+                          {item.name}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
 
-              <div className="min-w-0" style={{ minWidth: 0 }}>
-                <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-3 min-[1200px]:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
-                  <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
-                  <div className="justify-self-end min-[1200px]:col-start-3">
-                    <ToggleGroup
-                      value={chartMode}
-                      onChange={setChartMode}
-                      label="Chart value"
-                      options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
-                    />
+              {!stackedView && (
+                <div className="min-w-0">
+                  <div className="flex items-center justify-between gap-4">
+                    <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                    <div className="shrink-0">
+                      <ToggleGroup
+                        value={chartMode}
+                        onChange={setChartMode}
+                        label="Chart value"
+                        options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+                      />
+                    </div>
                   </div>
-                  <div className="col-span-2 row-start-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground min-[1200px]:col-span-1 min-[1200px]:col-start-2 min-[1200px]:row-start-1" aria-label="Usage providers">
+                  <div className="mt-4">
+                    <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} />
+                  </div>
+                  <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label="Usage providers">
                     {activeProviders.map((item) => (
                       <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
                         <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
@@ -630,29 +700,73 @@ function UsageDashboard() {
                     ))}
                   </div>
                 </div>
+              )}
 
-                <div className="mt-4">
-                  <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} />
+              {stackedView && (
+                <div>
+                  <h2 className="mb-3 text-sm font-medium text-muted-foreground">Providers</h2>
+                  <div className="overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]">
+                    {providerTotals.map((item, index) => (
+                      <div key={item.id} className={index === 0 ? "p-4" : "border-t border-border/60 p-4"}>
+                        <div className="flex items-center justify-between gap-4 text-sm">
+                          <span className="flex min-w-0 items-center gap-2 font-medium">
+                            <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
+                            <span className="truncate">{item.name}</span>
+                          </span>
+                          <span className="tabular-nums">{money(item.cost)}</span>
+                        </div>
+                        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
+                              backgroundColor: providerColor(item.id),
+                            }}
+                          />
+                        </div>
+                        <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, totals.cost)} of cost · {compact(item.tokens)} tokens</div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
             </section>
 
-            <section className="overflow-x-auto border-y border-border">
+            <section className={stackedView ? "pb-2" : "overflow-x-auto border-y border-border"}>
+              {stackedView && <h2 className="mb-3 text-sm font-medium text-muted-foreground">Totals</h2>}
               <div
-                className="grid min-w-[800px] grid-cols-5 divide-x divide-border"
-                style={{ display: "grid", minWidth: 800, gridTemplateColumns: "repeat(5, minmax(0, 1fr))" }}
+                className={stackedView ? "grid overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]" : "grid min-w-[800px] grid-cols-5 divide-x divide-border"}
+                style={{
+                  minWidth: stackedView ? 0 : 800,
+                  gridTemplateColumns: stackedView
+                    ? `repeat(${compactView ? 2 : 3}, minmax(0, 1fr))`
+                    : "repeat(5, minmax(0, 1fr))",
+                }}
               >
-                {metrics.map((metric) => (
-                  <div
-                    key={metric.label}
-                    className="min-w-0 px-4 py-5 first:pl-0 last:pr-0 md:px-5"
-                    style={{ boxSizing: "border-box", minWidth: 0, padding: "20px" }}
-                  >
-                    <div className="text-sm text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.label}</div>
-                    <div className="mt-1 text-2xl font-medium tabular-nums" style={{ marginTop: 4, fontSize: 24, lineHeight: "32px", fontWeight: 500 }}>{metric.value}</div>
-                    <div className="mt-1 text-sm leading-5 text-muted-foreground" style={{ marginTop: 4, fontSize: 13, lineHeight: "20px" }}>{metric.detail}</div>
-                  </div>
-                ))}
+                {metrics.map((metric, index) => {
+                  const columnCount = compactView ? 2 : 3;
+                  const isLastCompactMetric = compactView && index === metrics.length - 1;
+                  return (
+                    <div
+                      key={metric.label}
+                      className="min-w-0"
+                      style={{
+                        padding: compactView ? 16 : 20,
+                        borderLeft: stackedView && index % columnCount !== 0 && !isLastCompactMetric
+                          ? "1px solid hsl(var(--border) / 0.6)"
+                          : undefined,
+                        borderTop: stackedView && index >= columnCount
+                          ? "1px solid hsl(var(--border) / 0.6)"
+                          : undefined,
+                        gridColumn: isLastCompactMetric ? "1 / -1" : undefined,
+                      }}
+                    >
+                      <div className="text-sm text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.label}</div>
+                      <div className="mt-1 text-2xl font-medium tabular-nums" style={{ fontSize: 24, lineHeight: "32px" }}>{metric.value}</div>
+                      <div className="mt-1 text-sm leading-5 text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.detail}</div>
+                    </div>
+                  );
+                })}
               </div>
             </section>
 
@@ -667,30 +781,50 @@ function UsageDashboard() {
                 />
               </div>
 
-              <div className="mt-3 overflow-x-auto">
-                <table className="w-full min-w-[680px] border-collapse text-sm">
-                  <thead>
-                    <tr className="border-b border-border text-xs text-muted-foreground">
-                      <th className="pb-3 text-left font-normal">{breakdownMode === "model" ? "Model" : "Day"}</th>
-                      <th className="pb-3 text-left font-normal">Provider</th>
-                      <th className="pb-3 text-right font-normal">Cost</th>
-                      <th className="pb-3 text-right font-normal">Share</th>
-                      <th className="pb-3 text-right font-normal">Tokens</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {paginatedBreakdown.items.map((row) => (
-                      <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
-                        <td className="py-3 font-medium">{row.label}</td>
-                        <td className="py-3 text-muted-foreground">{row.provider}</td>
-                        <td className="py-3 text-right tabular-nums">{money(row.cost)}</td>
-                        <td className="py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
-                        <td className="py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
+              {compactView ? (
+                <div className="mt-3 overflow-hidden rounded-xl border border-border/70">
+                  {paginatedBreakdown.items.map((row, index) => (
+                    <div key={row.key} className={index === 0 ? "p-4" : "border-t border-border/60 p-4"}>
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="min-w-0">
+                          <div className="truncate text-sm font-medium">{row.label}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">{row.provider}</div>
+                        </div>
+                        <div className="shrink-0 text-right">
+                          <div className="text-sm tabular-nums">{money(row.cost)}</div>
+                          <div className="mt-1 text-xs tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</div>
+                        </div>
+                      </div>
+                      <div className="mt-3 text-xs tabular-nums text-muted-foreground">{compact(row.tokens)} tokens</div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="mt-3 overflow-x-auto">
+                  <table className="w-full min-w-[680px] border-collapse text-sm">
+                    <thead>
+                      <tr className="border-b border-border text-xs text-muted-foreground">
+                        <th className="pb-3 text-left font-normal">{breakdownMode === "model" ? "Model" : "Day"}</th>
+                        <th className="pb-3 text-left font-normal">Provider</th>
+                        <th className="pb-3 text-right font-normal">Cost</th>
+                        <th className="pb-3 text-right font-normal">Share</th>
+                        <th className="pb-3 text-right font-normal">Tokens</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {paginatedBreakdown.items.map((row) => (
+                        <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
+                          <td className="py-3 font-medium">{row.label}</td>
+                          <td className="py-3 text-muted-foreground">{row.provider}</td>
+                          <td className="py-3 text-right tabular-nums">{money(row.cost)}</td>
+                          <td className="py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
+                          <td className="py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
 
               {breakdown.length > BREAKDOWN_PAGE_SIZE && (
                 <div className="mt-3 flex items-center justify-end gap-2 text-xs tabular-nums text-muted-foreground">
