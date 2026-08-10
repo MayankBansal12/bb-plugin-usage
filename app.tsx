@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
@@ -45,11 +45,45 @@ type DashboardData = {
 
 const PROVIDER_COLORS = ["var(--foreground)", "var(--chart-2)", "var(--chart-3)"];
 
+type HeaderControlsState = {
+  provider: string;
+  machine: string;
+  range: Range;
+  providers: DashboardData["providers"];
+  machines: DashboardData["machines"];
+  dateLabel: string;
+  syncing: boolean;
+  lastSyncedAt: string | null;
+  setProvider: (value: string) => void;
+  setMachine: (value: string) => void;
+  setRange: (value: Range) => void;
+  sync: () => void;
+};
+
+let headerControlsState: HeaderControlsState | null = null;
+const headerControlsListeners = new Set<() => void>();
+
+function publishHeaderControls(next: HeaderControlsState | null) {
+  headerControlsState = next;
+  for (const listener of headerControlsListeners) listener();
+}
+
+function useHeaderControls() {
+  return useSyncExternalStore(
+    (listener) => {
+      headerControlsListeners.add(listener);
+      return () => headerControlsListeners.delete(listener);
+    },
+    () => headerControlsState,
+    () => null,
+  );
+}
+
 function money(value: number) {
   return new Intl.NumberFormat(undefined, {
     style: "currency",
     currency: "USD",
-    minimumFractionDigits: value > 0 && value < 1 ? 2 : 0,
+    minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(value);
 }
@@ -112,7 +146,7 @@ function smoothPath(points: Array<{ x: number; y: number }>, top: number, bottom
   return path;
 }
 
-function SegmentedControl<T extends string | number>({
+function ToggleGroup<T extends string | number>({
   value,
   options,
   onChange,
@@ -124,19 +158,18 @@ function SegmentedControl<T extends string | number>({
   label: string;
 }) {
   return (
-    <div className="inline-flex h-9 items-center rounded-lg border border-border bg-muted/20 p-0.5" role="tablist" aria-label={label}>
+    <div className="inline-flex h-8 items-center rounded-md border border-border/70 bg-muted/30 p-0.5" role="group" aria-label={label}>
       {options.map((option) => {
         const active = option.value === value;
         return (
           <button
             key={option.value}
             type="button"
-            role="tab"
-            aria-selected={active}
+            aria-pressed={active}
             onClick={() => onChange(option.value)}
-            className={`h-8 rounded-md px-3 text-xs font-medium transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${
+            className={`h-7 rounded-[5px] px-2.5 text-xs font-medium transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${
               active
-                ? "bg-background text-foreground shadow-sm ring-1 ring-border/70"
+                ? "bg-background text-foreground shadow-sm"
                 : "text-muted-foreground hover:text-foreground"
             }`}
           >
@@ -160,7 +193,7 @@ function SelectFilter({
   options: Array<{ value: string; label: string }>;
 }) {
   return (
-    <label className="flex h-9 items-center gap-2 rounded-lg border border-border bg-background px-3 text-xs text-muted-foreground focus-within:ring-1 focus-within:ring-ring">
+    <label className="flex h-8 items-center gap-2 rounded-md border border-border/70 bg-muted/20 px-2.5 text-xs text-muted-foreground transition-[background-color,border-color] duration-150 ease-out hover:bg-muted/40 focus-within:border-ring focus-within:ring-1 focus-within:ring-ring/30">
       <span className="hidden sm:inline">{label}</span>
       <select
         value={value}
@@ -170,6 +203,33 @@ function SelectFilter({
         {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select>
     </label>
+  );
+}
+
+function UsageHeaderControls() {
+  const controls = useHeaderControls();
+  if (!controls) return null;
+
+  return (
+    <div className="hidden items-center gap-2 md:flex">
+      <span className="text-xs tabular-nums text-muted-foreground">{controls.dateLabel}</span>
+      <ToggleGroup
+        value={controls.range}
+        onChange={controls.setRange}
+        label="Date range"
+        options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
+      />
+      <button
+        type="button"
+        onClick={controls.sync}
+        disabled={controls.syncing}
+        aria-label="Sync usage now"
+        title={controls.lastSyncedAt ? `Last synced ${new Date(controls.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
+        className="flex size-8 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+      >
+        <Icon name="RotateCcw" className={`size-4 ${controls.syncing ? "animate-spin" : ""}`} aria-hidden="true" />
+      </button>
+    </div>
   );
 }
 
@@ -184,11 +244,23 @@ function UsageChart({
   range: Range;
   mode: ChartMode;
 }) {
-  const width = 980;
-  const height = 300;
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [measuredWidth, setMeasuredWidth] = useState(980);
+  const width = Math.max(680, measuredWidth);
+  const height = 322;
   const inset = { top: 14, right: 8, bottom: 32, left: 62 };
-  const days = rangeDays(range);
+  const days = useMemo(() => rangeDays(range), [range]);
   const totalsByKey = new Map<string, number>();
+
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+    const updateWidth = () => setMeasuredWidth(element.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   for (const record of records) {
     const key = `${record.day}:${record.providerId}`;
@@ -209,8 +281,8 @@ function UsageChart({
   const formatValue = mode === "cost" ? money : compact;
 
   return (
-    <div className="overflow-x-auto">
-      <svg viewBox={`0 0 ${width} ${height}`} className="min-w-[680px] w-full" role="img" aria-label={`Daily ${mode} by provider`}>
+    <div ref={containerRef} className="overflow-x-auto">
+      <svg width={width} height={height} className="block min-w-[680px]" role="img" aria-label={`Daily ${mode} by provider`}>
         <defs>
           {providers.map((provider, index) => (
             <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
@@ -293,13 +365,15 @@ function UsageDashboard() {
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [syncing, setSyncing] = useState(false);
+  const mainRef = useRef<HTMLElement>(null);
+  const [contentWidth, setContentWidth] = useState(0);
 
-  const load = () => {
+  const load = useCallback(() => {
     setError(null);
     void rpc.call("dashboard").then(setData).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
-  };
+  }, [rpc]);
 
-  const sync = () => {
+  const sync = useCallback(() => {
     setSyncing(true);
     setError(null);
     void rpc.call("sync")
@@ -307,9 +381,9 @@ function UsageDashboard() {
       .then(setData)
       .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
       .finally(() => setSyncing(false));
-  };
+  }, [rpc]);
 
-  useEffect(load, []);
+  useEffect(load, [load]);
   useRealtime("usage-updated", load);
   useEffect(() => {
     if (realtimeState !== "connected") return;
@@ -360,6 +434,38 @@ function UsageDashboard() {
     return [...map.values()].sort((a, b) => b.key.localeCompare(a.key));
   }, [rows]);
 
+  const days = useMemo(() => rangeDays(range), [range]);
+
+  useEffect(() => {
+    if (!data) return;
+    publishHeaderControls({
+      provider,
+      machine,
+      range,
+      providers: data.providers,
+      machines: data.machines,
+      dateLabel: `${formatDay(days[0])}–${formatDay(days[days.length - 1])}`,
+      syncing,
+      lastSyncedAt: data.lastSyncedAt,
+      setProvider,
+      setMachine,
+      setRange,
+      sync,
+    });
+  }, [data, days, machine, provider, range, sync, syncing]);
+
+  useEffect(() => () => publishHeaderControls(null), []);
+
+  useEffect(() => {
+    const element = mainRef.current;
+    if (!element || !data) return;
+    const updateWidth = () => setContentWidth(element.clientWidth);
+    updateWidth();
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [data]);
+
   if (error) {
     return <div className="flex h-full items-center justify-center p-8 text-sm text-destructive">Could not load usage: {error}</div>;
   }
@@ -367,7 +473,6 @@ function UsageDashboard() {
     return <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">Loading usage…</div>;
   }
 
-  const days = rangeDays(range);
   const activeProviders = data.providers.filter((item) => provider === "all" || item.id === provider);
   const providerTotals = activeProviders.map((item) => ({
     ...item,
@@ -391,13 +496,12 @@ function UsageDashboard() {
 
   return (
     <div className="h-full overflow-y-auto bg-background">
-      <main className="mx-auto w-full max-w-[1480px] px-5 py-6 md:px-8 md:py-7">
-        <header className="flex flex-col gap-5 border-b border-border/70 pb-6 md:flex-row md:items-start md:justify-between">
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">Usage</h1>
-            <p className="mt-1 text-sm text-muted-foreground">{formatDay(days[0])} to {formatDay(days[days.length - 1])}</p>
-          </div>
-
+      <main
+        ref={mainRef}
+        className="mx-auto w-full max-w-[1440px] px-4 py-4 md:px-5 md:py-5 lg:px-6"
+        style={{ boxSizing: "border-box", width: "100%", maxWidth: 1440, margin: "0 auto", padding: "20px 24px" }}
+      >
+        <div className="flex flex-wrap items-center gap-2 border-b border-border/70 pb-4 md:hidden">
           <div className="flex flex-wrap items-center gap-2">
             <SelectFilter
               label="Provider"
@@ -411,7 +515,13 @@ function UsageDashboard() {
               onChange={setMachine}
               options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]}
             />
-            <SegmentedControl
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="mr-1 text-xs tabular-nums text-muted-foreground">
+              {formatDay(days[0])}–{formatDay(days[days.length - 1])}
+            </span>
+            <ToggleGroup
               value={range}
               onChange={setRange}
               label="Date range"
@@ -423,15 +533,15 @@ function UsageDashboard() {
               disabled={syncing}
               aria-label="Sync usage now"
               title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-              className="flex size-9 items-center justify-center rounded-lg border border-border text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+              className="flex size-8 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
             >
               <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
             </button>
           </div>
-        </header>
+        </div>
 
         {sourceIssues.length > 0 && (
-          <div className="mt-5 flex items-start gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2 text-xs text-muted-foreground">
+          <div className="mt-3 flex items-start gap-2 border-b border-border/60 pb-3 text-xs text-muted-foreground">
             <Icon name="AlertTriangle" className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden="true" />
             <span>{sourceIssues.length} source{sourceIssues.length === 1 ? "" : "s"} reported partial or unavailable history. Available records are still included.</span>
           </div>
@@ -444,13 +554,27 @@ function UsageDashboard() {
           </div>
         ) : (
           <>
-            <section className="grid gap-8 py-8 lg:grid-cols-[minmax(250px,0.7fr)_minmax(0,1.8fr)] lg:gap-12">
+            <section
+              className="grid gap-8 py-6 min-[900px]:grid-cols-[minmax(250px,0.72fr)_minmax(0,1.8fr)] min-[900px]:items-start lg:gap-10"
+              style={{
+                display: "grid",
+                gridTemplateColumns: contentWidth >= 900 ? "minmax(250px, 0.72fr) minmax(0, 1.8fr)" : "minmax(0, 1fr)",
+                alignItems: "start",
+                gap: contentWidth >= 1024 ? 40 : 32,
+                padding: "24px 0",
+              }}
+            >
               <div className="pt-1">
                 <div className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</div>
-                <div className="mt-2 text-4xl font-semibold tracking-tight tabular-nums md:text-[42px]">{money(totals.cost)}*</div>
+                <div
+                  className="mt-2 text-4xl font-semibold tracking-tight tabular-nums md:text-[42px]"
+                  style={{ marginTop: 8, fontSize: 42, lineHeight: "46px", fontWeight: 600, letterSpacing: "-0.025em" }}
+                >
+                  {money(totals.cost)}*
+                </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
 
-                <div className="mt-7 space-y-5">
+                <div className="mt-6 space-y-5">
                   {providerTotals.map((item, index) => (
                     <div key={item.id}>
                       <div className="flex items-center justify-between gap-4 text-sm">
@@ -462,7 +586,7 @@ function UsageDashboard() {
                       </div>
                       <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
                         <div
-                          className="h-full rounded-full transition-[width] duration-200 ease-out"
+                          className="h-full rounded-full"
                           style={{
                             width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
                             backgroundColor: PROVIDER_COLORS[index % PROVIDER_COLORS.length],
@@ -475,17 +599,17 @@ function UsageDashboard() {
                 </div>
               </div>
 
-              <div className="min-w-0">
+              <div className="min-w-0" style={{ minWidth: 0 }}>
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
                   <div className="flex flex-wrap items-center gap-4">
-                    <SegmentedControl
+                    <ToggleGroup
                       value={chartMode}
                       onChange={setChartMode}
                       label="Chart value"
                       options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
                     />
-                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
                       {activeProviders.map((item, index) => (
                         <span key={item.id} className="flex items-center gap-1.5">
                           <span className="size-2 rounded-full" style={{ backgroundColor: PROVIDER_COLORS[index % PROVIDER_COLORS.length] }} />
@@ -495,6 +619,7 @@ function UsageDashboard() {
                     </div>
                   </div>
                 </div>
+
                 <div className="mt-3">
                   <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} />
                 </div>
@@ -502,21 +627,28 @@ function UsageDashboard() {
             </section>
 
             <section className="overflow-x-auto border-y border-border">
-              <div className="grid min-w-[820px] grid-cols-5 divide-x divide-border">
+              <div
+                className="grid min-w-[800px] grid-cols-5 divide-x divide-border"
+                style={{ display: "grid", minWidth: 800, gridTemplateColumns: "repeat(5, minmax(0, 1fr))" }}
+              >
                 {metrics.map((metric) => (
-                  <div key={metric.label} className="px-5 py-4 first:pl-0 last:pr-0 md:px-6">
-                    <div className="text-xs text-muted-foreground">{metric.label}</div>
-                    <div className="mt-1 text-xl font-medium tabular-nums">{metric.value}</div>
-                    <div className="mt-0.5 text-xs text-muted-foreground">{metric.detail}</div>
+                  <div
+                    key={metric.label}
+                    className="min-w-0 px-4 py-5 first:pl-0 last:pr-0 md:px-5"
+                    style={{ boxSizing: "border-box", minWidth: 0, padding: "20px" }}
+                  >
+                    <div className="text-sm text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.label}</div>
+                    <div className="mt-1 text-2xl font-medium tabular-nums" style={{ marginTop: 4, fontSize: 24, lineHeight: "32px", fontWeight: 500 }}>{metric.value}</div>
+                    <div className="mt-1 text-sm leading-5 text-muted-foreground" style={{ marginTop: 4, fontSize: 13, lineHeight: "20px" }}>{metric.detail}</div>
                   </div>
                 ))}
               </div>
             </section>
 
-            <section className="py-8">
+            <section className="py-6">
               <div className="flex items-center justify-between gap-4">
                 <h2 className="text-base font-semibold">Breakdown</h2>
-                <SegmentedControl
+                <ToggleGroup
                   value={breakdownMode}
                   onChange={setBreakdownMode}
                   label="Breakdown grouping"
@@ -524,7 +656,7 @@ function UsageDashboard() {
                 />
               </div>
 
-              <div className="mt-4 overflow-x-auto">
+              <div className="mt-3 overflow-x-auto">
                 <table className="w-full min-w-[680px] border-collapse text-sm">
                   <thead>
                     <tr className="border-b border-border text-xs text-muted-foreground">
@@ -537,7 +669,7 @@ function UsageDashboard() {
                   </thead>
                   <tbody>
                     {breakdown.map((row) => (
-                      <tr key={row.key} className="border-b border-border/60 last:border-0">
+                      <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
                         <td className="py-3 font-medium">{row.label}</td>
                         <td className="py-3 text-muted-foreground">{row.provider}</td>
                         <td className="py-3 text-right tabular-nums">{money(row.cost)}</td>
@@ -552,7 +684,7 @@ function UsageDashboard() {
           </>
         )}
 
-        <footer className="border-t border-border/70 pt-4 text-xs text-muted-foreground">
+        <footer className="border-t border-border/70 pb-2 pt-4 text-xs text-muted-foreground">
           {data.notice} Price sheet {data.pricingVersion}.
         </footer>
       </main>
@@ -561,5 +693,12 @@ function UsageDashboard() {
 }
 
 export default definePluginApp((app) => {
-  app.slots.navPanel({ id: "usage", title: "Usage", icon: "ChartColumn", path: "usage", component: UsageDashboard });
+  app.slots.navPanel({
+    id: "usage",
+    title: "Usage",
+    icon: "ChartColumn",
+    path: "usage",
+    component: UsageDashboard,
+    headerContent: UsageHeaderControls,
+  });
 });
