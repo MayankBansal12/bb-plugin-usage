@@ -29,6 +29,14 @@ describe("usage collectors", () => {
     expect(JSON.stringify(record)).not.toContain("must not be retained");
   });
 
+  it("ignores zero-token synthetic Claude status messages", () => {
+    const content = JSON.stringify({
+      type: "assistant", timestamp: "2026-08-09T00:00:00Z",
+      message: { id: "message-status", model: "<synthetic>", usage: { input_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 0 } },
+    });
+    expect(parseClaude(content, firstMachine)).toEqual([]);
+  });
+
   it("parses Grok unified-log inference metadata and ignores malformed tail data", () => {
     const content = `${JSON.stringify({
       ts: "2026-08-09T00:00:00Z", sid: "session-2", msg: "shell.turn.inference_done",
