@@ -38,19 +38,18 @@ log events.
 
 ## Pricing assumptions
 
-The versioned price sheet is in `collectors.ts`. It currently uses standard,
-short-context API rates reviewed on 2026-08-09:
+Pricing comes from the bundled `@opencode-ai/models` snapshot of
+[models.dev](https://models.dev/). The plugin selects the first-party OpenAI,
+Anthropic, or xAI entry for each model and uses its standard short-context API
+rates. The snapshot is offline and deterministic; updating the dependency
+updates the price sheet without making the plugin depend on a runtime network
+request.
 
-- GPT-5.6 Sol: $5 input / $0.50 cached / $30 output per million tokens.
-- GPT-5.6 Terra: $2.50 / $0.25 / $15.
-- GPT-5.6 Luna: $1 / $0.10 / $6.
-- Claude Sonnet 5 introductory rate: $2 / $0.20 / $10; other Claude families
-  use their matching public list-price rules.
-- Grok Build 0.1: $1 / $0.20 / $2.
-
-Update `PRICING_VERSION` whenever a rate changes. Unknown models intentionally
-fall back to a documented family rate so they remain visible, but their cost is
-an estimate.
+The displayed pricing version is the snapshot generation date. A new snapshot
+also causes unchanged source files to be re-parsed once so stored historical
+costs use one consistent price sheet. Unknown models fall back to a known model
+from the same provider and remain estimates. Long-context and fast/priority
+tiers are not applied because the local usage logs do not identify those tiers.
 
 ## Develop
 

@@ -15,7 +15,7 @@ describe("usage collectors", () => {
     const a = parseCodex(content, firstMachine);
     const b = parseCodex(content, secondMachine);
     expect(a).toHaveLength(1);
-    expect(a[0]).toMatchObject({ model: "gpt-5.6-sol", processedTokens: 125, cachedInputTokens: 60, uncachedInputTokens: 40 });
+    expect(a[0]).toMatchObject({ model: "gpt-5.6-sol", costUsd: 0.000861, processedTokens: 125, cachedInputTokens: 60, uncachedInputTokens: 40 });
     expect(a[0]!.eventKey).toBe(b[0]!.eventKey);
   });
 
@@ -25,7 +25,7 @@ describe("usage collectors", () => {
       message: { id: "message-1", model: "claude-sonnet-5", content: "must not be retained", usage: { input_tokens: 40, cache_read_input_tokens: 60, cache_creation_input_tokens: 5, output_tokens: 20 } },
     });
     const [record] = parseClaude(content, firstMachine);
-    expect(record).toMatchObject({ eventKey: "claude:message-1", processedTokens: 125, cacheWriteTokens: 5 });
+    expect(record).toMatchObject({ eventKey: "claude:message-1", costUsd: 0.000304, processedTokens: 125, cacheWriteTokens: 5 });
     expect(JSON.stringify(record)).not.toContain("must not be retained");
   });
 
@@ -43,6 +43,6 @@ describe("usage collectors", () => {
       ctx: { loop_index: 3, prompt_tokens: 100, cached_prompt_tokens: 60, completion_tokens: 15, reasoning_tokens: 5 },
     })}\n{"incomplete"`;
     const [record] = parseGrok(content, firstMachine);
-    expect(record).toMatchObject({ eventKey: "grok:session-2:2026-08-09T00:00:00Z:3", processedTokens: 120, outputTokens: 20 });
+    expect(record).toMatchObject({ eventKey: "grok:session-2:2026-08-09T00:00:00Z:3", costUsd: 0.000092, processedTokens: 120, outputTokens: 20 });
   });
 });
