@@ -1,76 +1,61 @@
 # bb-plugin-usage
 
-A BB plugin for visualizing local AI-agent usage across provider subscriptions
-and enrolled machines.
+Track AI usage across Codex, Claude Code, and Grok Agent on all machines enrolled on BB.
 
-## Product behavior
+![Usage dashboard](https://5kas5z928t.ufs.sh/f/wBHVA4PQTleAMvssUiregkXmOAPY4ndWVuS718FbTZLDztxM)
 
-- “Subscription” means provider: Codex, Claude Code, or Grok Agent. Account
-  identity is deliberately ignored.
-- Every connected BB machine is scanned automatically every 15 minutes. The
-  `Sync now` button runs the same collection immediately.
-- The dashboard offers 7/30/90-day views plus provider and machine filters.
-- Dollar values are estimated standard API-equivalent cost, not subscription
-  fees or provider invoices.
-- No prompts, responses, code, paths, commands, or account data are stored.
-  Only timestamps, provider/model names, machine identity, token counts, and
-  calculated cost are normalized into the plugin database.
+## Features
 
-## Local adapters
+- View usage for the last 7, 30, or 90 days.
+- Filter by provider and machine.
+- Sync automatically every 15 minutes or manually with `Sync now`.
 
-- Codex: `~/.codex/sessions/**/rollout-*.jsonl`, using `token_count` events.
-- Claude Code: `~/.claude/projects/**/*.jsonl`, using assistant-message usage.
-- Grok Agent: `~/.grok/logs/unified.jsonl`, using
-  `shell.turn.inference_done` metadata.
+## Supported logs
 
-Machine home directories are resolved by the enrolled daemon; paths are not
-assumed to start with `/home/<name>`. Remote files are read through
-`bb.sdk.files` with an explicit `hostId`.
+- Codex: `~/.codex/sessions/**/rollout-*.jsonl`
+- Claude Code: `~/.claude/projects/**/*.jsonl`
+- Grok Agent: `~/.grok/logs/unified.jsonl`
 
-Normalized events, opaque source hashes, and event-to-source mappings live in
-the plugin SQLite database. Absolute log paths are never persisted. Changed
-files are re-parsed atomically; identical events copied across machines are
-counted once. A complete scan reconciles moved, deleted, and removed-machine
-sources, while truncated or partially unreadable scans preserve prior history
-and are marked `partial`. Attempt and successful-sync timestamps are tracked
-separately. The browser receives daily/model aggregates rather than raw local
-log events.
+![Usage by provider](https://5kas5z928t.ufs.sh/f/wBHVA4PQTleAX0mk1Ywqs8NZT3UMHvygFezBaGYxK2w6S1In)
 
-## Pricing assumptions
+![Usage details](https://5kas5z928t.ufs.sh/f/wBHVA4PQTleAKF31TmIL2VE9DjCy53AWlsMSoTNfqhc0U8Jb)
 
-Pricing comes from the bundled `@opencode-ai/models` snapshot of
-[models.dev](https://models.dev/). The plugin selects the first-party OpenAI,
-Anthropic, or xAI entry for each model and uses its standard short-context API
-rates. The snapshot is offline and deterministic; updating the dependency
-updates the price sheet without making the plugin depend on a runtime network
-request.
+## Install
 
-The displayed pricing version is the snapshot generation date. A new snapshot
-also causes unchanged source files to be re-parsed once so stored historical
-costs use one consistent price sheet. Unknown models fall back to a known model
-from the same provider and remain estimates. Long-context and fast/priority
-tiers are not applied because the local usage logs do not identify those tiers.
+Requires BB 0.36 or newer.
+
+```sh
+bb plugin install git:https://github.com/MayankBansal12/bb-plugin-usage.git@main --yes
+```
+
+Open BB and select **Usage** from the plugin sidebar. The plugin scans supported
+logs from connected machines and refreshes automatically.
 
 ## Develop
 
+Clone the repository and install dependencies:
+
 ```sh
+git clone https://github.com/MayankBansal12/bb-plugin-usage.git
+cd bb-plugin-usage
 npm install
+```
+
+Check and build:
+
+```sh
 npm run check
 npm test
 npm run build
+```
+
+Install the local build and start development mode:
+
+```sh
 bb plugin install . --yes
 bb plugin dev
 ```
 
-Path installs must be readable by the machine running the BB server. If this
-checkout lives only on an enrolled remote machine, publish/install it from a
-Git URL or copy the checkout to the server machine first.
+## Contributions
 
-Useful commands:
-
-```sh
-bb plugin types --check
-bb plugin build
-bb plugin reload usage
-bb plugin logs usage -f
-```
+Ideas, fixes, and improvements are welcome.
