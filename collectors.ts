@@ -1,4 +1,7 @@
-export type ProviderId = "codex" | "claude" | "grok";
+import { priceFor, PRICING_REVISION, PRICING_VERSION, type PricingProviderId } from "./lib/pricing";
+
+export type ProviderId = PricingProviderId;
+export { PRICING_REVISION, PRICING_VERSION };
 
 export type UsageRecord = {
   eventKey: string;
@@ -17,29 +20,6 @@ export type UsageRecord = {
   uncachedInputTokens: number;
   outputTokens: number;
 };
-
-type Price = { input: number; cached: number; cacheWrite: number; output: number };
-
-// Standard API-equivalent USD per million tokens, reviewed 2026-08-09.
-// These are estimates, not subscription charges or provider invoices.
-export const PRICING_VERSION = "2026-08-09";
-
-function priceFor(providerId: ProviderId, model: string): Price {
-  const name = model.toLowerCase();
-  if (providerId === "codex") {
-    if (name.includes("5.6-sol")) return { input: 5, cached: 0.5, cacheWrite: 5, output: 30 };
-    if (name.includes("5.6-terra")) return { input: 2.5, cached: 0.25, cacheWrite: 2.5, output: 15 };
-    if (name.includes("5.6-luna")) return { input: 1, cached: 0.1, cacheWrite: 1, output: 6 };
-    return { input: 1.25, cached: 0.125, cacheWrite: 1.25, output: 10 };
-  }
-  if (providerId === "claude") {
-    if (name.includes("sonnet-5")) return { input: 2, cached: 0.2, cacheWrite: 2.5, output: 10 };
-    if (name.includes("sonnet")) return { input: 3, cached: 0.3, cacheWrite: 3.75, output: 15 };
-    if (name.includes("haiku") || name.includes("fable")) return { input: 1, cached: 0.1, cacheWrite: 1.25, output: 5 };
-    return { input: 5, cached: 0.5, cacheWrite: 6.25, output: 25 };
-  }
-  return { input: 1, cached: 0.2, cacheWrite: 1, output: 2 };
-}
 
 function cost(providerId: ProviderId, model: string, uncached: number, cached: number, writes: number, output: number) {
   const price = priceFor(providerId, model);

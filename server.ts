@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
-import { parseClaude, parseCodex, parseGrok, PRICING_VERSION, type ProviderId, type UsageRecord } from "./collectors";
+import { parseClaude, parseCodex, parseGrok, PRICING_REVISION, PRICING_VERSION, type ProviderId, type UsageRecord } from "./collectors";
 
 const usageRecordSchema = z.object({
   day: z.string(), providerId: z.string(), providerName: z.string(), machineId: z.string(), machineName: z.string(), model: z.string(),
@@ -50,6 +50,8 @@ CREATE TABLE IF NOT EXISTS usage_sync_state (
   last_success_at TEXT, record_count INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY (machine_id, provider_id)
 );`;
 
+const pricingMigration = `ALTER TABLE usage_sources ADD COLUMN pricing_version TEXT;`;
+
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
 }
@@ -80,10 +82,11 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
   const insertMapping = db.prepare("INSERT OR IGNORE INTO usage_event_sources (event_key, source_id) VALUES (?, ?)");
 
   db.transaction(() => {
-    db.prepare(`INSERT INTO usage_sources VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO UPDATE SET
+    db.prepare(`INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id, root_reference, content_sha, last_seen_generation, last_success_at, pricing_version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO UPDATE SET
       machine_name=excluded.machine_name, root_reference=excluded.root_reference, content_sha=excluded.content_sha,
-      last_seen_generation=excluded.last_seen_generation, last_success_at=excluded.last_success_at`)
-      .run(source.id, machine.id, machine.name, providerId, source.rootReference, source.sha256, source.generation, new Date().toISOString());
+      last_seen_generation=excluded.last_seen_generation, last_success_at=excluded.last_success_at, pricing_version=excluded.pricing_version`)
+      .run(source.id, machine.id, machine.name, providerId, source.rootReference, source.sha256, source.generation, new Date().toISOString(), PRICING_REVISION);
     db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
     for (const row of records) {
       insertEvent.run(row.eventKey, row.timestamp, row.day, row.providerId, row.providerName, row.model, row.costUsd, row.cacheSavingsUsd, row.processedTokens, row.cachedInputTokens, row.cacheWriteTokens, row.uncachedInputTokens, row.outputTokens);
@@ -147,8 +150,8 @@ async function syncProvider(bb: BbPluginApi, db: Database, machine: { id: string
       let file;
       try { file = await bb.sdk.files.read({ hostId: machine.id, path: source.path }); } catch { readFailures += 1; continue; }
       if (file.contentEncoding !== "utf8") { readFailures += 1; continue; }
-      const prior = db.prepare("SELECT content_sha sha256 FROM usage_sources WHERE source_id=?").get(source.id) as { sha256?: string } | undefined;
-      if (prior?.sha256 === file.sha256) { markSourceSeen(db, source.id, generation); continue; }
+      const prior = db.prepare("SELECT content_sha sha256, pricing_version pricingVersion FROM usage_sources WHERE source_id=?").get(source.id) as { sha256?: string; pricingVersion?: string } | undefined;
+      if (prior?.sha256 === file.sha256 && prior.pricingVersion === PRICING_REVISION) { markSourceSeen(db, source.id, generation); continue; }
       const context = { machineId: machine.id, machineName: machine.name };
       const records = providerId === "codex" ? parseCodex(file.content, context) : providerId === "claude" ? parseClaude(file.content, context) : parseGrok(file.content, context);
       upsertSourceEvents(db, { id: source.id, rootReference: source.rootReference, sha256: file.sha256, generation }, machine, providerId, records);
@@ -178,7 +181,7 @@ function abortableDelay(ms: number, signal: AbortSignal) {
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration]);
+  bb.storage.migrate(db, [migration, pricingMigration]);
   let running: Promise<string> | null = null;
 
   const syncAll = () => {
