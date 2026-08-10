@@ -140,6 +140,8 @@ export function parseClaude(content: string, context: ParseContext): UsageRecord
     const cached = number(usage.cache_read_input_tokens);
     const writes = number(usage.cache_creation_input_tokens);
     const output = number(usage.output_tokens);
+    const processed = uncached + cached + writes + output;
+    if (model === "<synthetic>" && processed === 0) continue;
     const messageId = string(message.id, String(line));
 
     records.push({
@@ -153,7 +155,7 @@ export function parseClaude(content: string, context: ParseContext): UsageRecord
       model,
       costUsd: cost("claude", model, uncached, cached, writes, output),
       cacheSavingsUsd: cacheSavings("claude", model, cached),
-      processedTokens: uncached + cached + writes + output,
+      processedTokens: processed,
       cachedInputTokens: cached,
       cacheWriteTokens: writes,
       uncachedInputTokens: uncached,

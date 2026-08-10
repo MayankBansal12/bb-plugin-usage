@@ -217,7 +217,9 @@ export default async function plugin(bb: BbPluginApi) {
         SUM(cost_usd) costUsd, SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
         SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
         SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-        FROM canonical WHERE day >= date('now', '-365 days') GROUP BY day, provider_id, machine_id, model ORDER BY day`).all() as Array<Omit<DashboardRecord, "machineName">>;
+        FROM canonical WHERE day >= date('now', '-365 days')
+        AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
+        GROUP BY day, provider_id, machine_id, model ORDER BY day`).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id providerId, status, last_attempt_at lastAttemptAt,
         last_success_at lastSuccessAt, record_count recordCount, error FROM usage_sync_state ORDER BY machine_id, provider_id`).all() as SourceState[];

@@ -2,10 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { paginateItems } from "@/lib/pagination";
 
 type Range = 7 | 30 | 90;
 type ChartMode = "cost" | "tokens";
 type BreakdownMode = "model" | "day";
+
+const BREAKDOWN_PAGE_SIZE = 10;
 
 type UsageRecord = {
   day: string;
@@ -43,18 +47,30 @@ type DashboardData = {
   notice: string;
 };
 
-const PROVIDER_COLORS = ["var(--foreground)", "var(--chart-2)", "var(--chart-3)"];
+const PROVIDER_COLORS: Record<string, string> = {
+  codex: "#10A37F",
+  claude: "#D97757",
+  grok: "#6E7CF6",
+  cursor: "#A855F7",
+};
+
+const FALLBACK_PROVIDER_COLORS = ["#0EA5E9", "#F59E0B", "#EC4899", "#14B8A6"];
+
+function providerColor(providerId: string) {
+  const normalizedId = providerId.toLowerCase();
+  if (PROVIDER_COLORS[normalizedId]) return PROVIDER_COLORS[normalizedId];
+  let hash = 0;
+  for (const character of normalizedId) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
+  return FALLBACK_PROVIDER_COLORS[Math.abs(hash) % FALLBACK_PROVIDER_COLORS.length];
+}
 
 type HeaderControlsState = {
-  provider: string;
   machine: string;
   range: Range;
-  providers: DashboardData["providers"];
   machines: DashboardData["machines"];
   dateLabel: string;
   syncing: boolean;
   lastSyncedAt: string | null;
-  setProvider: (value: string) => void;
   setMachine: (value: string) => void;
   setRange: (value: Range) => void;
   sync: () => void;
@@ -167,7 +183,7 @@ function ToggleGroup<T extends string | number>({
             type="button"
             aria-pressed={active}
             onClick={() => onChange(option.value)}
-            className={`h-7 rounded-[5px] px-2.5 text-xs font-medium transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${
+            className={`inline-flex h-6 items-center justify-center rounded-[5px] px-2.5 text-xs font-medium leading-none transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${
               active
                 ? "bg-background text-foreground shadow-sm"
                 : "text-muted-foreground hover:text-foreground"
@@ -181,28 +197,37 @@ function ToggleGroup<T extends string | number>({
   );
 }
 
-function SelectFilter({
+function MachineFilter({
   value,
   onChange,
-  label,
   options,
 }: {
   value: string;
   onChange: (value: string) => void;
-  label: string;
   options: Array<{ value: string; label: string }>;
 }) {
   return (
-    <label className="flex h-8 items-center gap-2 rounded-md border border-border/70 bg-muted/20 px-2.5 text-xs text-muted-foreground transition-[background-color,border-color] duration-150 ease-out hover:bg-muted/40 focus-within:border-ring focus-within:ring-1 focus-within:ring-ring/30">
-      <span className="hidden sm:inline">{label}</span>
-      <select
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        className="min-w-0 cursor-pointer bg-transparent font-medium text-foreground outline-none"
+    <Select value={value} onValueChange={onChange}>
+      <SelectTrigger
+        aria-label="Filter usage by machine"
+        className="h-8 border-border/70 bg-muted/20 px-2.5 py-0 text-xs font-medium shadow-none hover:bg-muted/40 focus:ring-1 data-[state=open]:bg-muted/40 [&>svg]:size-3.5 [&>svg]:opacity-60"
+        style={{ width: 180 }}
       >
-        {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-      </select>
-    </label>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent
+        align="end"
+        sideOffset={4}
+        className="[&_[role=option]>span:last-child]:truncate"
+        style={{ width: "var(--radix-select-trigger-width)", minWidth: "var(--radix-select-trigger-width)" }}
+      >
+        {options.map((option) => (
+          <SelectItem key={option.value} value={option.value} className="text-xs">
+            {option.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
   );
 }
 
@@ -212,12 +237,16 @@ function UsageHeaderControls() {
 
   return (
     <div className="hidden items-center gap-2 md:flex">
-      <span className="text-xs tabular-nums text-muted-foreground">{controls.dateLabel}</span>
       <ToggleGroup
         value={controls.range}
         onChange={controls.setRange}
-        label="Date range"
+        label={`Date range, ${controls.dateLabel}`}
         options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
+      />
+      <MachineFilter
+        value={controls.machine}
+        onChange={controls.setMachine}
+        options={[{ value: "all", label: "All machines" }, ...controls.machines.map((item) => ({ value: item.id, label: item.name }))]}
       />
       <button
         type="button"
@@ -225,7 +254,7 @@ function UsageHeaderControls() {
         disabled={controls.syncing}
         aria-label="Sync usage now"
         title={controls.lastSyncedAt ? `Last synced ${new Date(controls.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-        className="flex size-8 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+        className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
       >
         <Icon name="RotateCcw" className={`size-4 ${controls.syncing ? "animate-spin" : ""}`} aria-hidden="true" />
       </button>
@@ -246,7 +275,7 @@ function UsageChart({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [measuredWidth, setMeasuredWidth] = useState(980);
-  const width = Math.max(680, measuredWidth);
+  const width = Math.max(360, measuredWidth);
   const height = 322;
   const inset = { top: 14, right: 8, bottom: 32, left: 62 };
   const days = useMemo(() => rangeDays(range), [range]);
@@ -282,12 +311,12 @@ function UsageChart({
 
   return (
     <div ref={containerRef} className="overflow-x-auto">
-      <svg width={width} height={height} className="block min-w-[680px]" role="img" aria-label={`Daily ${mode} by provider`}>
+      <svg width={width} height={height} className="block min-w-[360px]" role="img" aria-label={`Daily ${mode} by provider`}>
         <defs>
-          {providers.map((provider, index) => (
+          {providers.map((provider) => (
             <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
-              <stop offset="0%" stopColor={PROVIDER_COLORS[index % PROVIDER_COLORS.length]} stopOpacity="0.16" />
-              <stop offset="100%" stopColor={PROVIDER_COLORS[index % PROVIDER_COLORS.length]} stopOpacity="0" />
+              <stop offset="0%" stopColor={providerColor(provider.id)} stopOpacity="0.16" />
+              <stop offset="100%" stopColor={providerColor(provider.id)} stopOpacity="0" />
             </linearGradient>
           ))}
           <clipPath id="usage-chart-clip">
@@ -316,7 +345,7 @@ function UsageChart({
         })}
 
         <g clipPath="url(#usage-chart-clip)">
-          {series.map((item, seriesIndex) => {
+          {series.map((item) => {
             const points = item.values.map((value, index) => ({ x: x(index), y: y(value) }));
             const line = smoothPath(points, inset.top, inset.top + chartHeight);
             const area = `${line} L ${x(days.length - 1)} ${y(0)} L ${x(0)} ${y(0)} Z`;
@@ -326,8 +355,8 @@ function UsageChart({
                 <path
                   d={line}
                   fill="none"
-                  stroke={PROVIDER_COLORS[seriesIndex % PROVIDER_COLORS.length]}
-                  strokeWidth="2.25"
+                  stroke={providerColor(item.id)}
+                  strokeWidth="2.5"
                   strokeLinecap="round"
                   strokeLinejoin="round"
                   vectorEffect="non-scaling-stroke"
@@ -360,10 +389,10 @@ function UsageDashboard() {
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [range, setRange] = useState<Range>(30);
-  const [provider, setProvider] = useState("all");
   const [machine, setMachine] = useState("all");
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
+  const [breakdownPage, setBreakdownPage] = useState(1);
   const [syncing, setSyncing] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);
@@ -397,9 +426,8 @@ function UsageDashboard() {
     const cutoffDay = days[0];
     return data.records.filter((row) =>
       row.day >= cutoffDay
-      && (provider === "all" || row.providerId === provider)
       && (machine === "all" || row.machineId === machine));
-  }, [data, machine, provider, range]);
+  }, [data, machine, range]);
 
   const totals = useMemo(() => rows.reduce((sum, row) => ({
     cost: sum.cost + row.costUsd,
@@ -439,22 +467,21 @@ function UsageDashboard() {
   useEffect(() => {
     if (!data) return;
     publishHeaderControls({
-      provider,
       machine,
       range,
-      providers: data.providers,
       machines: data.machines,
       dateLabel: `${formatDay(days[0])}–${formatDay(days[days.length - 1])}`,
       syncing,
       lastSyncedAt: data.lastSyncedAt,
-      setProvider,
       setMachine,
       setRange,
       sync,
     });
-  }, [data, days, machine, provider, range, sync, syncing]);
+  }, [data, days, machine, range, sync, syncing]);
 
   useEffect(() => () => publishHeaderControls(null), []);
+
+  useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -473,17 +500,16 @@ function UsageDashboard() {
     return <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">Loading usage…</div>;
   }
 
-  const activeProviders = data.providers.filter((item) => provider === "all" || item.id === provider);
+  const activeProviders = data.providers;
   const providerTotals = activeProviders.map((item) => ({
     ...item,
     cost: rows.filter((row) => row.providerId === item.id).reduce((sum, row) => sum + row.costUsd, 0),
     tokens: rows.filter((row) => row.providerId === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
   }));
-  const visibleSources = data.sources.filter((source) =>
-    (provider === "all" || source.providerId === provider)
-    && (machine === "all" || source.machineId === machine));
+  const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssues = visibleSources.filter((source) => !["ready", "no-data"].includes(source.status));
   const breakdown = breakdownMode === "model" ? modelBreakdown : dayBreakdown;
+  const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
 
   const metrics = [
@@ -502,48 +528,33 @@ function UsageDashboard() {
         style={{ boxSizing: "border-box", width: "100%", maxWidth: 1440, margin: "0 auto", padding: "20px 24px" }}
       >
         <div className="flex flex-wrap items-center gap-2 border-b border-border/70 pb-4 md:hidden">
-          <div className="flex flex-wrap items-center gap-2">
-            <SelectFilter
-              label="Provider"
-              value={provider}
-              onChange={setProvider}
-              options={[{ value: "all", label: "All providers" }, ...data.providers.map((item) => ({ value: item.id, label: item.name }))]}
-            />
-            <SelectFilter
-              label="Machine"
-              value={machine}
-              onChange={setMachine}
-              options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]}
-            />
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="mr-1 text-xs tabular-nums text-muted-foreground">
-              {formatDay(days[0])}–{formatDay(days[days.length - 1])}
-            </span>
-            <ToggleGroup
-              value={range}
-              onChange={setRange}
-              label="Date range"
-              options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
-            />
-            <button
-              type="button"
-              onClick={sync}
-              disabled={syncing}
-              aria-label="Sync usage now"
-              title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-              className="flex size-8 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
-            >
-              <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
-            </button>
-          </div>
+          <ToggleGroup
+            value={range}
+            onChange={setRange}
+            label={`Date range, ${formatDay(days[0])}–${formatDay(days[days.length - 1])}`}
+            options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
+          />
+          <MachineFilter
+            value={machine}
+            onChange={setMachine}
+            options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]}
+          />
+          <button
+            type="button"
+            onClick={sync}
+            disabled={syncing}
+            aria-label="Sync usage now"
+            title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+          >
+            <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
+          </button>
         </div>
 
         {sourceIssues.length > 0 && (
-          <div className="mt-3 flex items-start gap-2 border-b border-border/60 pb-3 text-xs text-muted-foreground">
-            <Icon name="AlertTriangle" className="mt-0.5 size-4 shrink-0 text-amber-500" aria-hidden="true" />
-            <span>{sourceIssues.length} source{sourceIssues.length === 1 ? "" : "s"} reported partial or unavailable history. Available records are still included.</span>
+          <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
+            <Icon name="AlertTriangle" className="size-4 shrink-0 text-amber-500/90" aria-hidden="true" />
+            <span><span className="font-medium text-foreground/80">Some usage history is unavailable.</span> {sourceIssues.length} source{sourceIssues.length === 1 ? "" : "s"} reported partial data; available records are included.</span>
           </div>
         )}
 
@@ -575,11 +586,11 @@ function UsageDashboard() {
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
 
                 <div className="mt-6 space-y-5">
-                  {providerTotals.map((item, index) => (
+                  {providerTotals.map((item) => (
                     <div key={item.id}>
                       <div className="flex items-center justify-between gap-4 text-sm">
                         <span className="flex min-w-0 items-center gap-2 font-medium">
-                          <span className="size-2 rounded-full" style={{ backgroundColor: PROVIDER_COLORS[index % PROVIDER_COLORS.length] }} />
+                          <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
                           <span className="truncate">{item.name}</span>
                         </span>
                         <span className="tabular-nums">{money(item.cost)}</span>
@@ -589,7 +600,7 @@ function UsageDashboard() {
                           className="h-full rounded-full"
                           style={{
                             width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
-                            backgroundColor: PROVIDER_COLORS[index % PROVIDER_COLORS.length],
+                            backgroundColor: providerColor(item.id),
                           }}
                         />
                       </div>
@@ -600,27 +611,27 @@ function UsageDashboard() {
               </div>
 
               <div className="min-w-0" style={{ minWidth: 0 }}>
-                <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-3 min-[1200px]:grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]">
                   <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
-                  <div className="flex flex-wrap items-center gap-4">
+                  <div className="justify-self-end min-[1200px]:col-start-3">
                     <ToggleGroup
                       value={chartMode}
                       onChange={setChartMode}
                       label="Chart value"
                       options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
                     />
-                    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                      {activeProviders.map((item, index) => (
-                        <span key={item.id} className="flex items-center gap-1.5">
-                          <span className="size-2 rounded-full" style={{ backgroundColor: PROVIDER_COLORS[index % PROVIDER_COLORS.length] }} />
-                          {item.name}
-                        </span>
-                      ))}
-                    </div>
+                  </div>
+                  <div className="col-span-2 row-start-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground min-[1200px]:col-span-1 min-[1200px]:col-start-2 min-[1200px]:row-start-1" aria-label="Usage providers">
+                    {activeProviders.map((item) => (
+                      <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
+                        <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
+                        {item.name}
+                      </span>
+                    ))}
                   </div>
                 </div>
 
-                <div className="mt-3">
+                <div className="mt-4">
                   <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} />
                 </div>
               </div>
@@ -668,7 +679,7 @@ function UsageDashboard() {
                     </tr>
                   </thead>
                   <tbody>
-                    {breakdown.map((row) => (
+                    {paginatedBreakdown.items.map((row) => (
                       <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
                         <td className="py-3 font-medium">{row.label}</td>
                         <td className="py-3 text-muted-foreground">{row.provider}</td>
@@ -680,6 +691,32 @@ function UsageDashboard() {
                   </tbody>
                 </table>
               </div>
+
+              {breakdown.length > BREAKDOWN_PAGE_SIZE && (
+                <div className="mt-3 flex items-center justify-end gap-2 text-xs tabular-nums text-muted-foreground">
+                  <span>{paginatedBreakdown.rangeStart}–{paginatedBreakdown.rangeEnd} of {paginatedBreakdown.totalItems}</span>
+                  <button
+                    type="button"
+                    aria-label="Previous breakdown page"
+                    title="Previous page"
+                    disabled={!paginatedBreakdown.canPrevious}
+                    onClick={() => setBreakdownPage(paginatedBreakdown.page - 1)}
+                    className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <Icon name="ChevronLeft" className="size-3.5" aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Next breakdown page"
+                    title="Next page"
+                    disabled={!paginatedBreakdown.canNext}
+                    onClick={() => setBreakdownPage(paginatedBreakdown.page + 1)}
+                    className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40"
+                  >
+                    <Icon name="ChevronRight" className="size-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
             </section>
           </>
         )}
