@@ -567,8 +567,8 @@ export default async function plugin(bb: BbPluginApi) {
         notice: "Prompts and message content are never stored. Costs use models.dev estimates when available, then agent-reported cost; subscription charges may differ.",
       };
     },
-    async sync() {
-      await syncAll();
+    sync() {
+      void syncAll().catch((error) => bb.log.error(`Usage sync failed: ${errorMessage(error)}`));
       return { ok: true as const };
     },
   });
