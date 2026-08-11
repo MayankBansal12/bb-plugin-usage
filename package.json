@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-usage",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "build": "bb plugin build",
@@ -13,7 +13,7 @@
   },
   "bb": {
     "name": "Usage",
-    "description": "Combined AI subscription usage across enrolled machines.",
+    "description": "Coding-agent token usage and estimated API cost across enrolled machines.",
     "branding": {
       "icon": "ChartColumn"
     },
