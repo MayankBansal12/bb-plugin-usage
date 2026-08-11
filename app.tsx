@@ -9,17 +9,22 @@ import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state
 type Range = 7 | 30 | 90;
 type ChartMode = "cost" | "tokens";
 type BreakdownMode = "model" | "day";
+type DimensionMode = "agent" | "provider";
 
 const BREAKDOWN_PAGE_SIZE = 10;
 
 type UsageRecord = {
   day: string;
-  providerId: string;
-  providerName: string;
+  agentId: string;
+  agentName: string;
+  modelProviderId: string;
+  modelProviderName: string;
   machineId: string;
   machineName: string;
   model: string;
   costUsd: number;
+  loggedCostUsd: number | null;
+  pricingStatus: string;
   cacheSavingsUsd: number;
   processedTokens: number;
   cachedInputTokens: number;
@@ -34,11 +39,12 @@ type DashboardData = {
   lastSyncedAt: string | null;
   pricingVersion: string;
   machines: Array<{ id: string; name: string; status?: string }>;
-  providers: Array<{ id: string; name: string; status?: string }>;
+  agents: Array<{ id: string; name: string; status?: string }>;
+  modelProviders: Array<{ id: string; name: string; status?: string }>;
   records: UsageRecord[];
   sources: Array<{
     machineId: string;
-    providerId: string;
+    agentId: string;
     status: string;
     lastAttemptAt: string | null;
     lastSuccessAt: string | null;
@@ -52,6 +58,13 @@ const PROVIDER_COLORS: Record<string, string> = {
   codex: "#10A37F",
   claude: "#D97757",
   grok: "#6E7CF6",
+  opencode: "#0EA5E9",
+  pi: "#F59E0B",
+  openai: "#10A37F",
+  anthropic: "#D97757",
+  xai: "#6E7CF6",
+  google: "#4285F4",
+  openrouter: "#8B5CF6",
   cursor: "#A855F7",
 };
 
@@ -108,6 +121,10 @@ function money(value: number) {
 
 function compact(value: number) {
   return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
+}
+
+function pricingLabel(status: string) {
+  return status === "models-dev-exact" ? "models.dev exact" : status === "models-dev-alias" ? "models.dev alias" : status === "logged" ? "Agent reported" : status === "mixed" ? "Mixed" : "Unpriced";
 }
 
 function percentage(value: number, total: number) {
@@ -210,16 +227,18 @@ function MachineFilter({
   onChange,
   options,
   fill = false,
+  ariaLabel = "Filter usage by machine",
 }: {
   value: string;
   onChange: (value: string) => void;
   options: Array<{ value: string; label: string }>;
   fill?: boolean;
+  ariaLabel?: string;
 }) {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger
-        aria-label="Filter usage by machine"
+        aria-label={ariaLabel}
         className="h-8 border-border/70 bg-muted/20 px-2.5 py-0 text-xs font-medium shadow-none hover:bg-muted/40 focus:ring-1 data-[state=open]:bg-muted/40 [&>svg]:size-3.5 [&>svg]:opacity-60"
         style={{ width: fill ? "100%" : 180 }}
       >
@@ -277,12 +296,14 @@ function UsageChart({
   providers,
   range,
   mode,
+  groupBy,
   compactView = false,
 }: {
   records: UsageRecord[];
   providers: Array<{ id: string; name: string }>;
   range: Range;
   mode: ChartMode;
+  groupBy: DimensionMode;
   compactView?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -306,7 +327,8 @@ function UsageChart({
   }, []);
 
   for (const record of records) {
-    const key = `${record.day}:${record.providerId}`;
+    const dimensionId = groupBy === "agent" ? record.agentId : record.modelProviderId;
+    const key = `${record.day}:${dimensionId}`;
     const value = mode === "cost" ? record.costUsd : record.processedTokens;
     totalsByKey.set(key, (totalsByKey.get(key) ?? 0) + value);
   }
@@ -325,7 +347,7 @@ function UsageChart({
 
   return (
     <div ref={containerRef} className="min-w-0 overflow-hidden">
-      <svg width={width} height={height} className="block max-w-full" role="img" aria-label={`Daily ${mode} by provider`}>
+      <svg width={width} height={height} className="block max-w-full" role="img" aria-label={`Daily ${mode} by ${groupBy}`}>
         <defs>
           {providers.map((provider) => (
             <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
@@ -404,6 +426,10 @@ function UsageDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [range, setRange] = useState<Range>(30);
   const [machine, setMachine] = useState("all");
+  const [agent, setAgent] = useState("all");
+  const [modelProvider, setModelProvider] = useState("all");
+  const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
+  const [costGroup, setCostGroup] = useState<DimensionMode>("agent");
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [breakdownPage, setBreakdownPage] = useState(1);
@@ -442,8 +468,10 @@ function UsageDashboard() {
     const cutoffDay = days[0];
     return data.records.filter((row) =>
       row.day >= cutoffDay
-      && (machine === "all" || row.machineId === machine));
-  }, [data, machine, range]);
+      && (machine === "all" || row.machineId === machine)
+      && (agent === "all" || row.agentId === agent)
+      && (modelProvider === "all" || row.modelProviderId === modelProvider));
+  }, [agent, data, machine, modelProvider, range]);
 
   const totals = useMemo(() => rows.reduce((sum, row) => ({
     cost: sum.cost + row.costUsd,
@@ -453,26 +481,30 @@ function UsageDashboard() {
     cacheSavings: sum.cacheSavings + row.cacheSavingsUsd,
     uncached: sum.uncached + row.uncachedInputTokens,
     output: sum.output + row.outputTokens,
-  }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0 }), [rows]);
+    unpriced: sum.unpriced + (row.pricingStatus === "unknown" ? row.processedTokens : 0),
+  }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0, unpriced: 0 }), [rows]);
 
+  type BreakdownRow = { key: string; label: string; agent: string; agentId: string; provider: string; providerId: string; pricingStatus: string; cost: number; tokens: number };
   const modelBreakdown = useMemo(() => {
-    const map = new Map<string, { key: string; label: string; provider: string; providerId: string; cost: number; tokens: number }>();
+    const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
-      const key = `${row.providerId}:${row.model}`;
-      const current = map.get(key) ?? { key, label: row.model, provider: row.providerName, providerId: row.providerId, cost: 0, tokens: 0 };
+      const key = `${row.agentId}:${row.modelProviderId}:${row.model}`;
+      const current = map.get(key) ?? { key, label: row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, pricingStatus: row.pricingStatus, cost: 0, tokens: 0 };
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
+      if (current.pricingStatus !== row.pricingStatus) current.pricingStatus = "mixed";
       map.set(key, current);
     }
-    return [...map.values()].sort((a, b) => b.cost - a.cost);
+    return [...map.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
   }, [rows]);
 
   const dayBreakdown = useMemo(() => {
-    const map = new Map<string, { key: string; label: string; provider: string; providerId: string; cost: number; tokens: number }>();
+    const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
-      const current = map.get(row.day) ?? { key: row.day, label: formatDay(row.day, true), provider: "All providers", providerId: "all", cost: 0, tokens: 0 };
+      const current = map.get(row.day) ?? { key: row.day, label: formatDay(row.day, true), agent: "All agents", agentId: "all", provider: "All providers", providerId: "all", pricingStatus: row.pricingStatus, cost: 0, tokens: 0 };
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
+      if (current.pricingStatus !== row.pricingStatus) current.pricingStatus = "mixed";
       map.set(row.day, current);
     }
     return [...map.values()].sort((a, b) => b.key.localeCompare(a.key));
@@ -498,7 +530,7 @@ function UsageDashboard() {
 
   useEffect(() => () => publishHeaderControls(null), []);
 
-  useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
+  useEffect(() => setBreakdownPage(1), [agent, breakdownMode, machine, modelProvider, range]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -517,19 +549,24 @@ function UsageDashboard() {
     return <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">Loading usage…</div>;
   }
 
-  const activeProviders = data.providers;
-  const providerTotals = activeProviders.map((item) => ({
+  const usedAgentIds = new Set(rows.map((row) => row.agentId));
+  const usedProviderIds = new Set(rows.map((row) => row.modelProviderId));
+  const activeAgents = data.agents.filter((item) => usedAgentIds.has(item.id));
+  const activeModelProviders = data.modelProviders.filter((item) => usedProviderIds.has(item.id));
+  const activeProviders = chartGroup === "agent" ? activeAgents : activeModelProviders;
+  const costDimensions = costGroup === "agent" ? activeAgents : activeModelProviders;
+  const providerTotals = costDimensions.map((item) => ({
     ...item,
-    cost: rows.filter((row) => row.providerId === item.id).reduce((sum, row) => sum + row.costUsd, 0),
-    tokens: rows.filter((row) => row.providerId === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
+    cost: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.costUsd, 0),
+    tokens: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
   }));
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
-  const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
+  const visibleSources = data.sources.filter((source) => (machine === "all" || source.machineId === machine) && (agent === "all" || source.agentId === agent));
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
   const emptyView = getEmptyUsageView({
     machines: visibleMachines,
     sources: visibleSources,
-    hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
+    hasRecordsOutsideView: data.records.some((record) => (machine === "all" || record.machineId === machine) && (agent === "all" || record.agentId === agent) && (modelProvider === "all" || record.modelProviderId === modelProvider)),
   });
   const breakdown = breakdownMode === "model" ? modelBreakdown : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
@@ -540,6 +577,7 @@ function UsageDashboard() {
     { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of observed input` },
     { label: "Uncached input", value: compact(totals.uncached), detail: `${compact(totals.cacheWrites)} cache writes` },
     { label: "Output", value: compact(totals.output), detail: "Includes reasoning tokens" },
+    { label: "Unpriced tokens", value: compact(totals.unpriced), detail: totals.unpriced > 0 ? "No safe model-price match" : "All observed tokens priced" },
     { label: "Cache savings", value: money(totals.cacheSavings), detail: totals.cost > 0 ? `${(totals.cacheSavings / totals.cost).toFixed(1)}× the raw token cost` : `Price sheet ${data.pricingVersion}` },
   ];
 
@@ -586,6 +624,13 @@ function UsageDashboard() {
             </button>
           </div>
         </div>}
+
+        <div className="mt-4 flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">Filter</span>
+          <MachineFilter value={agent} onChange={setAgent} ariaLabel="Filter usage by coding agent" options={[{ value: "all", label: "All agents" }, ...data.agents.map((item) => ({ value: item.id, label: item.name }))]} />
+          <MachineFilter value={modelProvider} onChange={setModelProvider} ariaLabel="Filter usage by model provider" options={[{ value: "all", label: "All model providers" }, ...data.modelProviders.map((item) => ({ value: item.id, label: item.name }))]} />
+          {(agent !== "all" || modelProvider !== "all") && <button type="button" onClick={() => { setAgent("all"); setModelProvider("all"); }} className="h-8 rounded-md px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground">Clear</button>}
+        </div>
 
         {sourceIssueMessage && rows.length > 0 && (
           <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
@@ -640,6 +685,9 @@ function UsageDashboard() {
                   {money(totals.cost)}*
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
+                <div className="mt-4">
+                  <ToggleGroup value={costGroup} onChange={setCostGroup} label="Cost breakdown" options={[{ value: "agent", label: "By agent" }, { value: "provider", label: "By provider" }]} />
+                </div>
 
                 {!stackedView && (
                   <div className="mt-6 space-y-5">
@@ -669,8 +717,16 @@ function UsageDashboard() {
 
                 {stackedView && (
                   <div className="mt-5 min-w-0 border-t border-border/60 pt-4">
-                    <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3">
-                      <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                      <ToggleGroup
+                        value={chartGroup}
+                        onChange={setChartGroup}
+                        label="Chart series"
+                        options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
+
+                      />
+
                       <ToggleGroup
                         value={chartMode}
                         onChange={setChartMode}
@@ -679,9 +735,9 @@ function UsageDashboard() {
                       />
                     </div>
                     <div className="mt-3">
-                      <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} compactView={compactView} />
+                      <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} groupBy={chartGroup} compactView={compactView} />
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label="Usage providers">
+                    <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label={`Usage ${chartGroup === "agent" ? "agents" : "model providers"}`}>
                       {activeProviders.map((item) => (
                         <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
                           <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
@@ -696,8 +752,16 @@ function UsageDashboard() {
               {!stackedView && (
                 <div className="min-w-0">
                   <div className="flex items-center justify-between gap-4">
-                    <h2 className="text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
-                    <div className="shrink-0">
+                    <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <ToggleGroup
+                        value={chartGroup}
+                        onChange={setChartGroup}
+                        label="Chart series"
+                        options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
+
+                      />
+
                       <ToggleGroup
                         value={chartMode}
                         onChange={setChartMode}
@@ -707,9 +771,9 @@ function UsageDashboard() {
                     </div>
                   </div>
                   <div className="mt-4">
-                    <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} />
+                    <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} groupBy={chartGroup} />
                   </div>
-                  <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label="Usage providers">
+                  <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label={`Usage ${chartGroup === "agent" ? "agents" : "model providers"}`}>
                     {activeProviders.map((item) => (
                       <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
                         <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
@@ -722,7 +786,7 @@ function UsageDashboard() {
 
               {stackedView && (
                 <div>
-                  <h2 className="mb-3 text-sm font-medium text-muted-foreground">Providers</h2>
+                  <h2 className="mb-3 text-sm font-medium text-muted-foreground">{costGroup === "agent" ? "Agents" : "Model providers"}</h2>
                   <div className="overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]">
                     {providerTotals.map((item, index) => (
                       <div key={item.id} className={index === 0 ? "p-4" : "border-t border-border/60 p-4"}>
@@ -753,12 +817,12 @@ function UsageDashboard() {
             <section className={stackedView ? "pb-2" : "overflow-x-auto border-y border-border"}>
               {stackedView && <h2 className="mb-3 text-sm font-medium text-muted-foreground">Totals</h2>}
               <div
-                className={stackedView ? "grid overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]" : "grid min-w-[800px] grid-cols-5 divide-x divide-border"}
+                className={stackedView ? "grid overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]" : "grid min-w-[960px] grid-cols-6 divide-x divide-border"}
                 style={{
-                  minWidth: stackedView ? 0 : 800,
+                  minWidth: stackedView ? 0 : 960,
                   gridTemplateColumns: stackedView
                     ? `repeat(${compactView ? 2 : 3}, minmax(0, 1fr))`
-                    : "repeat(5, minmax(0, 1fr))",
+                    : "repeat(6, minmax(0, 1fr))",
                 }}
               >
                 {metrics.map((metric, index) => {
@@ -806,37 +870,41 @@ function UsageDashboard() {
                       <div className="flex items-start justify-between gap-4">
                         <div className="min-w-0">
                           <div className="truncate text-sm font-medium">{row.label}</div>
-                          <div className="mt-1 text-xs text-muted-foreground">{row.provider}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">{row.agent} · {row.provider}</div>
                         </div>
                         <div className="shrink-0 text-right">
                           <div className="text-sm tabular-nums">{money(row.cost)}</div>
                           <div className="mt-1 text-xs tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</div>
                         </div>
                       </div>
-                      <div className="mt-3 text-xs tabular-nums text-muted-foreground">{compact(row.tokens)} tokens</div>
+                      <div className="mt-3 flex items-center justify-between gap-3 text-xs tabular-nums text-muted-foreground"><span>{compact(row.tokens)} tokens</span><span>{pricingLabel(row.pricingStatus)}</span></div>
                     </div>
                   ))}
                 </div>
               ) : (
                 <div className="mt-3 overflow-x-auto">
-                  <table className="w-full min-w-[680px] border-collapse text-sm">
+                  <table className="w-full min-w-[900px] border-collapse text-sm">
                     <thead>
                       <tr className="border-b border-border text-xs text-muted-foreground">
                         <th className="pb-3 text-left font-normal">{breakdownMode === "model" ? "Model" : "Day"}</th>
-                        <th className="pb-3 text-left font-normal">Provider</th>
+                        <th className="pb-3 text-left font-normal">Agent</th>
+                        <th className="pb-3 text-left font-normal">Model provider</th>
                         <th className="pb-3 text-right font-normal">Cost</th>
                         <th className="pb-3 text-right font-normal">Share</th>
                         <th className="pb-3 text-right font-normal">Tokens</th>
+                        <th className="pb-3 text-right font-normal">Pricing</th>
                       </tr>
                     </thead>
                     <tbody>
                       {paginatedBreakdown.items.map((row) => (
                         <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
                           <td className="py-3 font-medium">{row.label}</td>
+                          <td className="py-3 text-muted-foreground">{row.agent}</td>
                           <td className="py-3 text-muted-foreground">{row.provider}</td>
                           <td className="py-3 text-right tabular-nums">{money(row.cost)}</td>
                           <td className="py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
                           <td className="py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
+                          <td className="py-3 text-right text-xs text-muted-foreground">{pricingLabel(row.pricingStatus)}</td>
                         </tr>
                       ))}
                     </tbody>

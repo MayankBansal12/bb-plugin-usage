@@ -1,55 +1,92 @@
 import { generatedAt, providers } from "@opencode-ai/models/snapshot";
 import type { ModelCost } from "@opencode-ai/models";
 
-export type PricingProviderId = "codex" | "claude" | "grok";
 export type Price = { input: number; cached: number; cacheWrite: number; output: number };
-
-const providerIds: Record<PricingProviderId, "openai" | "anthropic" | "xai"> = {
-  codex: "openai",
-  claude: "anthropic",
-  grok: "xai",
+export type PricingStatus = "models-dev-exact" | "models-dev-alias" | "logged" | "unknown";
+export type PricingResult = {
+  modelProviderId: string;
+  modelProviderName: string;
+  price: Price | null;
+  status: Exclude<PricingStatus, "logged">;
 };
 
-const fallbackModelIds: Record<PricingProviderId, string> = {
-  codex: "gpt-5.1",
-  claude: "claude-opus-4-8",
-  grok: "grok-build-0.1",
+type CatalogModel = { id: string; cost?: ModelCost };
+type CatalogProvider = { id?: string; name?: string; models: Record<string, CatalogModel> };
+const catalog = providers as unknown as Record<string, CatalogProvider>;
+
+const providerAliases: Record<string, string> = {
+  bedrock: "amazon-bedrock",
+  vertex: "google-vertex",
+  "x-ai": "xai",
+  copilot: "github-copilot",
 };
 
 export const PRICING_REVISION = generatedAt;
 export const PRICING_VERSION = generatedAt.slice(0, 10);
 
-function normalizedModelId(model: string) {
-  return model.trim().toLowerCase().replace(/^(?:openai|anthropic|xai|x-ai)\//, "");
+export function normalizeProviderId(providerId: string) {
+  const normalized = providerId.trim().toLowerCase().replace(/_/g, "-");
+  return providerAliases[normalized] ?? (normalized || "unknown");
 }
 
-function pricedCost(providerId: PricingProviderId, model: string): ModelCost {
-  const provider = providers[providerIds[providerId]];
-  if (!provider) throw new Error(`models.dev snapshot is missing ${providerIds[providerId]}`);
-
-  const modelId = normalizedModelId(model);
-  const exact = provider.models[modelId];
-  if (exact?.cost) return exact.cost;
-
-  const alias = Object.values(provider.models)
-    .filter((candidate) => candidate.cost && (modelId.startsWith(`${candidate.id}-`) || modelId.startsWith(`${candidate.id}:`)))
-    .sort((a, b) => b.id.length - a.id.length)[0];
-  if (alias?.cost) return alias.cost;
-
-  const fallback = provider.models[fallbackModelIds[providerId]];
-  if (!fallback?.cost) throw new Error(`models.dev snapshot is missing fallback pricing for ${providerId}`);
-  return fallback.cost;
+function normalizedModelIds(providerId: string, model: string) {
+  const normalized = model.trim().toLowerCase();
+  const withoutProvider = normalized.startsWith(`${providerId}/`) ? normalized.slice(providerId.length + 1) : normalized;
+  return [...new Set([normalized, withoutProvider])];
 }
 
-function toPrice(cost: ModelCost): Price {
+function toPrice(cost: ModelCost): Price | null {
+  const input = Number(cost.input);
+  const output = Number(cost.output);
+  if (!Number.isFinite(input) || !Number.isFinite(output)) return null;
+  const cached = Number(cost.cache_read ?? input);
+  const cacheWrite = Number(cost.cache_write ?? input);
   return {
-    input: cost.input,
-    cached: cost.cache_read ?? cost.input,
-    cacheWrite: cost.cache_write ?? cost.input,
-    output: cost.output,
+    input: Math.max(0, input),
+    cached: Number.isFinite(cached) ? Math.max(0, cached) : Math.max(0, input),
+    cacheWrite: Number.isFinite(cacheWrite) ? Math.max(0, cacheWrite) : Math.max(0, input),
+    output: Math.max(0, output),
   };
 }
 
-export function priceFor(providerId: PricingProviderId, model: string): Price {
-  return toPrice(pricedCost(providerId, model));
+function providerName(providerId: string, provider?: CatalogProvider) {
+  return provider?.name?.trim() || providerId.split("-").map((part) => part ? `${part[0]!.toUpperCase()}${part.slice(1)}` : part).join(" ");
+}
+
+function matchWithinProvider(providerId: string, provider: CatalogProvider, model: string): PricingResult | null {
+  const modelIds = normalizedModelIds(providerId, model);
+  for (const modelId of modelIds) {
+    const exact = provider.models[modelId];
+    const price = exact?.cost ? toPrice(exact.cost) : null;
+    if (price) return { modelProviderId: providerId, modelProviderName: providerName(providerId, provider), price, status: "models-dev-exact" };
+  }
+
+  const alias = Object.values(provider.models)
+    .filter((candidate) => candidate.cost && modelIds.some((modelId) =>
+      modelId.startsWith(`${candidate.id.toLowerCase()}-`) || modelId.startsWith(`${candidate.id.toLowerCase()}:`)))
+    .sort((a, b) => b.id.length - a.id.length)[0];
+  const price = alias?.cost ? toPrice(alias.cost) : null;
+  return price ? { modelProviderId: providerId, modelProviderName: providerName(providerId, provider), price, status: "models-dev-alias" } : null;
+}
+
+export function resolvePricing(rawProviderId: string, model: string): PricingResult {
+  const modelProviderId = normalizeProviderId(rawProviderId);
+  const provider = catalog[modelProviderId];
+  if (provider) {
+    const match = matchWithinProvider(modelProviderId, provider, model);
+    if (match) return match;
+  }
+
+  const exactMatches = Object.entries(catalog).flatMap(([candidateId, candidate]) => {
+    const exact = normalizedModelIds(modelProviderId, model).map((modelId) => candidate.models[modelId]).find((item) => item?.cost);
+    const price = exact?.cost ? toPrice(exact.cost) : null;
+    return price ? [{ modelProviderId: normalizeProviderId(candidateId), modelProviderName: providerName(candidateId, candidate), price }] : [];
+  });
+  if (exactMatches.length === 1) return { ...exactMatches[0]!, status: "models-dev-exact" };
+
+  return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
+}
+
+export function priceFor(providerId: string, model: string): Price | null {
+  return resolvePricing(providerId, model).price;
 }

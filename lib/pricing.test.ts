@@ -1,20 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { priceFor, PRICING_VERSION } from "./pricing";
+import { normalizeProviderId, priceFor, resolvePricing, PRICING_VERSION } from "./pricing";
 
 describe("models.dev pricing", () => {
-  it("uses first-party standard token rates from the bundled snapshot", () => {
-    expect(priceFor("codex", "gpt-5.6-terra")).toEqual({ input: 2, cached: 0.2, cacheWrite: 2.5, output: 12 });
-    expect(priceFor("claude", "claude-fable-5")).toEqual({ input: 10, cached: 1, cacheWrite: 12.5, output: 50 });
-    expect(priceFor("grok", "grok-4.5")).toEqual({ input: 2, cached: 0.3, cacheWrite: 2, output: 6 });
+  it("uses provider/model rates from the bundled snapshot", () => {
+    expect(priceFor("openai", "gpt-5.6-terra")).toEqual({ input: 2, cached: 0.2, cacheWrite: 2.5, output: 12 });
+    expect(priceFor("anthropic", "claude-fable-5")).toEqual({ input: 10, cached: 1, cacheWrite: 12.5, output: 50 });
+    expect(priceFor("xai", "grok-4.5")).toEqual({ input: 2, cached: 0.3, cacheWrite: 2, output: 6 });
   });
 
-  it("normalizes provider prefixes and unknown model suffixes", () => {
-    expect(priceFor("codex", "openai/gpt-5.6-luna")).toEqual(priceFor("codex", "gpt-5.6-luna"));
-    expect(priceFor("claude", "claude-sonnet-5-20990101")).toEqual(priceFor("claude", "claude-sonnet-5"));
+  it("normalizes provider aliases and dated model suffixes", () => {
+    expect(normalizeProviderId("x-ai")).toBe("xai");
+    expect(priceFor("anthropic", "claude-sonnet-5-20990101")).toEqual(priceFor("anthropic", "claude-sonnet-5"));
   });
 
-  it("uses a provider fallback model when a log contains an unknown model", () => {
-    expect(priceFor("grok", "grok-unreleased")).toEqual(priceFor("grok", "grok-build-0.1"));
+  it("does not assign an unrelated fallback price to unknown models", () => {
+    expect(priceFor("custom-local", "unreleased-model")).toBeNull();
+    expect(resolvePricing("custom-local", "unreleased-model")).toMatchObject({ status: "unknown", price: null });
   });
 
   it("derives the displayed version from the bundled snapshot", () => {

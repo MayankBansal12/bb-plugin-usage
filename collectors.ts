@@ -1,18 +1,22 @@
-import { priceFor, PRICING_REVISION, PRICING_VERSION, type PricingProviderId } from "./lib/pricing";
+import { normalizeProviderId, resolvePricing, PRICING_REVISION, PRICING_VERSION, type PricingStatus } from "./lib/pricing";
 
-export type ProviderId = PricingProviderId;
+export type AgentId = "codex" | "claude" | "grok" | "opencode" | "pi";
 export { PRICING_REVISION, PRICING_VERSION };
 
 export type UsageRecord = {
   eventKey: string;
   timestamp: string;
   day: string;
-  providerId: ProviderId;
-  providerName: string;
+  agentId: AgentId;
+  agentName: string;
+  modelProviderId: string;
+  modelProviderName: string;
   machineId: string;
   machineName: string;
   model: string;
   costUsd: number;
+  loggedCostUsd: number | null;
+  pricingStatus: PricingStatus;
   cacheSavingsUsd: number;
   processedTokens: number;
   cachedInputTokens: number;
@@ -21,26 +25,48 @@ export type UsageRecord = {
   outputTokens: number;
 };
 
-function cost(providerId: ProviderId, model: string, uncached: number, cached: number, writes: number, output: number) {
-  const price = priceFor(providerId, model);
-  return Number((((uncached * price.input) + (cached * price.cached) + (writes * price.cacheWrite) + (output * price.output)) / 1_000_000).toFixed(6));
-}
+type UsageInput = {
+  eventKey: string;
+  timestamp: string;
+  agentId: AgentId;
+  agentName: string;
+  modelProviderId: string;
+  model: string;
+  loggedCostUsd?: number | null;
+  uncachedInputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+};
 
-function cacheSavings(providerId: ProviderId, model: string, cached: number) {
-  const price = priceFor(providerId, model);
-  return Number(((cached * Math.max(0, price.input - price.cached)) / 1_000_000).toFixed(6));
-}
+type ParseContext = { machineId: string; machineName: string };
 
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function number(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+function finite(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : typeof value === "string" && value.trim() && Number.isFinite(Number(value)) ? Number(value) : null;
 }
 
-function string(value: unknown, fallback: string) {
-  return typeof value === "string" && value.length > 0 ? value : fallback;
+function count(value: unknown) {
+  return Math.max(0, Math.round(finite(value) ?? 0));
+}
+
+function text(value: unknown, fallback: string) {
+  return typeof value === "string" && value.trim().length > 0 ? value : fallback;
+}
+
+function isoTimestamp(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  }
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
 }
 
 function lines(content: string) {
@@ -57,50 +83,61 @@ function lines(content: string) {
   return parsed;
 }
 
-type ParseContext = { machineId: string; machineName: string };
+function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
+  const pricing = resolvePricing(input.modelProviderId, input.model);
+  const uncached = count(input.uncachedInputTokens);
+  const cached = count(input.cachedInputTokens);
+  const writes = count(input.cacheWriteTokens);
+  const output = count(input.outputTokens);
+  const logged = finite(input.loggedCostUsd);
+  const estimated = pricing.price
+    ? ((uncached * pricing.price.input) + (cached * pricing.price.cached) + (writes * pricing.price.cacheWrite) + (output * pricing.price.output)) / 1_000_000
+    : null;
+  const timestamp = isoTimestamp(input.timestamp) ?? input.timestamp;
+  return {
+    eventKey: input.eventKey,
+    timestamp,
+    day: timestamp.slice(0, 10),
+    agentId: input.agentId,
+    agentName: input.agentName,
+    modelProviderId: pricing.modelProviderId,
+    modelProviderName: pricing.modelProviderName,
+    machineId: context.machineId,
+    machineName: context.machineName,
+    model: input.model,
+    costUsd: Number((estimated ?? logged ?? 0).toFixed(6)),
+    loggedCostUsd: logged === null ? null : Number(Math.max(0, logged).toFixed(6)),
+    pricingStatus: estimated !== null ? pricing.status : logged !== null ? "logged" : "unknown",
+    cacheSavingsUsd: pricing.price ? Number(((cached * Math.max(0, pricing.price.input - pricing.price.cached)) / 1_000_000).toFixed(6)) : 0,
+    processedTokens: uncached + cached + writes + output,
+    cachedInputTokens: cached,
+    cacheWriteTokens: writes,
+    uncachedInputTokens: uncached,
+    outputTokens: output,
+  };
+}
 
 export function parseCodex(content: string, context: ParseContext): UsageRecord[] {
   const records: UsageRecord[] = [];
   let model = "codex-unknown";
   let sessionId = "session-unknown";
-
   for (const { value, line } of lines(content)) {
     const payload = object(value.payload);
     if ((value.type === "turn_context" || value.type === "session_meta") && payload) {
-      model = string(payload.model, model);
-      if (value.type === "session_meta") sessionId = string(payload.id, sessionId);
+      model = text(payload.model, model);
+      if (value.type === "session_meta") sessionId = text(payload.id, sessionId);
     }
     if (value.type !== "event_msg" || payload?.type !== "token_count") continue;
-
-    const info = object(payload.info);
-    const usage = object(info?.last_token_usage);
-    if (!usage) continue;
-    const timestamp = string(value.timestamp, "");
-    if (!timestamp) continue;
-
-    const input = number(usage.input_tokens);
-    const cached = Math.min(input, number(usage.cached_input_tokens));
-    const writes = number(usage.cache_write_input_tokens);
-    const uncached = Math.max(0, input - cached);
-    const output = number(usage.output_tokens);
-
-    records.push({
-      eventKey: `codex:${sessionId}:${timestamp}:${line}`,
-      timestamp,
-      day: timestamp.slice(0, 10),
-      providerId: "codex",
-      providerName: "Codex",
-      machineId: context.machineId,
-      machineName: context.machineName,
-      model,
-      costUsd: cost("codex", model, uncached, cached, writes, output),
-      cacheSavingsUsd: cacheSavings("codex", model, cached),
-      processedTokens: input + writes + output,
-      cachedInputTokens: cached,
-      cacheWriteTokens: writes,
-      uncachedInputTokens: uncached,
-      outputTokens: output,
-    });
+    const usage = object(object(payload.info)?.last_token_usage);
+    const timestamp = isoTimestamp(value.timestamp);
+    if (!usage || !timestamp) continue;
+    const input = count(usage.input_tokens);
+    const cached = Math.min(input, count(usage.cached_input_tokens));
+    records.push(usageRecord({
+      eventKey: `codex:${sessionId}:${timestamp}:${line}`, timestamp, agentId: "codex", agentName: "Codex",
+      modelProviderId: "openai", model, uncachedInputTokens: input - cached, cachedInputTokens: cached,
+      cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
+    }, context));
   }
   return records;
 }
@@ -111,36 +148,17 @@ export function parseClaude(content: string, context: ParseContext): UsageRecord
     if (value.type !== "assistant") continue;
     const message = object(value.message);
     const usage = object(message?.usage);
-    if (!message || !usage) continue;
-    const timestamp = string(value.timestamp, "");
-    if (!timestamp) continue;
-
-    const model = string(message.model, "claude-unknown");
-    const uncached = number(usage.input_tokens);
-    const cached = number(usage.cache_read_input_tokens);
-    const writes = number(usage.cache_creation_input_tokens);
-    const output = number(usage.output_tokens);
-    const processed = uncached + cached + writes + output;
+    const timestamp = isoTimestamp(value.timestamp);
+    if (!message || !usage || !timestamp) continue;
+    const model = text(message.model, "claude-unknown");
+    const processed = count(usage.input_tokens) + count(usage.cache_read_input_tokens) + count(usage.cache_creation_input_tokens) + count(usage.output_tokens);
     if (model === "<synthetic>" && processed === 0) continue;
-    const messageId = string(message.id, String(line));
-
-    records.push({
-      eventKey: `claude:${messageId}`,
-      timestamp,
-      day: timestamp.slice(0, 10),
-      providerId: "claude",
-      providerName: "Claude Code",
-      machineId: context.machineId,
-      machineName: context.machineName,
-      model,
-      costUsd: cost("claude", model, uncached, cached, writes, output),
-      cacheSavingsUsd: cacheSavings("claude", model, cached),
-      processedTokens: processed,
-      cachedInputTokens: cached,
-      cacheWriteTokens: writes,
-      uncachedInputTokens: uncached,
-      outputTokens: output,
-    });
+    records.push(usageRecord({
+      eventKey: `claude:${text(message.id, String(line))}`, timestamp, agentId: "claude", agentName: "Claude Code",
+      modelProviderId: "anthropic", model, uncachedInputTokens: count(usage.input_tokens),
+      cachedInputTokens: count(usage.cache_read_input_tokens), cacheWriteTokens: count(usage.cache_creation_input_tokens),
+      outputTokens: count(usage.output_tokens),
+    }, context));
   }
   return records;
 }
@@ -150,34 +168,64 @@ export function parseGrok(content: string, context: ParseContext): UsageRecord[]
   for (const { value, line } of lines(content)) {
     if (value.msg !== "shell.turn.inference_done") continue;
     const usage = object(value.ctx);
-    if (!usage || usage.prompt_tokens === undefined) continue;
-    const timestamp = string(value.ts, "");
-    if (!timestamp) continue;
-
-    const model = string(usage.model, "grok-build-0.1");
-    const input = number(usage.prompt_tokens);
-    const cached = Math.min(input, number(usage.cached_prompt_tokens));
-    const uncached = Math.max(0, input - cached);
-    const output = number(usage.completion_tokens) + number(usage.reasoning_tokens);
-    const sessionId = string(value.sid, "session");
-
-    records.push({
-      eventKey: `grok:${sessionId}:${timestamp}:${number(usage.loop_index) || line}`,
-      timestamp,
-      day: timestamp.slice(0, 10),
-      providerId: "grok",
-      providerName: "Grok Agent",
-      machineId: context.machineId,
-      machineName: context.machineName,
-      model,
-      costUsd: cost("grok", model, uncached, cached, 0, output),
-      cacheSavingsUsd: cacheSavings("grok", model, cached),
-      processedTokens: input + output,
-      cachedInputTokens: cached,
-      cacheWriteTokens: 0,
-      uncachedInputTokens: uncached,
-      outputTokens: output,
-    });
+    const timestamp = isoTimestamp(value.ts);
+    if (!usage || usage.prompt_tokens === undefined || !timestamp) continue;
+    const input = count(usage.prompt_tokens);
+    const cached = Math.min(input, count(usage.cached_prompt_tokens));
+    records.push(usageRecord({
+      eventKey: `grok:${text(value.sid, "session")}:${timestamp}:${count(usage.loop_index) || line}`, timestamp,
+      agentId: "grok", agentName: "Grok Agent", modelProviderId: "xai", model: text(usage.model, "grok-build-0.1"),
+      uncachedInputTokens: input - cached, cachedInputTokens: cached, cacheWriteTokens: 0,
+      outputTokens: count(usage.completion_tokens) + count(usage.reasoning_tokens),
+    }, context));
   }
   return records;
+}
+
+export function parsePi(content: string, context: ParseContext): UsageRecord[] {
+  const records: UsageRecord[] = [];
+  let sessionId = "session-unknown";
+  for (const { value, line } of lines(content)) {
+    if (value.type === "session") sessionId = text(value.id, sessionId);
+    if (value.type !== "message") continue;
+    const message = object(value.message);
+    const usage = object(message?.usage);
+    const timestamp = isoTimestamp(value.timestamp ?? message?.timestamp);
+    if (!message || message.role !== "assistant" || !usage || !timestamp) continue;
+    records.push(usageRecord({
+      eventKey: `pi:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId: "pi", agentName: "Pi",
+      modelProviderId: text(message.provider, "unknown"), model: text(message.responseModel, text(message.model, "unknown")),
+      loggedCostUsd: finite(object(usage.cost)?.total), uncachedInputTokens: count(usage.input),
+      cachedInputTokens: count(usage.cacheRead), cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
+    }, context));
+  }
+  return records;
+}
+
+export function parseOpenCode(content: string, context: ParseContext): UsageRecord[] {
+  let values: unknown;
+  try {
+    values = JSON.parse(content.trim() || "[]");
+  } catch {
+    throw new Error("OpenCode returned malformed JSON.");
+  }
+  if (!Array.isArray(values)) throw new Error("OpenCode returned an unexpected result shape.");
+
+  return values.flatMap((raw) => {
+    const row = object(raw);
+    if (!row) return [];
+    const day = text(row.day, "");
+    const timestamp = isoTimestamp(`${day}T00:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !timestamp) return [];
+    const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
+    const model = text(row.model, "unknown");
+    const input = count(row.inputTokens);
+    const cached = Math.min(input, count(row.cachedInputTokens));
+    return [usageRecord({
+      eventKey: `opencode:${context.machineId}:${day}:${modelProviderId}:${model}`, timestamp, agentId: "opencode", agentName: "OpenCode",
+      modelProviderId, model, loggedCostUsd: finite(row.loggedCostUsd), uncachedInputTokens: input - cached,
+      cachedInputTokens: cached, cacheWriteTokens: count(row.cacheWriteTokens),
+      outputTokens: count(row.outputTokens) + count(row.reasoningTokens),
+    }, context)];
+  });
 }
