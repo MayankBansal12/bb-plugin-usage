@@ -4,6 +4,7 @@ import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { paginateItems } from "@/lib/pagination";
+import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
 
 type Range = 7 | 30 | 90;
 type ChartMode = "cost" | "tokens";
@@ -522,8 +523,14 @@ function UsageDashboard() {
     cost: rows.filter((row) => row.providerId === item.id).reduce((sum, row) => sum + row.costUsd, 0),
     tokens: rows.filter((row) => row.providerId === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
   }));
+  const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
-  const sourceIssues = visibleSources.filter((source) => !["ready", "no-data"].includes(source.status));
+  const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
+  const emptyView = getEmptyUsageView({
+    machines: visibleMachines,
+    sources: visibleSources,
+    hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
+  });
   const breakdown = breakdownMode === "model" ? modelBreakdown : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
@@ -540,10 +547,11 @@ function UsageDashboard() {
     <div className="h-full overflow-y-auto bg-background">
       <main
         ref={mainRef}
-        className="mx-auto w-full max-w-[1440px] px-4 py-4 md:px-5 md:py-5 lg:px-6"
+        className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col px-4 py-4 md:px-5 md:py-5 lg:px-6"
         style={{
           boxSizing: "border-box",
           width: "100%",
+          minHeight: "100%",
           maxWidth: 1440,
           margin: "0 auto",
           padding: compactView ? "16px" : "20px 24px",
@@ -579,17 +587,27 @@ function UsageDashboard() {
           </div>
         </div>}
 
-        {sourceIssues.length > 0 && (
+        {sourceIssueMessage && rows.length > 0 && (
           <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
             <Icon name="AlertTriangle" className="size-4 shrink-0 text-amber-500/90" aria-hidden="true" />
-            <span><span className="font-medium text-foreground/80">Some usage history is unavailable.</span> {sourceIssues.length} source{sourceIssues.length === 1 ? "" : "s"} reported partial data; available records are included.</span>
+            <span><span className="font-medium text-foreground/80">Some usage history is unavailable.</span> {sourceIssueMessage}</span>
           </div>
         )}
 
         {rows.length === 0 ? (
-          <div className="flex min-h-[420px] flex-col items-center justify-center border-b border-border text-center">
-            <div className="text-sm font-medium">No usage in this view</div>
-            <p className="mt-1 max-w-md text-sm text-muted-foreground">Try a wider date range, another filter, or sync connected machines.</p>
+          <div
+            className="flex flex-1 flex-col items-center justify-center text-center"
+            style={{ minHeight: 280, padding: "clamp(52px, 10vh, 80px) 24px" }}
+          >
+            <div className={`flex size-10 items-center justify-center rounded-full ${emptyView.kind === "error" ? "bg-destructive/10 text-destructive" : emptyView.kind === "offline" ? "bg-amber-500/10 text-amber-500" : "bg-muted text-muted-foreground"}`}>
+              <Icon
+                name={emptyView.kind === "offline" ? "Laptop" : emptyView.kind === "error" ? "AlertCircle" : emptyView.kind === "filtered" ? "Calendar" : "File"}
+                className="size-5"
+                aria-hidden="true"
+              />
+            </div>
+            <div className="mt-4 text-sm font-medium">{emptyView.title}</div>
+            <p className="mt-2 max-w-md text-sm leading-6 text-muted-foreground">{emptyView.description}</p>
           </div>
         ) : (
           <>
@@ -855,8 +873,17 @@ function UsageDashboard() {
           </>
         )}
 
-        <footer className="border-t border-border/70 pb-2 pt-4 text-xs text-muted-foreground">
-          {data.notice} Price sheet {data.pricingVersion}.
+        <footer className={`flex flex-wrap items-center gap-x-6 gap-y-2 pb-1 text-xs text-muted-foreground ${rows.length > 0 ? "border-t border-border/70 pt-4" : "pt-2"}`}>
+          {rows.length > 0 && <span className="min-w-0 flex-1">{data.notice} Price sheet {data.pricingVersion}.</span>}
+          <a
+            href="https://github.com/MayankBansal12/bb-plugin-usage/issues"
+            target="_blank"
+            rel="noreferrer"
+            className="ml-auto inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 font-medium transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.97]"
+          >
+            Report issue or request feature
+            <Icon name="ExternalLink" className="size-3.5" aria-hidden="true" />
+          </a>
         </footer>
       </main>
     </div>
