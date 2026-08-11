@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import { parseClaude, parseCodex, parseGrok, PRICING_REVISION, PRICING_VERSION, type ProviderId, type UsageRecord } from "./collectors";
+import { createSyncCoordinator } from "./lib/sync-coordinator";
+import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 
 const usageRecordSchema = z.object({
   day: z.string(), providerId: z.string(), providerName: z.string(), machineId: z.string(), machineName: z.string(), model: z.string(),
@@ -12,13 +14,17 @@ const sourceStateSchema = z.object({
   machineId: z.string(), providerId: z.string(), status: z.string(), lastAttemptAt: z.string().nullable(),
   lastSuccessAt: z.string().nullable(), recordCount: z.number().int(), error: z.string().nullable(),
 });
+const syncStateSchema = z.object({
+  phase: z.enum(["initializing", "refreshing", "ready", "error"]), running: z.boolean(),
+  startedAt: z.string().nullable(), completedAt: z.string().nullable(), error: z.string().nullable(),
+});
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
 
 export const rpcContract = defineRpcContract({
   dashboard: { input: z.null(), output: z.object({
     mode: z.literal("live"), generatedAt: z.string(), lastSyncedAt: z.string().nullable(), pricingVersion: z.string(),
-    machines: z.array(filterOptionSchema), providers: z.array(filterOptionSchema), records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), notice: z.string(),
+    machines: z.array(filterOptionSchema), providers: z.array(filterOptionSchema), records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), sync: syncStateSchema, notice: z.string(),
   }) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
@@ -181,12 +187,17 @@ function abortableDelay(ms: number, signal: AbortSignal) {
 
 export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration]);
-  let running: Promise<string> | null = null;
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration]);
+  const syncCoordinator = createSyncCoordinator({
+    completedAt: readLastCompletedSyncAt(db),
+    persistCompletedAt(completedAt) {
+      persistLastCompletedSyncAt(db, completedAt);
+    },
+  });
 
   const syncAll = () => {
-    if (running) return running;
-    running = (async () => {
+    const wasRunning = syncCoordinator.snapshot().running;
+    const result = syncCoordinator.run(async () => {
       const machines = await bb.sdk.hosts.list();
       reconcileMachines(db, machines.map((machine) => machine.id));
       for (const machine of machines) {
@@ -201,11 +212,18 @@ export default async function plugin(bb: BbPluginApi) {
           for (const provider of PROVIDERS) upsertState(db, machine.id, provider.id, "unavailable", countForMachine(db, machine.id, provider.id), "Machine home directory could not be resolved.", false);
         }
       }
-      const completedAt = new Date().toISOString();
-      bb.realtime.publish("usage-updated", { completedAt });
-      return completedAt;
-    })().finally(() => { running = null; });
-    return running;
+      return new Date().toISOString();
+    });
+
+    if (!wasRunning) {
+      bb.realtime.publish("usage-updated", { stage: "started" });
+      void result.then(
+        (completedAt) => bb.realtime.publish("usage-updated", { stage: "completed", completedAt }),
+        () => bb.realtime.publish("usage-updated", { stage: "failed" }),
+      );
+    }
+
+    return result;
   };
 
   bb.rpc.register(rpcContract, {
@@ -226,9 +244,9 @@ export default async function plugin(bb: BbPluginApi) {
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id providerId, status, last_attempt_at lastAttemptAt,
         last_success_at lastSuccessAt, record_count recordCount, error FROM usage_sync_state ORDER BY machine_id, provider_id`).all() as SourceState[];
-      const last = db.prepare("SELECT MAX(last_success_at) AS value FROM usage_sync_state").get() as { value: string | null };
-      return { mode: "live" as const, generatedAt: new Date().toISOString(), lastSyncedAt: last.value, pricingVersion: PRICING_VERSION,
-        machines, providers: [...PROVIDERS], records, sources,
+      const sync = syncCoordinator.snapshot();
+      return { mode: "live" as const, generatedAt: new Date().toISOString(), lastSyncedAt: sync.completedAt, pricingVersion: PRICING_VERSION,
+        machines, providers: [...PROVIDERS], records, sources, sync,
         notice: "Local metadata only: prompts and message content are never stored. Dollar values are standard API-equivalent estimates, not subscription charges." };
     },
     sync() {

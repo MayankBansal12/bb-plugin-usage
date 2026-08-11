@@ -3,7 +3,10 @@ import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { paginateItems } from "@/lib/pagination";
+import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
+import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
 
 type Range = 7 | 30 | 90;
@@ -45,6 +48,7 @@ type DashboardData = {
     recordCount: number;
     error: string | null;
   }>;
+  sync: UsageSyncSnapshot;
   notice: string;
 };
 
@@ -407,34 +411,49 @@ function UsageDashboard() {
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [breakdownPage, setBreakdownPage] = useState(1);
-  const [syncing, setSyncing] = useState(false);
+  const [syncRequested, setSyncRequested] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);
   const compactView = contentWidth < 640;
   const stackedView = contentWidth < 900;
+  const syncing = syncRequested || (data ? isUsageSyncInProgress(data.sync) : false);
 
-  const load = useCallback(() => {
+  const load = useCallback(async () => {
     setError(null);
-    void rpc.call("dashboard").then(setData).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    try {
+      const nextData = await rpc.call("dashboard");
+      setData(nextData);
+      if (!isUsageSyncInProgress(nextData.sync)) setSyncRequested(false);
+    } catch (reason) {
+      setSyncRequested(false);
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   }, [rpc]);
 
   const sync = useCallback(() => {
-    setSyncing(true);
+    setSyncRequested(true);
     setError(null);
     void rpc.call("sync")
-      .then(() => rpc.call("dashboard"))
-      .then(setData)
-      .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)))
-      .finally(() => setSyncing(false));
-  }, [rpc]);
+      .then(() => load())
+      .catch((reason) => {
+        setSyncRequested(false);
+        setError(reason instanceof Error ? reason.message : String(reason));
+      });
+  }, [load, rpc]);
 
-  useEffect(load, [load]);
-  useRealtime("usage-updated", load);
+  useEffect(() => { void load(); }, [load]);
+  useRealtime("usage-updated", () => { void load(); });
   useEffect(() => {
     if (realtimeState !== "connected") return;
-    if (hasConnected.current) load();
+    if (hasConnected.current) void load();
     else hasConnected.current = true;
-  }, [realtimeState]);
+  }, [load, realtimeState]);
+
+  useEffect(() => {
+    if (!data || !shouldPollUsage(data.sync)) return;
+    const timer = window.setTimeout(() => { void load(); }, 750);
+    return () => window.clearTimeout(timer);
+  }, [data, load]);
 
   const rows = useMemo(() => {
     if (!data) return [];
@@ -481,7 +500,10 @@ function UsageDashboard() {
   const days = useMemo(() => rangeDays(range), [range]);
 
   useEffect(() => {
-    if (!data) return;
+    if (!data || shouldShowInitialUsageLoading(data.sync)) {
+      publishHeaderControls(null);
+      return;
+    }
     publishHeaderControls({
       machine,
       range,
@@ -513,8 +535,27 @@ function UsageDashboard() {
   if (error) {
     return <div className="flex h-full items-center justify-center p-8 text-sm text-destructive">Could not load usage: {error}</div>;
   }
-  if (!data) {
-    return <div className="flex h-full items-center justify-center p-8 text-sm text-muted-foreground">Loading usage…</div>;
+  if (!data || shouldShowInitialUsageLoading(data.sync)) {
+    return <UsageDashboardSkeleton />;
+  }
+  if (data.sync.phase === "error" && data.sync.completedAt === null) {
+    return (
+      <div className="flex h-full items-center justify-center p-8 text-center">
+        <div className="max-w-md">
+          <div className="text-sm font-medium">Usage couldn’t be collected</div>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">{data.sync.error ?? "The initial machine scan failed."}</p>
+          <button
+            type="button"
+            onClick={sync}
+            disabled={syncing}
+            className="mt-4 inline-flex h-8 items-center justify-center gap-2 rounded-md border border-border px-3 text-sm font-medium transition-colors hover:bg-muted/50 disabled:pointer-events-none disabled:opacity-50"
+          >
+            <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
+            Try again
+          </button>
+        </div>
+      </div>
+    );
   }
 
   const activeProviders = data.providers;
