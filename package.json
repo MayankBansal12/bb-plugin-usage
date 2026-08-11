@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-usage",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "build": "bb plugin build",
