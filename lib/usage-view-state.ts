@@ -32,7 +32,7 @@ export function getSourceIssueMessage(machines: UsageMachineState[], sources: Us
   const details: string[] = [];
   if (offline.length === 1) details.push(`${offline[0]!.name} is offline`);
   else if (offline.length > 1) details.push(`${plural(offline.length, "machine")} are offline`);
-  if (failedScans > 0) details.push(`${plural(failedScans, "provider scan")} failed or ${failedScans === 1 ? "was" : "were"} incomplete`);
+  if (failedScans > 0) details.push(`${plural(failedScans, "agent scan")} failed or ${failedScans === 1 ? "was" : "were"} incomplete`);
 
   return `${details.join("; ")}. Available records are included.`;
 }
@@ -65,7 +65,7 @@ export function getEmptyUsageView({
     return {
       kind: "error",
       title: failedScans.some((source) => source.status === "partial") ? "Usage scan was incomplete" : "Usage couldn’t be collected",
-      description: `${plural(failedScans.length, "provider scan")} failed or returned incomplete data. Try syncing again.`,
+      description: `${plural(failedScans.length, "agent scan")} failed or returned incomplete data. Try syncing again.`,
     };
   }
 
