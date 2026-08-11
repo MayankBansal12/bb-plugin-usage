@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
@@ -80,38 +80,6 @@ function providerColor(providerId: string) {
   let hash = 0;
   for (const character of normalizedId) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
   return FALLBACK_PROVIDER_COLORS[Math.abs(hash) % FALLBACK_PROVIDER_COLORS.length];
-}
-
-type HeaderControlsState = {
-  machine: string;
-  range: Range;
-  machines: DashboardData["machines"];
-  dateLabel: string;
-  syncing: boolean;
-  lastSyncedAt: string | null;
-  stackedView: boolean;
-  setMachine: (value: string) => void;
-  setRange: (value: Range) => void;
-  sync: () => void;
-};
-
-let headerControlsState: HeaderControlsState | null = null;
-const headerControlsListeners = new Set<() => void>();
-
-function publishHeaderControls(next: HeaderControlsState | null) {
-  headerControlsState = next;
-  for (const listener of headerControlsListeners) listener();
-}
-
-function useHeaderControls() {
-  return useSyncExternalStore(
-    (listener) => {
-      headerControlsListeners.add(listener);
-      return () => headerControlsListeners.delete(listener);
-    },
-    () => headerControlsState,
-    () => null,
-  );
 }
 
 function money(value: number) {
@@ -261,37 +229,6 @@ function MachineFilter({
         ))}
       </SelectContent>
     </Select>
-  );
-}
-
-function UsageHeaderControls() {
-  const controls = useHeaderControls();
-  if (!controls || controls.stackedView) return null;
-
-  return (
-    <div className="flex items-center gap-2">
-      <ToggleGroup
-        value={controls.range}
-        onChange={controls.setRange}
-        label={`Date range, ${controls.dateLabel}`}
-        options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
-      />
-      <MachineFilter
-        value={controls.machine}
-        onChange={controls.setMachine}
-        options={[{ value: "all", label: "All machines" }, ...controls.machines.map((item) => ({ value: item.id, label: item.name }))]}
-      />
-      <button
-        type="button"
-        onClick={controls.sync}
-        disabled={controls.syncing}
-        aria-label="Sync usage now"
-        title={controls.lastSyncedAt ? `Last synced ${new Date(controls.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-        className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
-      >
-        <Icon name="RotateCcw" className={`size-4 ${controls.syncing ? "animate-spin" : ""}`} aria-hidden="true" />
-      </button>
-    </div>
   );
 }
 
@@ -500,8 +437,7 @@ function UsageDashboard() {
     cacheSavings: sum.cacheSavings + row.cacheSavingsUsd,
     uncached: sum.uncached + row.uncachedInputTokens,
     output: sum.output + row.outputTokens,
-    unpriced: sum.unpriced + (row.pricingStatus === "unknown" ? row.processedTokens : 0),
-  }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0, unpriced: 0 }), [rows]);
+  }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0 }), [rows]);
 
   type BreakdownRow = { key: string; label: string; agent: string; agentId: string; provider: string; providerId: string; pricingStatus: string; cost: number; tokens: number };
   const modelBreakdown = useMemo(() => {
@@ -530,27 +466,6 @@ function UsageDashboard() {
   }, [rows]);
 
   const days = useMemo(() => rangeDays(range), [range]);
-
-  useEffect(() => {
-    if (!data || shouldShowInitialUsageLoading(data.sync)) {
-      publishHeaderControls(null);
-      return;
-    }
-    publishHeaderControls({
-      machine,
-      range,
-      machines: data.machines,
-      dateLabel: `${formatDay(days[0])}–${formatDay(days[days.length - 1])}`,
-      syncing,
-      lastSyncedAt: data.lastSyncedAt,
-      stackedView,
-      setMachine,
-      setRange,
-      sync,
-    });
-  }, [data, days, machine, range, stackedView, sync, syncing]);
-
-  useEffect(() => () => publishHeaderControls(null), []);
 
   useEffect(() => setBreakdownPage(1), [agent, breakdownMode, machine, modelProvider, range]);
 
@@ -615,10 +530,8 @@ function UsageDashboard() {
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day` },
-    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of observed input` },
-    { label: "Uncached input", value: compact(totals.uncached), detail: `${compact(totals.cacheWrites)} cache writes` },
+    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of input · ${compact(totals.cacheWrites)} writes` },
     { label: "Output", value: compact(totals.output), detail: "Includes reasoning tokens" },
-    { label: "Unpriced tokens", value: compact(totals.unpriced), detail: totals.unpriced > 0 ? "No safe model-price match" : "All observed tokens priced" },
     { label: "Cache savings", value: money(totals.cacheSavings), detail: totals.cost > 0 ? `${(totals.cacheSavings / totals.cost).toFixed(1)}× the raw token cost` : `Price sheet ${data.pricingVersion}` },
   ];
 
@@ -636,41 +549,41 @@ function UsageDashboard() {
           padding: compactView ? "16px" : "20px 24px",
         }}
       >
-        {stackedView && <div className="grid gap-2 border-b border-border/70 pb-4">
-          <ToggleGroup
-            value={range}
-            onChange={setRange}
-            label={`Date range, ${formatDay(days[0])}–${formatDay(days[days.length - 1])}`}
-            options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
-            fill
-          />
-          <div className="flex min-w-0 gap-2">
-            <div className="min-w-0 flex-1">
-              <MachineFilter
-                value={machine}
-                onChange={setMachine}
-                options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]}
-                fill
+        <div className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/[0.12] p-2">
+          <div className={`flex items-center gap-2 ${stackedView ? "w-full" : "mr-1"}`}>
+            <span className="inline-flex size-7 shrink-0 items-center justify-center text-muted-foreground" title="Usage filters">
+              <Icon name="SlidersHorizontal" className="size-4" aria-hidden="true" />
+            </span>
+            <div className={stackedView ? "min-w-0 flex-1" : ""}>
+              <ToggleGroup
+                value={range}
+                onChange={setRange}
+                label={`Date range, ${formatDay(days[0])}–${formatDay(days[days.length - 1])}`}
+                options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
+                fill={stackedView}
               />
             </div>
-            <button
-              type="button"
-              onClick={sync}
-              disabled={syncing}
-              aria-label="Sync usage now"
-              title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-              className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
-            >
-              <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
-            </button>
           </div>
-        </div>}
-
-        <div className="mt-4 flex flex-wrap items-center gap-2">
-          <span className="text-xs font-medium text-muted-foreground">Filter</span>
-          <MachineFilter value={agent} onChange={setAgent} ariaLabel="Filter usage by coding agent" options={[{ value: "all", label: "All agents" }, ...data.agents.map((item) => ({ value: item.id, label: item.name }))]} />
-          <MachineFilter value={modelProvider} onChange={setModelProvider} ariaLabel="Filter usage by model provider" options={[{ value: "all", label: "All model providers" }, ...data.modelProviders.map((item) => ({ value: item.id, label: item.name }))]} />
-          {(agent !== "all" || modelProvider !== "all") && <button type="button" onClick={() => { setAgent("all"); setModelProvider("all"); }} className="h-8 rounded-md px-2.5 text-xs font-medium text-muted-foreground hover:bg-muted/50 hover:text-foreground">Clear</button>}
+          <div className="min-w-[150px] flex-1" style={{ maxWidth: stackedView ? undefined : 180 }}>
+            <MachineFilter value={machine} onChange={setMachine} ariaLabel="Filter usage by machine" options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]} fill />
+          </div>
+          <div className="min-w-[150px] flex-1" style={{ maxWidth: stackedView ? undefined : 180 }}>
+            <MachineFilter value={agent} onChange={setAgent} ariaLabel="Filter usage by coding agent" options={[{ value: "all", label: "All agents" }, ...data.agents.map((item) => ({ value: item.id, label: item.name }))]} fill />
+          </div>
+          <div className="min-w-[170px] flex-1" style={{ maxWidth: stackedView ? undefined : 210 }}>
+            <MachineFilter value={modelProvider} onChange={setModelProvider} ariaLabel="Filter usage by model provider" options={[{ value: "all", label: "All model providers" }, ...data.modelProviders.map((item) => ({ value: item.id, label: item.name }))]} fill />
+          </div>
+          {(machine !== "all" || agent !== "all" || modelProvider !== "all") && <button type="button" onClick={() => { setMachine("all"); setAgent("all"); setModelProvider("all"); }} className="h-8 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.97]">Clear</button>}
+          <button
+            type="button"
+            onClick={sync}
+            disabled={syncing}
+            aria-label="Sync usage now"
+            title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
+            className="ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+          >
+            <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
+          </button>
         </div>
 
         {sourceIssueMessage && rows.length > 0 && (
@@ -700,9 +613,9 @@ function UsageDashboard() {
             <section
               className="grid py-6"
               style={{
-                gridTemplateColumns: stackedView ? "minmax(0, 1fr)" : "minmax(250px, 0.72fr) minmax(0, 1.8fr)",
+                gridTemplateColumns: stackedView ? "minmax(0, 1fr)" : "minmax(330px, 0.92fr) minmax(0, 1.65fr)",
                 alignItems: "start",
-                gap: stackedView ? 20 : contentWidth >= 1024 ? 40 : 32,
+                gap: stackedView ? 20 : contentWidth >= 1024 ? 48 : 36,
               }}
             >
               <div
@@ -714,7 +627,10 @@ function UsageDashboard() {
                   padding: compactView ? 20 : 24,
                 } : undefined}
               >
-                <div className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</div>
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</div>
+                  <ToggleGroup value={costGroup} onChange={setCostGroup} label="Cost breakdown" options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]} />
+                </div>
                 <div
                   className="mt-2 font-semibold tracking-tight tabular-nums"
                   style={{
@@ -726,12 +642,8 @@ function UsageDashboard() {
                   {money(totals.cost)}*
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
-                <div className="mt-4">
-                  <ToggleGroup value={costGroup} onChange={setCostGroup} label="Cost breakdown" options={[{ value: "agent", label: "By agent" }, { value: "provider", label: "By provider" }]} />
-                </div>
-
                 {!stackedView && (
-                  <div className="mt-6 space-y-5">
+                  <div className="mt-7 space-y-5">
                     {providerTotals.map((item) => (
                       <div key={item.id}>
                         <div className="flex items-center justify-between gap-4 text-sm">
@@ -858,30 +770,28 @@ function UsageDashboard() {
             <section className={stackedView ? "pb-2" : "overflow-x-auto border-y border-border"}>
               {stackedView && <h2 className="mb-3 text-sm font-medium text-muted-foreground">Totals</h2>}
               <div
-                className={stackedView ? "grid overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]" : "grid min-w-[960px] grid-cols-6 divide-x divide-border"}
+                className={stackedView ? "grid overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]" : "grid min-w-[720px] grid-cols-4 divide-x divide-border"}
                 style={{
-                  minWidth: stackedView ? 0 : 960,
+                  minWidth: stackedView ? 0 : 720,
                   gridTemplateColumns: stackedView
-                    ? `repeat(${compactView ? 2 : 3}, minmax(0, 1fr))`
-                    : "repeat(6, minmax(0, 1fr))",
+                    ? "repeat(2, minmax(0, 1fr))"
+                    : "repeat(4, minmax(0, 1fr))",
                 }}
               >
                 {metrics.map((metric, index) => {
-                  const columnCount = compactView ? 2 : 3;
-                  const isLastCompactMetric = compactView && index === metrics.length - 1;
+                  const columnCount = 2;
                   return (
                     <div
                       key={metric.label}
                       className="min-w-0"
                       style={{
                         padding: compactView ? 16 : 20,
-                        borderLeft: stackedView && index % columnCount !== 0 && !isLastCompactMetric
+                        borderLeft: stackedView && index % columnCount !== 0
                           ? "1px solid hsl(var(--border) / 0.6)"
                           : undefined,
                         borderTop: stackedView && index >= columnCount
                           ? "1px solid hsl(var(--border) / 0.6)"
                           : undefined,
-                        gridColumn: isLastCompactMetric ? "1 / -1" : undefined,
                       }}
                     >
                       <div className="text-sm text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.label}</div>
@@ -1006,6 +916,5 @@ export default definePluginApp((app) => {
     icon: "ChartColumn",
     path: "usage",
     component: UsageDashboard,
-    headerContent: UsageHeaderControls,
   });
 });

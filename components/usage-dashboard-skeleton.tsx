@@ -7,15 +7,15 @@ export function UsageDashboardSkeleton() {
     <div className="h-full overflow-auto" role="status" aria-label="Loading usage from all machines">
       <span className="sr-only">Collecting usage from all connected machines…</span>
       <main className="mx-auto w-full max-w-[1440px] px-4 pb-6 pt-5 sm:px-6">
-        <div className="flex items-center justify-between gap-4 border-b border-border/70 pb-5">
-          <div className="space-y-2">
-            <ShimmerBlock className="h-3 w-28" />
-            <ShimmerBlock className="h-4 w-56 max-w-[65vw]" />
-          </div>
-          <ShimmerBlock className="h-8 w-28" />
+        <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/[0.12] p-2">
+          <ShimmerBlock className="h-8 w-48" />
+          <ShimmerBlock className="h-8 w-40" />
+          <ShimmerBlock className="h-8 w-40" />
+          <ShimmerBlock className="h-8 w-48" />
+          <ShimmerBlock className="ml-auto size-8" />
         </div>
 
-        <section className="grid gap-8 py-6 md:grid-cols-[minmax(250px,0.72fr)_minmax(0,1.8fr)]">
+        <section className="grid gap-9 py-6 md:grid-cols-[minmax(330px,0.92fr)_minmax(0,1.65fr)] lg:gap-12">
           <div className="space-y-4">
             <ShimmerBlock className="h-3 w-24" />
             <ShimmerBlock className="h-11 w-44" />
@@ -41,8 +41,8 @@ export function UsageDashboardSkeleton() {
           </div>
         </section>
 
-        <section className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border/70 bg-border/70 sm:grid-cols-3 lg:grid-cols-5">
-          {[0, 1, 2, 3, 4].map((item) => (
+        <section className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border/70 bg-border/70 lg:grid-cols-4">
+          {[0, 1, 2, 3].map((item) => (
             <div key={item} className="space-y-3 bg-background p-5">
               <ShimmerBlock className="h-3 w-20" />
               <ShimmerBlock className="h-7 w-24" />
