@@ -1,13 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
+import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWindow } from "@/lib/provider-limits";
 
 type Range = 7 | 30 | 90;
 type ChartMode = "cost" | "tokens";
@@ -15,6 +18,52 @@ type BreakdownMode = "model" | "day";
 type DimensionMode = "agent" | "provider";
 
 const BREAKDOWN_PAGE_SIZE = 10;
+const SHOW_USAGE_LIMITS_STORAGE_KEY = "bb-plugin-usage:show-usage-limits";
+
+type UsageToolbarState = {
+  range: Range;
+  machine: string;
+  showUsageLimits: boolean;
+  machines: DashboardData["machines"];
+  lastSyncedAt: string | null;
+  syncing: boolean;
+};
+
+let usageToolbarState: UsageToolbarState = {
+  range: 7,
+  machine: "all",
+  showUsageLimits: false,
+  machines: [],
+  lastSyncedAt: null,
+  syncing: false,
+};
+let usageToolbarSync: (() => void) | null = null;
+const usageToolbarListeners = new Set<() => void>();
+
+function updateUsageToolbar(next: Partial<UsageToolbarState>) {
+  usageToolbarState = { ...usageToolbarState, ...next };
+  usageToolbarListeners.forEach((listener) => listener());
+}
+
+function useUsageToolbar() {
+  return useSyncExternalStore(
+    (listener) => {
+      usageToolbarListeners.add(listener);
+      return () => usageToolbarListeners.delete(listener);
+    },
+    () => usageToolbarState,
+    () => usageToolbarState,
+  );
+}
+
+function rememberShowUsageLimits(checked: boolean) {
+  updateUsageToolbar({ showUsageLimits: checked });
+  try {
+    window.localStorage.setItem(SHOW_USAGE_LIMITS_STORAGE_KEY, checked ? "true" : "false");
+  } catch {
+    // The preference remains active for this session when storage is unavailable.
+  }
+}
 
 type UsageRecord = {
   day: string;
@@ -53,6 +102,14 @@ type DashboardData = {
     lastSuccessAt: string | null;
     recordCount: number;
     error: string | null;
+  }>;
+  providerLimits: Array<{
+    machineId: string;
+    machineName: string;
+    providerId: string;
+    providerName: string;
+    planLabel: string | null;
+    windows: ProviderLimitWindow[];
   }>;
   sync: UsageSyncSnapshot;
   notice: string;
@@ -93,10 +150,6 @@ function money(value: number) {
 
 function compact(value: number) {
   return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
-}
-
-function pricingLabel(status: string) {
-  return status === "models-dev-exact" ? "models.dev exact" : status === "models-dev-alias" ? "models.dev alias" : status === "logged" ? "Agent reported" : status === "mixed" ? "Mixed" : "Unpriced";
 }
 
 function percentage(value: number, total: number) {
@@ -199,31 +252,40 @@ function MachineFilter({
   onChange,
   options,
   fill = false,
+  width = 180,
+  contentWidth,
   ariaLabel = "Filter usage by machine",
+  triggerLabel,
 }: {
   value: string;
   onChange: (value: string) => void;
   options: Array<{ value: string; label: string }>;
   fill?: boolean;
+  width?: number;
+  contentWidth?: number;
   ariaLabel?: string;
+  triggerLabel?: string;
 }) {
   return (
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger
         aria-label={ariaLabel}
         className="h-8 border-border/70 bg-muted/20 px-2.5 py-0 text-xs font-medium shadow-none hover:bg-muted/40 focus:ring-1 data-[state=open]:bg-muted/40 [&>svg]:size-3.5 [&>svg]:opacity-60"
-        style={{ width: fill ? "100%" : 180 }}
+        style={{ width: fill ? "100%" : width }}
       >
-        <SelectValue />
+        <SelectValue>{triggerLabel}</SelectValue>
       </SelectTrigger>
       <SelectContent
         align="end"
         sideOffset={4}
         className="[&_[role=option]>span:last-child]:truncate"
-        style={{ width: "var(--radix-select-trigger-width)", minWidth: "var(--radix-select-trigger-width)" }}
+        style={{
+          width: contentWidth ?? "var(--radix-select-trigger-width)",
+          minWidth: contentWidth ?? "var(--radix-select-trigger-width)",
+        }}
       >
         {options.map((option) => (
-          <SelectItem key={option.value} value={option.value} className="text-xs">
+          <SelectItem key={option.value} value={option.value} className="whitespace-nowrap text-xs">
             {option.label}
           </SelectItem>
         ))}
@@ -359,16 +421,199 @@ function UsageChart({
   );
 }
 
+function ProviderLimits({
+  limits,
+  contentWidth,
+}: {
+  limits: DashboardData["providerLimits"];
+  contentWidth: number;
+}) {
+  const machineMap = new Map<string, DashboardData["providerLimits"]>();
+  for (const limit of limits) {
+    const providers = machineMap.get(limit.machineId) ?? [];
+    providers.push(limit);
+    machineMap.set(limit.machineId, providers);
+  }
+  const machines = Array.from(machineMap, ([machineId, providers]) => ({
+    machineId,
+    machineName: providers[0]?.machineName ?? "Unknown machine",
+    providers,
+  }));
+  const columnCount = contentWidth < 640 ? 1 : contentWidth < 1080 ? 2 : 3;
+  const constrainHeight = contentWidth >= 1024;
+
+  return (
+    <section className="mt-3 rounded-lg border border-border/70 bg-muted/[0.08] px-3 py-2.5" aria-labelledby="provider-limits-title">
+      <div className="flex items-baseline justify-between gap-3 px-0.5">
+        <h2 id="provider-limits-title" className="text-sm font-medium">Usage limits</h2>
+        <span className="text-xs text-muted-foreground">Current plan windows</span>
+      </div>
+      {machines.length === 0 ? (
+        <p className="mt-2 px-0.5 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
+      ) : (
+        <div
+          className={`mt-4 grid gap-2 ${constrainHeight ? "max-h-60 overflow-y-auto pr-1" : ""}`}
+          style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
+        >
+          {machines.map((machine) => (
+            <div
+              key={machine.machineId}
+              className="min-w-0 rounded-md border border-border/60 bg-muted/20 px-2.5 py-2"
+            >
+              <div className="truncate text-[11px] font-medium text-muted-foreground" title={machine.machineName}>
+                {machine.machineName}
+              </div>
+              <div className="mt-1 divide-y divide-border/50 border-t border-border/50">
+                {machine.providers.map((limit) => (
+                  <div key={limit.providerId} className="py-2 first:pt-1.5 last:pb-0">
+                    <div className="flex min-w-0 items-baseline justify-between gap-3">
+                      <div className="min-w-0 truncate text-xs font-medium">{limit.providerName}</div>
+                      {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
+                    </div>
+                    <div className="mt-1.5 space-y-1.5">
+                      {limit.windows.map((window, index) => {
+                        const reset = formatLimitReset(window.resetsAt);
+                        const usedPercent = clampPercent(window.usedPercent);
+                        return (
+                          <div key={`${window.label}:${index}`}>
+                            <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
+                              <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
+                              <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
+                            </div>
+                            <div
+                              className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
+                              role="progressbar"
+                              aria-label={`${machine.machineName} ${limit.providerName} ${window.label}`}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                              aria-valuenow={Math.round(usedPercent)}
+                            >
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${usedPercent}%`,
+                                  backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(limit.providerId),
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
+  const toolbar = useUsageToolbar();
+  const phoneToolbar = useMediaQuery("(max-width: 479px)");
+  const inBody = placement === "body";
+  const selectedMachineLabel = toolbar.machine === "all"
+    ? "All machines"
+    : toolbar.machines.find((item) => item.id === toolbar.machine)?.name;
+
+  return (
+    <div className={inBody
+      ? "flex w-full flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/[0.12] p-2"
+      : "flex min-w-0 items-center gap-2"}
+    >
+      {!inBody && (
+        <label className="flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground">
+          <Checkbox
+            checked={toolbar.showUsageLimits}
+            onCheckedChange={(checked) => rememberShowUsageLimits(checked === true)}
+            aria-label="Show usage limits"
+          />
+          <span>Show usage limits</span>
+        </label>
+      )}
+      <MachineFilter
+        value={String(toolbar.range)}
+        onChange={(value) => updateUsageToolbar({ range: Number(value) as Range })}
+        ariaLabel="Usage duration"
+        width={inBody ? (phoneToolbar ? 96 : 110) : 118}
+        contentWidth={148}
+        triggerLabel={`Last ${toolbar.range} days`}
+        options={[7, 30, 90].map((value) => ({ value: String(value), label: `Last ${value} days` }))}
+      />
+      <div className={inBody ? "min-w-[120px] flex-1" : undefined}>
+        <MachineFilter
+          value={toolbar.machine}
+          onChange={(machine) => updateUsageToolbar({ machine })}
+          ariaLabel="Filter usage by machine"
+          width={160}
+          fill={inBody}
+          triggerLabel={selectedMachineLabel}
+          options={[{ value: "all", label: "All machines" }, ...toolbar.machines.map((item) => ({ value: item.id, label: item.name }))]}
+        />
+      </div>
+      {inBody && (
+        <label className={`flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground ${phoneToolbar ? "w-full" : ""}`}>
+          <Checkbox
+            checked={toolbar.showUsageLimits}
+            onCheckedChange={(checked) => rememberShowUsageLimits(checked === true)}
+            aria-label="Show usage limits"
+          />
+          <span>Show usage limits</span>
+        </label>
+      )}
+      {!inBody && <UsageSyncButton />}
+    </div>
+  );
+}
+
+function UsageSyncButton() {
+  const toolbar = useUsageToolbar();
+
+  return (
+    <button
+      type="button"
+      onClick={() => usageToolbarSync?.()}
+      disabled={toolbar.syncing || !usageToolbarSync}
+      aria-label="Sync usage now"
+      title={toolbar.lastSyncedAt ? `Last synced ${new Date(toolbar.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
+      className="inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
+    >
+      <Icon name="RotateCcw" className={`size-4 ${toolbar.syncing ? "animate-spin" : ""}`} aria-hidden="true" />
+    </button>
+  );
+}
+
+function UsageHeaderControls() {
+  const compactHeader = useMediaQuery("(max-width: 1023px)");
+
+  useEffect(() => {
+    try {
+      updateUsageToolbar({ showUsageLimits: window.localStorage.getItem(SHOW_USAGE_LIMITS_STORAGE_KEY) === "true" });
+    } catch {
+      // Keep the default unchecked state when storage is unavailable.
+    }
+  }, []);
+
+  if (compactHeader) return <UsageSyncButton />;
+  return <UsageToolbarControls placement="header" />;
+}
+
+function UsageResponsiveControls() {
+  const compactHeader = useMediaQuery("(max-width: 1023px)");
+  if (!compactHeader) return null;
+  return <UsageToolbarControls placement="body" />;
+}
+
 function UsageDashboard() {
   const rpc = useRpc<typeof rpcContract>();
   const realtimeState = useRealtimeConnectionState();
   const hasConnected = useRef(false);
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [range, setRange] = useState<Range>(30);
-  const [machine, setMachine] = useState("all");
-  const [agent, setAgent] = useState("all");
-  const [modelProvider, setModelProvider] = useState("all");
+  const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
   const [costGroup, setCostGroup] = useState<DimensionMode>("agent");
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
@@ -404,6 +649,27 @@ function UsageDashboard() {
       });
   }, [load, rpc]);
 
+  useEffect(() => {
+    usageToolbarSync = sync;
+    return () => {
+      if (usageToolbarSync === sync) usageToolbarSync = null;
+    };
+  }, [sync]);
+
+  useEffect(() => {
+    updateUsageToolbar({
+      machines: data?.machines ?? [],
+      lastSyncedAt: data?.lastSyncedAt ?? null,
+      syncing,
+    });
+  }, [data, syncing]);
+
+  useEffect(() => {
+    if (machine !== "all" && data && !data.machines.some((item) => item.id === machine)) {
+      updateUsageToolbar({ machine: "all" });
+    }
+  }, [data, machine]);
+
   useEffect(() => { void load(); }, [load]);
   useRealtime("usage-updated", () => { void load(); });
   useEffect(() => {
@@ -424,10 +690,8 @@ function UsageDashboard() {
     const cutoffDay = days[0];
     return data.records.filter((row) =>
       row.day >= cutoffDay
-      && (machine === "all" || row.machineId === machine)
-      && (agent === "all" || row.agentId === agent)
-      && (modelProvider === "all" || row.modelProviderId === modelProvider));
-  }, [agent, data, machine, modelProvider, range]);
+      && (machine === "all" || row.machineId === machine));
+  }, [data, machine, range]);
 
   const totals = useMemo(() => rows.reduce((sum, row) => ({
     cost: sum.cost + row.costUsd,
@@ -439,15 +703,14 @@ function UsageDashboard() {
     output: sum.output + row.outputTokens,
   }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0 }), [rows]);
 
-  type BreakdownRow = { key: string; label: string; agent: string; agentId: string; provider: string; providerId: string; pricingStatus: string; cost: number; tokens: number };
+  type BreakdownRow = { key: string; label: string; agent: string; agentId: string; provider: string; providerId: string; cost: number; tokens: number };
   const modelBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
       const key = `${row.agentId}:${row.modelProviderId}:${row.model}`;
-      const current = map.get(key) ?? { key, label: row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, pricingStatus: row.pricingStatus, cost: 0, tokens: 0 };
+      const current = map.get(key) ?? { key, label: row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
-      if (current.pricingStatus !== row.pricingStatus) current.pricingStatus = "mixed";
       map.set(key, current);
     }
     return [...map.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
@@ -456,10 +719,9 @@ function UsageDashboard() {
   const dayBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
-      const current = map.get(row.day) ?? { key: row.day, label: formatDay(row.day, true), agent: "All agents", agentId: "all", provider: "All providers", providerId: "all", pricingStatus: row.pricingStatus, cost: 0, tokens: 0 };
+      const current = map.get(row.day) ?? { key: row.day, label: formatDay(row.day, true), agent: "All agents", agentId: "all", provider: "All providers", providerId: "all", cost: 0, tokens: 0 };
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
-      if (current.pricingStatus !== row.pricingStatus) current.pricingStatus = "mixed";
       map.set(row.day, current);
     }
     return [...map.values()].sort((a, b) => b.key.localeCompare(a.key));
@@ -467,7 +729,7 @@ function UsageDashboard() {
 
   const days = useMemo(() => rangeDays(range), [range]);
 
-  useEffect(() => setBreakdownPage(1), [agent, breakdownMode, machine, modelProvider, range]);
+  useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -517,16 +779,17 @@ function UsageDashboard() {
     tokens: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
   }));
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
-  const visibleSources = data.sources.filter((source) => (machine === "all" || source.machineId === machine) && (agent === "all" || source.agentId === agent));
+  const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
   const emptyView = getEmptyUsageView({
     machines: visibleMachines,
     sources: visibleSources,
-    hasRecordsOutsideView: data.records.some((record) => (machine === "all" || record.machineId === machine) && (agent === "all" || record.agentId === agent) && (modelProvider === "all" || record.modelProviderId === modelProvider)),
+    hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
   const breakdown = breakdownMode === "model" ? modelBreakdown : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
+  const visibleProviderLimits = data.providerLimits.filter((limit) => machine === "all" || limit.machineId === machine);
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day` },
@@ -549,42 +812,11 @@ function UsageDashboard() {
           padding: compactView ? "16px" : "20px 24px",
         }}
       >
-        <div className="mt-1 flex flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/[0.12] p-2">
-          <div className={`flex items-center gap-2 ${stackedView ? "w-full" : "mr-1"}`}>
-            <span className="inline-flex size-7 shrink-0 items-center justify-center text-muted-foreground" title="Usage filters">
-              <Icon name="SlidersHorizontal" className="size-4" aria-hidden="true" />
-            </span>
-            <div className={stackedView ? "min-w-0 flex-1" : ""}>
-              <ToggleGroup
-                value={range}
-                onChange={setRange}
-                label={`Date range, ${formatDay(days[0])}–${formatDay(days[days.length - 1])}`}
-                options={[7, 30, 90].map((value) => ({ value: value as Range, label: `${value} days` }))}
-                fill={stackedView}
-              />
-            </div>
-          </div>
-          <div className="min-w-[150px] flex-1" style={{ maxWidth: stackedView ? undefined : 180 }}>
-            <MachineFilter value={machine} onChange={setMachine} ariaLabel="Filter usage by machine" options={[{ value: "all", label: "All machines" }, ...data.machines.map((item) => ({ value: item.id, label: item.name }))]} fill />
-          </div>
-          <div className="min-w-[150px] flex-1" style={{ maxWidth: stackedView ? undefined : 180 }}>
-            <MachineFilter value={agent} onChange={setAgent} ariaLabel="Filter usage by coding agent" options={[{ value: "all", label: "All agents" }, ...data.agents.map((item) => ({ value: item.id, label: item.name }))]} fill />
-          </div>
-          <div className="min-w-[170px] flex-1" style={{ maxWidth: stackedView ? undefined : 210 }}>
-            <MachineFilter value={modelProvider} onChange={setModelProvider} ariaLabel="Filter usage by model provider" options={[{ value: "all", label: "All model providers" }, ...data.modelProviders.map((item) => ({ value: item.id, label: item.name }))]} fill />
-          </div>
-          {(machine !== "all" || agent !== "all" || modelProvider !== "all") && <button type="button" onClick={() => { setMachine("all"); setAgent("all"); setModelProvider("all"); }} className="h-8 rounded-md px-2.5 text-xs font-medium text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.97]">Clear</button>}
-          <button
-            type="button"
-            onClick={sync}
-            disabled={syncing}
-            aria-label="Sync usage now"
-            title={data.lastSyncedAt ? `Last synced ${new Date(data.lastSyncedAt).toLocaleString()}` : "Sync usage now"}
-            className="ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-md border border-border/70 text-muted-foreground transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:cursor-wait disabled:opacity-50"
-          >
-            <Icon name="RotateCcw" className={`size-4 ${syncing ? "animate-spin" : ""}`} aria-hidden="true" />
-          </button>
-        </div>
+        <UsageResponsiveControls />
+
+        {showUsageLimits && (
+          <ProviderLimits limits={visibleProviderLimits} contentWidth={contentWidth} />
+        )}
 
         {sourceIssueMessage && rows.length > 0 && (
           <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
@@ -643,7 +875,7 @@ function UsageDashboard() {
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
                 {!stackedView && (
-                  <div className="mt-7 space-y-5">
+                  <div className="space-y-5" style={{ marginTop: 28 }}>
                     {providerTotals.map((item) => (
                       <div key={item.id}>
                         <div className="flex items-center justify-between gap-4 text-sm">
@@ -669,7 +901,7 @@ function UsageDashboard() {
                 )}
 
                 {stackedView && (
-                  <div className="mt-5 min-w-0 border-t border-border/60 pt-4">
+                  <div className="mt-7 min-w-0 border-t border-border/60 pt-4">
                     <div className="flex flex-wrap items-center gap-2">
                       <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
                       <ToggleGroup
@@ -774,12 +1006,12 @@ function UsageDashboard() {
                 style={{
                   minWidth: stackedView ? 0 : 720,
                   gridTemplateColumns: stackedView
-                    ? "repeat(2, minmax(0, 1fr))"
+                    ? `repeat(${compactView ? 1 : 2}, minmax(0, 1fr))`
                     : "repeat(4, minmax(0, 1fr))",
                 }}
               >
                 {metrics.map((metric, index) => {
-                  const columnCount = 2;
+                  const columnCount = compactView ? 1 : 2;
                   return (
                     <div
                       key={metric.label}
@@ -828,7 +1060,7 @@ function UsageDashboard() {
                           <div className="mt-1 text-xs tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</div>
                         </div>
                       </div>
-                      <div className="mt-3 flex items-center justify-between gap-3 text-xs tabular-nums text-muted-foreground"><span>{compact(row.tokens)} tokens</span><span>{pricingLabel(row.pricingStatus)}</span></div>
+                      <div className="mt-3 text-xs tabular-nums text-muted-foreground">{compact(row.tokens)} tokens</div>
                     </div>
                   ))}
                 </div>
@@ -843,7 +1075,6 @@ function UsageDashboard() {
                         <th className="pb-3 text-right font-normal">Cost</th>
                         <th className="pb-3 text-right font-normal">Share</th>
                         <th className="pb-3 text-right font-normal">Tokens</th>
-                        <th className="pb-3 text-right font-normal">Pricing</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -855,7 +1086,6 @@ function UsageDashboard() {
                           <td className="py-3 text-right tabular-nums">{money(row.cost)}</td>
                           <td className="py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
                           <td className="py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
-                          <td className="py-3 text-right text-xs text-muted-foreground">{pricingLabel(row.pricingStatus)}</td>
                         </tr>
                       ))}
                     </tbody>
@@ -916,5 +1146,6 @@ export default definePluginApp((app) => {
     icon: "ChartColumn",
     path: "usage",
     component: UsageDashboard,
+    headerContent: UsageHeaderControls,
   });
 });

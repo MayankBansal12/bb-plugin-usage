@@ -26,6 +26,14 @@ const syncStateSchema = z.object({
   phase: z.enum(["initializing", "refreshing", "ready", "error"]), running: z.boolean(),
   startedAt: z.string().nullable(), completedAt: z.string().nullable(), error: z.string().nullable(),
 });
+const providerLimitWindowSchema = z.object({
+  label: z.string(), usedPercent: z.number(), resetsAt: z.string().nullable(),
+  cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
+});
+const providerLimitSchema = z.object({
+  machineId: z.string(), machineName: z.string(), providerId: z.string(), providerName: z.string(),
+  planLabel: z.string().nullable(), windows: z.array(providerLimitWindowSchema),
+});
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
 
@@ -33,7 +41,8 @@ export const rpcContract = defineRpcContract({
   dashboard: { input: z.null(), output: z.object({
     mode: z.literal("live"), generatedAt: z.string(), lastSyncedAt: z.string().nullable(), pricingVersion: z.string(),
     machines: z.array(filterOptionSchema), agents: z.array(filterOptionSchema), modelProviders: z.array(filterOptionSchema),
-    records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), sync: syncStateSchema, notice: z.string(),
+    records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), providerLimits: z.array(providerLimitSchema),
+    sync: syncStateSchema, notice: z.string(),
   }) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
@@ -49,6 +58,12 @@ const AGENTS = [
   { id: "opencode", name: "OpenCode" },
   { id: "pi", name: "Pi" },
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
+
+const LIMIT_PROVIDERS = [
+  { key: "codex", id: "codex", name: "Codex" },
+  { key: "claudeCode", id: "claude", name: "Claude Code" },
+  { key: "cursor", id: "cursor", name: "Cursor" },
+] as const;
 
 const migration = `
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -489,6 +504,28 @@ export default async function plugin(bb: BbPluginApi) {
     async dashboard() {
       const machines = (await bb.sdk.hosts.list()).map((host) => ({ id: host.id, name: host.name, status: host.status }));
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
+      const providerLimits = (await Promise.all(machines
+        .filter((machine) => machine.status === "connected")
+        .map(async (machine) => {
+          try {
+            const usage = await bb.sdk.system.usageLimits({ hostId: machine.id });
+            return LIMIT_PROVIDERS.flatMap((provider) => {
+              const limit = usage[provider.key];
+              if (limit.status !== "ok" || limit.windows.length === 0) return [];
+              return [{
+                machineId: machine.id,
+                machineName: machine.name,
+                providerId: provider.id,
+                providerName: provider.name,
+                planLabel: limit.planLabel,
+                windows: limit.windows,
+              }];
+            });
+          } catch (error) {
+            bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
+            return [];
+          }
+        }))).flat();
       const rows = db.prepare(`WITH canonical AS (
           SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
           JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
@@ -525,6 +562,7 @@ export default async function plugin(bb: BbPluginApi) {
         modelProviders,
         records,
         sources,
+        providerLimits,
         sync,
         notice: "Prompts and message content are never stored. Costs use models.dev estimates when available, then agent-reported cost; subscription charges may differ.",
       };
