@@ -20,7 +20,7 @@ export const rpcContract = defineRpcContract({
     mode: z.literal("live"), generatedAt: z.string(), lastSyncedAt: z.string().nullable(), pricingVersion: z.string(),
     machines: z.array(filterOptionSchema), providers: z.array(filterOptionSchema), records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), notice: z.string(),
   }) },
-  sync: { input: z.null(), output: z.object({ ok: z.literal(true), lastSyncedAt: z.string() }) },
+  sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
@@ -231,7 +231,10 @@ export default async function plugin(bb: BbPluginApi) {
         machines, providers: [...PROVIDERS], records, sources,
         notice: "Local metadata only: prompts and message content are never stored. Dollar values are standard API-equivalent estimates, not subscription charges." };
     },
-    async sync() { return { ok: true as const, lastSyncedAt: await syncAll() }; },
+    sync() {
+      void syncAll().catch((error) => bb.log.error(`Usage sync failed: ${String(error)}`));
+      return { ok: true as const };
+    },
   });
 
   bb.background.service("usage-collector", {
