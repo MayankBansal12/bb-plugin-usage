@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-usage",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "build": "bb plugin build",
@@ -13,7 +13,7 @@
   },
   "bb": {
     "name": "Usage",
-    "description": "Combined AI subscription usage across enrolled machines.",
+    "description": "Coding-agent token usage and estimated API cost across enrolled machines.",
     "branding": {
       "icon": "ChartColumn"
     },
@@ -24,6 +24,7 @@
     "@hugeicons/core-free-icons": "^4.1.3",
     "@hugeicons/react": "^1.1.6",
     "@opencode-ai/models": "^0.0.39",
+    "@radix-ui/react-checkbox": "^1.3.11",
     "@radix-ui/react-select": "^2.3.7",
     "@radix-ui/react-slot": "^1.3.0",
     "class-variance-authority": "^0.7.1",

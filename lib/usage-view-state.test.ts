@@ -39,6 +39,6 @@ describe("usage view state", () => {
     expect(getSourceIssueMessage(
       [offline],
       [{ machineId: offline.id, status: "offline" }, { machineId: offline.id, status: "partial" }],
-    )).toBe("Workstation is offline; 1 provider scan failed or was incomplete. Available records are included.");
+    )).toBe("Workstation is offline; 1 agent scan failed or was incomplete. Available records are included.");
   });
 });

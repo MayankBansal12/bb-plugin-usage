@@ -1,20 +1,32 @@
 # bb-plugin-usage
 
-Track AI usage across Codex, Claude Code, and Grok Agent on all machines enrolled on BB.
+Track coding-agent token usage and estimated API cost across every machine enrolled in BB.
 
 ![Usage dashboard](https://5kas5z928t.ufs.sh/f/wBHVA4PQTleAMvssUiregkXmOAPY4ndWVuS718FbTZLDztxM)
 
 ## Features
 
-- View usage for the last 7, 30, or 90 days.
-- Filter by provider and machine.
-- Sync automatically every 15 minutes or manually with `Sync now`.
+- Collect usage from Codex, Claude Code, Grok Agent, OpenCode, and Pi.
+- Separate the coding agent from the underlying model provider.
+- Group charts and cost summaries by agent or model provider.
+- Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
+- Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
+- Resolve model prices from the bundled [models.dev](https://models.dev) snapshot without inventing prices for ambiguous models.
+- Sync automatically every 15 minutes or manually from the dashboard.
 
-## Supported logs
+## Supported data sources
 
 - Codex: `~/.codex/sessions/**/rollout-*.jsonl`
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`
+- Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
+- OpenCode: `~/.local/share/opencode/opencode.db`, or an optional database override in plugin settings
+
+OpenCode collection requires the `sqlite3` CLI on each enrolled machine that has an OpenCode database. The query is read-only, aggregates only usage metadata, is limited to 365 days and 900 KB of output, and times out after 30 seconds.
+
+The plugin never stores prompts or message content. It stores timestamps, agent/model identifiers, token buckets, pricing status, and aggregate cost. Costs are standard API-rate estimates when models.dev can resolve a model, then agent-reported cost when available. They are not subscription-billing totals.
+
+Missing log roots are treated as normal “no data” results. Offline machines, unreadable files, incomplete discovery, malformed OpenCode output, missing SQLite, query failures, and timeouts are retained as per-agent sync states so available history remains visible with an error notice.
 
 ![Usage by provider](https://5kas5z928t.ufs.sh/f/wBHVA4PQTleAX0mk1Ywqs8NZT3UMHvygFezBaGYxK2w6S1In)
 
@@ -28,22 +40,14 @@ Requires BB 0.36 or newer.
 bb plugin install git:https://github.com/MayankBansal12/bb-plugin-usage.git@main --yes
 ```
 
-Open BB and select **Usage** from the plugin sidebar. The plugin scans supported
-logs from connected machines and refreshes automatically.
+Open BB and select **Usage** from the plugin sidebar. The plugin scans supported local data on connected machines and refreshes automatically.
 
 ## Develop
-
-Clone the repository and install dependencies:
 
 ```sh
 git clone https://github.com/MayankBansal12/bb-plugin-usage.git
 cd bb-plugin-usage
 npm install
-```
-
-Check and build:
-
-```sh
 npm run check
 npm test
 npm run build
