@@ -64,6 +64,36 @@ const LIMIT_PROVIDERS = [
   { key: "claudeCode", id: "claude", name: "Claude Code" },
   { key: "cursor", id: "cursor", name: "Cursor" },
 ] as const;
+const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
+
+export async function loadProviderLimits(
+  bb: BbPluginApi,
+  machines: Array<Machine & { status: string }>,
+  timeoutMs = PROVIDER_LIMITS_TIMEOUT_MS,
+) {
+  return (await Promise.all(machines
+    .filter((machine) => machine.status === "connected")
+    .map(async (machine) => {
+      try {
+        const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
+        return LIMIT_PROVIDERS.flatMap((provider) => {
+          const limit = usage[provider.key];
+          if (limit.status !== "ok" || limit.windows.length === 0) return [];
+          return [{
+            machineId: machine.id,
+            machineName: machine.name,
+            providerId: provider.id,
+            providerName: provider.name,
+            planLabel: limit.planLabel,
+            windows: limit.windows,
+          }];
+        });
+      } catch (error) {
+        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
+        return [];
+      }
+    }))).flat();
+}
 
 const migration = `
 CREATE TABLE IF NOT EXISTS usage_events (
@@ -504,28 +534,7 @@ export default async function plugin(bb: BbPluginApi) {
     async dashboard() {
       const machines = (await bb.sdk.hosts.list()).map((host) => ({ id: host.id, name: host.name, status: host.status }));
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
-      const providerLimits = (await Promise.all(machines
-        .filter((machine) => machine.status === "connected")
-        .map(async (machine) => {
-          try {
-            const usage = await bb.sdk.system.usageLimits({ hostId: machine.id });
-            return LIMIT_PROVIDERS.flatMap((provider) => {
-              const limit = usage[provider.key];
-              if (limit.status !== "ok" || limit.windows.length === 0) return [];
-              return [{
-                machineId: machine.id,
-                machineName: machine.name,
-                providerId: provider.id,
-                providerName: provider.name,
-                planLabel: limit.planLabel,
-                windows: limit.windows,
-              }];
-            });
-          } catch (error) {
-            bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
-            return [];
-          }
-        }))).flat();
+      const providerLimits = await loadProviderLimits(bb, machines);
       const rows = db.prepare(`WITH canonical AS (
           SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
           JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
