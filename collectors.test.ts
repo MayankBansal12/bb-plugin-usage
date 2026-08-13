@@ -48,7 +48,7 @@ describe("usage collectors", () => {
       } },
     ].map(JSON.stringify).join("\n");
     const record = parsePi(content, machine)[0]!;
-    expect(record).toMatchObject({ eventKey: "pi:pi-session:entry-1", agentId: "pi", modelProviderId: "google", loggedCostUsd: 0.0012, processedTokens: 125 });
+    expect(record).toMatchObject({ eventKey: "pi:pi-session:entry-1", agentId: "pi", agentName: "Prime Agent", modelProviderId: "google", loggedCostUsd: 0.0012, processedTokens: 125 });
     expect(JSON.stringify(record)).not.toContain("not retained");
   });
 
