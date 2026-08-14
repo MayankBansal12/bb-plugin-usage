@@ -4,6 +4,7 @@ import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { paginateItems } from "@/lib/pagination";
@@ -782,6 +783,15 @@ function UsageDashboard() {
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
   const refreshError = usageRefreshError(data.sync, error);
+  const dataWarning =
+    refreshError
+      ? {
+          title: "Usage couldn’t be refreshed.",
+          detail: `Showing the last available data${data.lastSyncedAt ? ` from ${new Date(data.lastSyncedAt).toLocaleString()}` : ""}. ${refreshError}${sourceIssueMessage && rows.length > 0 ? ` ${sourceIssueMessage}` : ""}`,
+        }
+      : sourceIssueMessage && rows.length > 0
+        ? { title: "Some usage history is unavailable.", detail: sourceIssueMessage }
+        : null;
   const emptyView = getEmptyUsageView({
     machines: visibleMachines,
     sources: visibleSources,
@@ -819,20 +829,6 @@ function UsageDashboard() {
           <ProviderLimits limits={visibleProviderLimits} contentWidth={contentWidth} />
         )}
 
-        {(refreshError || (sourceIssueMessage && rows.length > 0)) && (
-          <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
-            <Icon name="AlertTriangle" className="size-4 shrink-0 text-amber-500/90" aria-hidden="true" />
-            <span>
-              <span className="font-medium text-foreground/80">
-                {refreshError ? "Usage couldn’t be refreshed." : "Some usage history is unavailable."}
-              </span>{" "}
-              {refreshError && `Showing the last available data${data.lastSyncedAt ? ` from ${new Date(data.lastSyncedAt).toLocaleString()}` : ""}. ${refreshError}`}
-              {refreshError && sourceIssueMessage && rows.length > 0 && " "}
-              {sourceIssueMessage && rows.length > 0 && sourceIssueMessage}
-            </span>
-          </div>
-        )}
-
         {rows.length === 0 ? (
           <div
             className="flex flex-1 flex-col items-center justify-center text-center"
@@ -868,7 +864,28 @@ function UsageDashboard() {
                 } : undefined}
               >
                 <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</span>
+                    {dataWarning && (
+                      <TooltipProvider>
+                        <Tooltip delayDuration={150}>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              aria-label="Usage data warning"
+                              className="inline-flex size-5 -my-1 items-center justify-center rounded text-amber-500/90 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-amber-500 active:scale-[0.96] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            >
+                              <Icon name="Info" className="size-3.5" aria-hidden="true" />
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            <div className="font-medium text-foreground/90">{dataWarning.title}</div>
+                            <div className="mt-0.5 text-muted-foreground">{dataWarning.detail}</div>
+                          </TooltipContent>
+                        </Tooltip>
+                      </TooltipProvider>
+                    )}
+                  </div>
                   <ToggleGroup value={costGroup} onChange={setCostGroup} label="Cost breakdown" options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]} />
                 </div>
                 <div
