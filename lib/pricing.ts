@@ -11,8 +11,22 @@ export type PricingResult = {
 };
 
 type CatalogModel = { id: string; cost?: ModelCost };
-type CatalogProvider = { id?: string; name?: string; models: Record<string, CatalogModel> };
+export type CatalogProvider = { id?: string; name?: string; models: Record<string, CatalogModel> };
 const catalog = providers as unknown as Record<string, CatalogProvider>;
+
+let activeCatalog: { revision: string; providers: Record<string, CatalogProvider> } | null = null;
+
+export function setPricingCatalog(providers: Record<string, CatalogProvider>, revision: string) {
+  activeCatalog = { revision, providers };
+}
+
+export function resetPricingCatalog() {
+  activeCatalog = null;
+}
+
+function activeProviders() {
+  return activeCatalog?.providers ?? catalog;
+}
 
 const providerAliases: Record<string, string> = {
   bedrock: "amazon-bedrock",
@@ -21,8 +35,14 @@ const providerAliases: Record<string, string> = {
   copilot: "github-copilot",
 };
 
-export const PRICING_REVISION = generatedAt;
-export const PRICING_VERSION = generatedAt.slice(0, 10);
+export function pricingRevision() {
+  return activeCatalog?.revision ?? generatedAt;
+}
+
+export function pricingVersion() {
+  const revision = pricingRevision();
+  return (revision.includes("@") ? revision.slice(revision.indexOf("@") + 1) : revision).slice(0, 10);
+}
 
 export function normalizeProviderId(providerId: string) {
   const normalized = providerId.trim().toLowerCase().replace(/_/g, "-");
@@ -71,13 +91,13 @@ function matchWithinProvider(providerId: string, provider: CatalogProvider, mode
 
 export function resolvePricing(rawProviderId: string, model: string): PricingResult {
   const modelProviderId = normalizeProviderId(rawProviderId);
-  const provider = catalog[modelProviderId];
+  const provider = activeProviders()[modelProviderId];
   if (provider) {
     const match = matchWithinProvider(modelProviderId, provider, model);
     if (match) return match;
   }
 
-  const exactMatches = Object.entries(catalog).flatMap(([candidateId, candidate]) => {
+  const exactMatches = Object.entries(activeProviders()).flatMap(([candidateId, candidate]) => {
     const exact = normalizedModelIds(modelProviderId, model).map((modelId) => candidate.models[modelId]).find((item) => item?.cost);
     const price = exact?.cost ? toPrice(exact.cost) : null;
     return price ? [{ modelProviderId: normalizeProviderId(candidateId), modelProviderName: providerName(candidateId, candidate), price }] : [];

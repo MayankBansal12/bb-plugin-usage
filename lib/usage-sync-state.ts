@@ -11,3 +11,7 @@ export function shouldShowInitialUsageLoading(sync: UsageSyncSnapshot) {
 export function shouldPollUsage(sync: UsageSyncSnapshot) {
   return isUsageSyncInProgress(sync);
 }
+
+export function usageRefreshError(sync: UsageSyncSnapshot, requestError: string | null) {
+  return requestError ?? (sync.completedAt ? sync.error : null);
+}

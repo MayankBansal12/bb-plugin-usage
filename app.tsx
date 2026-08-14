@@ -8,7 +8,7 @@ import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
-import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading } from "@/lib/usage-sync-state";
+import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
 import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWindow } from "@/lib/provider-limits";
 
@@ -741,7 +741,7 @@ function UsageDashboard() {
     return () => observer.disconnect();
   }, [data]);
 
-  if (error) {
+  if (error && !data) {
     return <div className="flex h-full items-center justify-center p-8 text-sm text-destructive">Could not load usage: {error}</div>;
   }
   if (!data || shouldShowInitialUsageLoading(data.sync)) {
@@ -781,6 +781,7 @@ function UsageDashboard() {
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
+  const refreshError = usageRefreshError(data.sync, error);
   const emptyView = getEmptyUsageView({
     machines: visibleMachines,
     sources: visibleSources,
@@ -818,10 +819,17 @@ function UsageDashboard() {
           <ProviderLimits limits={visibleProviderLimits} contentWidth={contentWidth} />
         )}
 
-        {sourceIssueMessage && rows.length > 0 && (
+        {(refreshError || (sourceIssueMessage && rows.length > 0)) && (
           <div className="mt-4 flex min-h-9 items-center gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/[0.06] px-3 py-2 text-xs leading-5 text-muted-foreground">
             <Icon name="AlertTriangle" className="size-4 shrink-0 text-amber-500/90" aria-hidden="true" />
-            <span><span className="font-medium text-foreground/80">Some usage history is unavailable.</span> {sourceIssueMessage}</span>
+            <span>
+              <span className="font-medium text-foreground/80">
+                {refreshError ? "Usage couldn’t be refreshed." : "Some usage history is unavailable."}
+              </span>{" "}
+              {refreshError && `Showing the last available data${data.lastSyncedAt ? ` from ${new Date(data.lastSyncedAt).toLocaleString()}` : ""}. ${refreshError}`}
+              {refreshError && sourceIssueMessage && rows.length > 0 && " "}
+              {sourceIssueMessage && rows.length > 0 && sourceIssueMessage}
+            </span>
           </div>
         )}
 

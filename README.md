@@ -11,7 +11,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Group charts and cost summaries by agent or model provider.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
-- Resolve model prices from the bundled [models.dev](https://models.dev) snapshot without inventing prices for ambiguous models.
+- Resolve model prices from [models.dev](https://models.dev), refreshed daily at runtime with the bundled snapshot as fallback, without inventing prices for ambiguous models.
 - Sync automatically every 15 minutes or manually from the dashboard.
 
 ## Supported data sources

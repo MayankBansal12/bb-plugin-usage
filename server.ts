@@ -4,8 +4,10 @@ import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
   parseClaude, parseCodex, parseGrok, parseOpenCode, parsePi,
-  PRICING_REVISION, PRICING_VERSION, type AgentId, type UsageRecord,
+  type AgentId, type UsageRecord,
 } from "./collectors";
+import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
+import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 
@@ -65,6 +67,14 @@ const LIMIT_PROVIDERS = [
   { key: "cursor", id: "cursor", name: "Cursor" },
 ] as const;
 const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
+const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
+const SYNC_HOSTS_TIMEOUT_MS = 10_000;
+const MACHINE_SYNC_TIMEOUT_MS = 60_000;
+
+function timeoutSignal(timeoutMs: number, parent?: AbortSignal) {
+  const timeout = AbortSignal.timeout(timeoutMs);
+  return parent ? AbortSignal.any([parent, timeout]) : timeout;
+}
 
 export async function loadProviderLimits(
   bb: BbPluginApi,
@@ -129,6 +139,9 @@ UPDATE usage_events SET
 CREATE INDEX IF NOT EXISTS usage_events_model_provider_idx ON usage_events(model_provider_id, day);
 `;
 const primeAgentMigration = `UPDATE usage_events SET provider_name='Prime Agent' WHERE provider_id='pi' AND provider_name='Pi';`;
+const pricingCatalogMigration = `CREATE TABLE IF NOT EXISTS pricing_catalog (
+  id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, fetched_at TEXT NOT NULL, data TEXT NOT NULL
+);`;
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -194,7 +207,7 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(source_id) DO UPDATE SET
       machine_name=excluded.machine_name, root_reference=excluded.root_reference, content_sha=excluded.content_sha,
       last_seen_generation=excluded.last_seen_generation, last_success_at=excluded.last_success_at, pricing_version=excluded.pricing_version`)
-      .run(source.id, machine.id, machine.name, agentId, source.rootReference, source.sha256, source.generation, new Date().toISOString(), PRICING_REVISION);
+      .run(source.id, machine.id, machine.name, agentId, source.rootReference, source.sha256, source.generation, new Date().toISOString(), pricingRevision());
     db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
     for (const row of records) {
       insertEvent.run(
@@ -245,6 +258,7 @@ async function discoverJsonSources(
   home: string,
   agentId: Exclude<AgentId, "opencode">,
   settings: CollectorSettings,
+  signal: AbortSignal,
 ): Promise<Discovery> {
   const roots = agentId === "codex" ? [`${home}/.codex/sessions`]
     : agentId === "claude" ? [`${home}/.claude/projects`]
@@ -261,6 +275,7 @@ async function discoverJsonSources(
         path: root,
         query: agentId === "codex" ? "rollout-" : agentId === "grok" ? "unified.jsonl" : ".jsonl",
         limit: 5000,
+        signal,
       });
     } catch (error) {
       if (isNotFound(error)) continue;
@@ -288,18 +303,20 @@ async function syncJsonAgent(
   home: string,
   agentId: Exclude<AgentId, "opencode">,
   settings: CollectorSettings,
+  signal: AbortSignal,
 ) {
   const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
-    const discovery = await discoverJsonSources(bb, machine.id, home, agentId, settings);
+    const discovery = await discoverJsonSources(bb, machine.id, home, agentId, settings, signal);
     let refreshed = 0;
     let readFailures = 0;
     let parseFailures = 0;
     let lastError: string | null = null;
     for (const source of discovery.sources) {
+      if (signal.aborted) throw signal.reason;
       let file;
       try {
-        file = await bb.sdk.files.read({ hostId: machine.id, path: source.path });
+        file = await bb.sdk.files.read({ hostId: machine.id, path: source.path, signal });
       } catch (error) {
         if (isNotFound(error)) continue;
         readFailures += 1;
@@ -313,7 +330,7 @@ async function syncJsonAgent(
       }
       const prior = db.prepare("SELECT content_sha sha256, pricing_version pricingVersion FROM usage_sources WHERE source_id=?")
         .get(source.id) as { sha256?: string; pricingVersion?: string } | undefined;
-      if (prior?.sha256 === file.sha256 && prior.pricingVersion === PRICING_REVISION) {
+      if (prior?.sha256 === file.sha256 && prior.pricingVersion === pricingRevision()) {
         markSourceSeen(db, source.id, generation);
         continue;
       }
@@ -349,7 +366,7 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-async function runHostCommand(bb: BbPluginApi, machine: Machine, command: string) {
+async function runHostCommand(bb: BbPluginApi, machine: Machine, command: string, signal: AbortSignal) {
   const terminal = await bb.sdk.terminals.create({
     scope: { kind: "host_path", hostId: machine.id, cwd: null },
     cols: 120,
@@ -363,9 +380,9 @@ async function runHostCommand(bb: BbPluginApi, machine: Machine, command: string
     while (state.status === "starting" || state.status === "running" || state.status === "disconnected") {
       if (Date.now() >= deadline) throw new Error("OpenCode metadata query timed out after 30 seconds.");
       await delay(200);
-      state = await bb.sdk.terminals.get({ terminalId: terminal.id });
+      state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
     }
-    const output = await bb.sdk.terminals.output({ terminalId: terminal.id, tailBytes: 900_000, limitChunks: 4000 });
+    const output = await bb.sdk.terminals.output({ terminalId: terminal.id, tailBytes: 900_000, limitChunks: 4000, signal });
     if (output.truncated) throw new Error("OpenCode metadata query exceeded the 900 KB output limit.");
     const text = output.chunks.sort((a, b) => a.seq - b.seq)
       .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
@@ -375,7 +392,7 @@ async function runHostCommand(bb: BbPluginApi, machine: Machine, command: string
     }
     return text;
   } finally {
-    try { await bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }); } catch { /* already closed by the host */ }
+    void bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => { /* already closed by the host */ });
   }
 }
 
@@ -425,13 +442,14 @@ async function syncOpenCode(
   machine: Machine,
   home: string,
   settings: CollectorSettings,
+  signal: AbortSignal,
 ) {
   const agentId: AgentId = "opencode";
   const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const databasePath = expandHome(settings.openCodeDatabasePath, home) || `${home}/.local/share/opencode/opencode.db`;
   const sourceId = opaqueId(machine.id, agentId, databasePath);
   try {
-    const output = await runHostCommand(bb, machine, openCodeCommand(databasePath));
+    const output = await runHostCommand(bb, machine, openCodeCommand(databasePath), signal);
     const json = extractOpenCodeJson(output);
     if (json === null) {
       reconcileSources(db, machine.id, agentId, generation);
@@ -482,7 +500,8 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, primeAgentMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, primeAgentMigration, pricingCatalogMigration]);
+  activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
     persistCompletedAt(completedAt) {
@@ -490,31 +509,34 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
 
-  const syncAll = () => {
+  const syncAll = (serviceSignal?: AbortSignal) => {
     const wasRunning = syncCoordinator.snapshot().running;
     const result = syncCoordinator.run(async () => {
-      const machines = await bb.sdk.hosts.list();
+      activateCachedCatalog(db);
+      const machines = await bb.sdk.hosts.list({ signal: timeoutSignal(SYNC_HOSTS_TIMEOUT_MS, serviceSignal) });
       reconcileMachines(db, machines.map((machine) => machine.id));
       const collectorSettings = await settings.get();
       for (const machine of machines) {
+        if (serviceSignal?.aborted) throw serviceSignal.reason;
         if (machine.status !== "connected") {
           for (const agent of AGENTS) upsertState(db, machine.id, agent.id, "offline", countForMachine(db, machine.id, agent.id), null, false);
           continue;
         }
+        const machineSignal = timeoutSignal(MACHINE_SYNC_TIMEOUT_MS, serviceSignal);
         let home: string;
         try {
-          home = (await bb.sdk.hosts.directory({ hostId: machine.id })).directory;
+          home = (await bb.sdk.hosts.directory({ hostId: machine.id, signal: machineSignal })).directory;
         } catch (error) {
           const message = `Machine home directory could not be resolved: ${errorMessage(error)}`;
           for (const agent of AGENTS) upsertState(db, machine.id, agent.id, "unavailable", countForMachine(db, machine.id, agent.id), message, false);
           continue;
         }
         await Promise.all([
-          syncJsonAgent(bb, db, machine, home, "codex", collectorSettings),
-          syncJsonAgent(bb, db, machine, home, "claude", collectorSettings),
-          syncJsonAgent(bb, db, machine, home, "grok", collectorSettings),
-          syncJsonAgent(bb, db, machine, home, "pi", collectorSettings),
-          syncOpenCode(bb, db, machine, home, collectorSettings),
+          syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, machineSignal),
+          syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, machineSignal),
+          syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, machineSignal),
+          syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, machineSignal),
+          syncOpenCode(bb, db, machine, home, collectorSettings, machineSignal),
         ]);
       }
       return new Date().toISOString();
@@ -533,7 +555,15 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.rpc.register(rpcContract, {
     async dashboard() {
-      const machines = (await bb.sdk.hosts.list()).map((host) => ({ id: host.id, name: host.name, status: host.status }));
+      let machines: Array<Machine & { status: string }>;
+      try {
+        machines = (await bb.sdk.hosts.list({ signal: AbortSignal.timeout(DASHBOARD_HOSTS_TIMEOUT_MS) }))
+          .map((host) => ({ id: host.id, name: host.name, status: host.status }));
+      } catch (error) {
+        bb.log.warn(`Machine list unavailable: ${errorMessage(error)}`);
+        machines = db.prepare(`SELECT machine_id id, MAX(machine_name) name, 'unavailable' status
+          FROM usage_sources GROUP BY machine_id ORDER BY name`).all() as typeof machines;
+      }
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
       const providerLimits = await loadProviderLimits(bb, machines);
       const rows = db.prepare(`WITH canonical AS (
@@ -566,7 +596,7 @@ export default async function plugin(bb: BbPluginApi) {
         mode: "live" as const,
         generatedAt: new Date().toISOString(),
         lastSyncedAt: sync.completedAt,
-        pricingVersion: PRICING_VERSION,
+        pricingVersion: pricingVersion(),
         machines,
         agents: [...AGENTS],
         modelProviders,
@@ -586,7 +616,13 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.service("usage-collector", {
     async start(signal) {
       while (!signal.aborted) {
-        try { await syncAll(); } catch (error) { bb.log.error(`Usage sync failed: ${errorMessage(error)}`); }
+        try { await syncAll(signal); } catch (error) {
+          if (!signal.aborted) bb.log.error(`Usage sync failed: ${errorMessage(error)}`);
+        }
+        if (signal.aborted) break;
+        try { await refreshCatalog(db); } catch (error) {
+          bb.log.warn(`models.dev catalog refresh failed: ${errorMessage(error)}`);
+        }
         await abortableDelay(15 * 60_000, signal);
       }
     },
