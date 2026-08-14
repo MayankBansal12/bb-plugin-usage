@@ -5,7 +5,7 @@ vi.mock("@bb/plugin-sdk", () => ({
   defineRpcContract: <T>(contract: T) => contract,
 }));
 
-import plugin, { loadProviderLimits } from "./server";
+import plugin, { loadProviderLimits, runHostCommand } from "./server";
 
 describe("sync RPC", () => {
   it("returns before a slow collection completes", async () => {
@@ -73,5 +73,56 @@ describe("provider limit loading", () => {
       providerId: "codex",
       planLabel: "Pro",
     })]);
+  });
+});
+
+describe("host command output", () => {
+  it("collects output while the terminal is still running, then closes it", async () => {
+    const text = "query result\n__BB_HOST_COMMAND_DONE__:0\n";
+    const create = vi.fn(async (input: unknown) => ({ id: "terminal-1", status: "starting", input }));
+    const get = vi.fn(async () => ({ id: "terminal-1", status: "running" }));
+    const output = vi.fn(async () => ({
+      chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
+      truncated: false,
+    }));
+    const close = vi.fn(async () => undefined);
+    const bb = { sdk: { terminals: { create, get, output, close } } } as unknown as BbPluginApi;
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      "printf result",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).resolves.toBe(text);
+
+    expect(get).toHaveBeenCalledOnce();
+    expect(output).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
+    expect(create.mock.calls[0]?.[0]).toMatchObject({
+      start: { mode: "command", command: expect.stringContaining("__BB_HOST_COMMAND_DONE__") },
+    });
+  });
+
+  it("surfaces a command diagnostic before closing the held terminal", async () => {
+    const text = "__BB_USAGE_ERROR__:sqlite3 is missing\n__BB_HOST_COMMAND_DONE__:127\n";
+    const close = vi.fn(async () => undefined);
+    const bb = {
+      sdk: { terminals: {
+        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
+        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
+        close,
+      } },
+    } as unknown as BbPluginApi;
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      "exit 127",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).rejects.toThrow("sqlite3 is missing");
+    expect(close).toHaveBeenCalledOnce();
   });
 });
