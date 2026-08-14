@@ -1,7 +1,6 @@
-import { normalizeProviderId, resolvePricing, PRICING_REVISION, PRICING_VERSION, type PricingStatus } from "./lib/pricing";
+import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
 export type AgentId = "codex" | "claude" | "grok" | "opencode" | "pi";
-export { PRICING_REVISION, PRICING_VERSION };
 
 export type UsageRecord = {
   eventKey: string;
