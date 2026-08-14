@@ -192,7 +192,7 @@ export function parsePi(content: string, context: ParseContext): UsageRecord[] {
     const timestamp = isoTimestamp(value.timestamp ?? message?.timestamp);
     if (!message || message.role !== "assistant" || !usage || !timestamp) continue;
     records.push(usageRecord({
-      eventKey: `pi:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId: "pi", agentName: "Prime Agent",
+      eventKey: `pi:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId: "pi", agentName: "Pi",
       modelProviderId: text(message.provider, "unknown"), model: text(message.responseModel, text(message.model, "unknown")),
       loggedCostUsd: finite(object(usage.cost)?.total), uncachedInputTokens: count(usage.input),
       cachedInputTokens: count(usage.cacheRead), cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),

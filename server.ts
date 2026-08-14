@@ -58,7 +58,7 @@ const AGENTS = [
   { id: "claude", name: "Claude Code" },
   { id: "grok", name: "Grok Agent" },
   { id: "opencode", name: "OpenCode" },
-  { id: "pi", name: "Prime Agent" },
+  { id: "pi", name: "Pi" },
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
 
 const LIMIT_PROVIDERS = [
@@ -138,7 +138,6 @@ UPDATE usage_events SET
   pricing_status='models-dev-alias';
 CREATE INDEX IF NOT EXISTS usage_events_model_provider_idx ON usage_events(model_provider_id, day);
 `;
-const primeAgentMigration = `UPDATE usage_events SET provider_name='Prime Agent' WHERE provider_id='pi' AND provider_name='Pi';`;
 const pricingCatalogMigration = `CREATE TABLE IF NOT EXISTS pricing_catalog (
   id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, fetched_at TEXT NOT NULL, data TEXT NOT NULL
 );`;
@@ -488,8 +487,8 @@ export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
     piSessionRoots: {
       type: "string",
-      label: "Extra Prime Agent session roots",
-      description: "Optional semicolon-separated absolute paths. Prime Agent (the pi CLI) sessions in ~/.pi/agent/sessions are always scanned.",
+      label: "Extra Pi session roots",
+      description: "Optional semicolon-separated absolute paths. The default ~/.pi/agent/sessions is always scanned.",
       default: "",
     },
     openCodeDatabasePath: {
@@ -500,7 +499,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, primeAgentMigration, pricingCatalogMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),

@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, Grok Agent, OpenCode, and Prime Agent (the pi CLI).
+- Collect usage from Codex, Claude Code, Grok Agent, OpenCode, and Pi.
 - Separate the coding agent from the underlying model provider.
 - Group charts and cost summaries by agent or model provider.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
@@ -19,7 +19,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Codex: `~/.codex/sessions/**/rollout-*.jsonl`
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`
-- Prime Agent: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
+- Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
 - OpenCode: `~/.local/share/opencode/opencode.db`, or an optional database override in plugin settings
 
 OpenCode collection requires the `sqlite3` CLI on each enrolled machine that has an OpenCode database. The query is read-only, aggregates only usage metadata, is limited to 365 days and 900 KB of output, and times out after 30 seconds.
