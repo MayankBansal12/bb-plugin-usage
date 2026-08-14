@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseClaude, parseCodex, parseGrok, parseOpenCode, parsePi } from "./collectors";
+import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi } from "./collectors";
 
 const machine = { machineId: "machine-a", machineName: "Machine A" };
 
@@ -67,5 +67,24 @@ describe("usage collectors", () => {
       { type: "message", id: "e", timestamp: "2026-08-09T00:00:01Z", message: { role: "assistant", provider: "custom-local", model: "my-model", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 } } },
     ].map(JSON.stringify).join("\n");
     expect(parsePi(content, machine)[0]).toMatchObject({ costUsd: 0, pricingStatus: "unknown", processedTokens: 15 });
+  });
+
+  it("prices host-side aggregates without exposing file metadata", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "openai",
+      model: "gpt-5.6-sol",
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    }]);
+    expect(parseHostUsageAggregates(content, "codex", machine)[0]).toMatchObject({
+      eventKey: "codex:machine-a:2026-08-09:openai:gpt-5.6-sol",
+      agentId: "codex",
+      modelProviderId: "openai",
+      processedTokens: 125,
+    });
   });
 });

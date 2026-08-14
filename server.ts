@@ -3,10 +3,15 @@ import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
-  parseClaude, parseCodex, parseGrok, parseOpenCode, parsePi,
+  parseHostUsageAggregates, parseOpenCode,
   type AgentId, type UsageRecord,
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
+import {
+  compressedHostJsonCollectorScript,
+  extractHostJsonScan,
+  type HostJsonAgentId,
+} from "./lib/host-json-collector";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
@@ -69,7 +74,10 @@ const LIMIT_PROVIDERS = [
 const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
-const MACHINE_SYNC_TIMEOUT_MS = 60_000;
+const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
+const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
+const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
+const HISTORY_DAYS = 365;
 
 function timeoutSignal(timeoutMs: number, parent?: AbortSignal) {
   const timeout = AbortSignal.timeout(timeoutMs);
@@ -151,11 +159,6 @@ function errorMessage(error: unknown) {
   return message.replace(/[\r\n]+/g, " ").slice(0, 300) || "Unknown error.";
 }
 
-function isNotFound(error: unknown) {
-  const message = errorMessage(error).toLowerCase();
-  return /not found|enoent|does not exist|no such file|missing/.test(message);
-}
-
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
@@ -220,10 +223,6 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
   })();
 }
 
-function markSourceSeen(db: Database, sourceId: string, generation: string) {
-  db.prepare("UPDATE usage_sources SET last_seen_generation=? WHERE source_id=?").run(generation, sourceId);
-}
-
 function reconcileSources(db: Database, machineId: string, agentId: AgentId, generation: string) {
   db.transaction(() => {
     const stale = db.prepare("SELECT source_id id FROM usage_sources WHERE machine_id=? AND provider_id=? AND last_seen_generation<>?")
@@ -248,51 +247,27 @@ function reconcileMachines(db: Database, machineIds: string[]) {
   })();
 }
 
-type DiscoveredSource = { path: string; id: string; rootReference: string };
-type Discovery = { sources: DiscoveredSource[]; truncated: boolean };
-
-async function discoverJsonSources(
-  bb: BbPluginApi,
-  hostId: string,
-  home: string,
-  agentId: Exclude<AgentId, "opencode">,
-  settings: CollectorSettings,
-  signal: AbortSignal,
-): Promise<Discovery> {
-  const roots = agentId === "codex" ? [`${home}/.codex/sessions`]
+function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+  return agentId === "codex" ? [`${home}/.codex/sessions`]
     : agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
     : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home)];
-  const sources: DiscoveredSource[] = [];
-  let truncated = false;
-
-  for (const root of [...new Set(roots)]) {
-    let result;
-    try {
-      result = await bb.sdk.files.list({
-        hostId,
-        path: root,
-        query: agentId === "codex" ? "rollout-" : agentId === "grok" ? "unified.jsonl" : ".jsonl",
-        limit: 5000,
-        signal,
-      });
-    } catch (error) {
-      if (isNotFound(error)) continue;
-      throw error;
-    }
-    truncated ||= result.truncated;
-    for (const file of result.files) {
-      const path = file.path.startsWith("/") ? file.path : `${root}/${file.path}`;
-      if (!path.endsWith(".jsonl")) continue;
-      if (agentId === "grok" && !path.endsWith("/unified.jsonl")) continue;
-      sources.push({ path, id: opaqueId(hostId, agentId, path), rootReference: opaqueId(root) });
-    }
-  }
-  return { sources: [...new Map(sources.map((source) => [source.id, source])).values()], truncated };
 }
 
-function parserFor(agentId: Exclude<AgentId, "opencode">) {
-  return agentId === "codex" ? parseCodex : agentId === "claude" ? parseClaude : agentId === "grok" ? parseGrok : parsePi;
+function historyStartDay() {
+  const start = new Date();
+  start.setUTCDate(start.getUTCDate() - HISTORY_DAYS);
+  return start.toISOString().slice(0, 10);
+}
+
+function jsonAgentCommand(input: Parameters<typeof compressedHostJsonCollectorScript>[0]) {
+  const script = compressedHostJsonCollectorScript(input);
+  return [
+    "if ! command -v node >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to scan agent usage logs.'; exit 127",
+    "fi",
+    `node -e ${shellQuote(script)}`,
+  ].join("; ");
 }
 
 async function syncJsonAgent(
@@ -300,62 +275,50 @@ async function syncJsonAgent(
   db: Database,
   machine: Machine,
   home: string,
-  agentId: Exclude<AgentId, "opencode">,
+  agentId: HostJsonAgentId,
   settings: CollectorSettings,
   signal: AbortSignal,
 ) {
   const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
-    const discovery = await discoverJsonSources(bb, machine.id, home, agentId, settings, signal);
-    let refreshed = 0;
-    let readFailures = 0;
-    let parseFailures = 0;
-    let lastError: string | null = null;
-    for (const source of discovery.sources) {
-      if (signal.aborted) throw signal.reason;
-      let file;
-      try {
-        file = await bb.sdk.files.read({ hostId: machine.id, path: source.path, signal });
-      } catch (error) {
-        if (isNotFound(error)) continue;
-        readFailures += 1;
-        lastError = errorMessage(error);
-        continue;
-      }
-      if (file.contentEncoding !== "utf8") {
-        readFailures += 1;
-        lastError = "A usage log was not UTF-8 text.";
-        continue;
-      }
-      const prior = db.prepare("SELECT content_sha sha256, pricing_version pricingVersion FROM usage_sources WHERE source_id=?")
-        .get(source.id) as { sha256?: string; pricingVersion?: string } | undefined;
-      if (prior?.sha256 === file.sha256 && prior.pricingVersion === pricingRevision()) {
-        markSourceSeen(db, source.id, generation);
-        continue;
-      }
-      try {
-        const records = parserFor(agentId)(file.content, { machineId: machine.id, machineName: machine.name });
-        upsertSourceEvents(db, { id: source.id, rootReference: source.rootReference, sha256: file.sha256, generation }, machine, agentId, records);
-        refreshed += records.length;
-      } catch (error) {
-        parseFailures += 1;
-        lastError = errorMessage(error);
-      }
-    }
+    const roots = [...new Set(jsonAgentRoots(home, agentId, settings))];
+    const cachePath = `${home}/.cache/bb-plugin-usage/json-log-scan-v1/${agentId}.json`;
+    const output = await runHostCommand(bb, machine, jsonAgentCommand({
+      agentId,
+      roots,
+      cachePath,
+      sinceDay: historyStartDay(),
+    }), signal, {
+      title: `Usage: ${agentId} scan`,
+      timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
+    });
+    const scan = extractHostJsonScan(output);
+    if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
+    const aggregateJson = JSON.stringify(scan.rows);
+    const records = parseHostUsageAggregates(aggregateJson, agentId, {
+      machineId: machine.id,
+      machineName: machine.name,
+    });
+    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...roots);
+    upsertSourceEvents(db, {
+      id: sourceId,
+      rootReference: opaqueId(...roots),
+      sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+      generation,
+    }, machine, agentId, records);
+    reconcileSources(db, machine.id, agentId, generation);
 
-    const failureCount = readFailures + parseFailures;
-    const complete = !discovery.truncated && failureCount === 0;
-    if (complete) reconcileSources(db, machine.id, agentId, generation);
+    const complete = scan.failureCount === 0;
     const recordCount = countForMachine(db, machine.id, agentId);
     const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
-    const error = discovery.truncated ? "File discovery reached the 5,000-file safety limit."
-      : failureCount > 0 ? `${failureCount} source file${failureCount === 1 ? "" : "s"} could not be collected${lastError ? `: ${lastError}` : "."}`
+    const error = scan.failureCount > 0
+      ? `${scan.failureCount} source problem${scan.failureCount === 1 ? "" : "s"} prevented a complete scan${scan.error ? `: ${scan.error}` : "."}`
       : null;
     upsertState(db, machine.id, agentId, status, recordCount, error, complete);
-    bb.log.info(`${machine.name}/${agentId}: ${recordCount} records (${refreshed} refreshed, ${status})`);
+    bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from ${scan.fileCount} files (${scan.changedFileCount} changed, ${scan.reusedFileCount} cached, ${status})`);
   } catch (error) {
     const recordCount = countForMachine(db, machine.id, agentId);
-    const message = `Source discovery failed: ${errorMessage(error)}`;
+    const message = `Usage scan failed: ${errorMessage(error)}`;
     upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
     bb.log.warn(`${machine.name}/${agentId}: ${message}`);
   }
@@ -365,33 +328,61 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-async function runHostCommand(bb: BbPluginApi, machine: Machine, command: string, signal: AbortSignal) {
+type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number };
+
+function heldHostCommand(command: string) {
+  return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '__BB_HOST_COMMAND_DONE__' "$bb_usage_status"; while :; do sleep 3600; done`;
+}
+
+function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["terminals"]["output"]>>) {
+  return output.chunks.sort((a, b) => a.seq - b.seq)
+    .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
+}
+
+export async function runHostCommand(
+  bb: BbPluginApi,
+  machine: Machine,
+  command: string,
+  signal: AbortSignal,
+  options: HostCommandOptions,
+) {
   const terminal = await bb.sdk.terminals.create({
     scope: { kind: "host_path", hostId: machine.id, cwd: null },
     cols: 120,
     rows: 24,
-    title: "Usage: OpenCode scan",
-    start: { mode: "command", command },
+    title: options.title,
+    start: { mode: "command", command: heldHostCommand(command) },
   });
   try {
-    const deadline = Date.now() + 30_000;
-    let state = terminal;
-    while (state.status === "starting" || state.status === "running" || state.status === "disconnected") {
-      if (Date.now() >= deadline) throw new Error("OpenCode metadata query timed out after 30 seconds.");
-      await delay(200);
-      state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
+    const deadline = Date.now() + options.timeoutMs;
+    while (Date.now() < deadline) {
+      const state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
+      if (state.status === "running") {
+        const output = await bb.sdk.terminals.output({
+          terminalId: terminal.id,
+          tailBytes: 900_000,
+          limitChunks: 4000,
+          signal,
+        });
+        if (output.truncated) throw new Error(`${options.title} exceeded the 900 KB output limit.`);
+        const text = terminalOutputText(output);
+        const completion = text.match(/__BB_HOST_COMMAND_DONE__:(\d+)/);
+        if (completion) {
+          const exitCode = Number(completion[1]);
+          if (exitCode !== 0) {
+            const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim();
+            throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
+          }
+          return text;
+        }
+      } else if (state.status !== "starting" && state.status !== "disconnected") {
+        throw new Error(`${options.title} stopped before its output could be collected.`);
+      }
+      await delay(options.pollMs ?? 200);
     }
-    const output = await bb.sdk.terminals.output({ terminalId: terminal.id, tailBytes: 900_000, limitChunks: 4000, signal });
-    if (output.truncated) throw new Error("OpenCode metadata query exceeded the 900 KB output limit.");
-    const text = output.chunks.sort((a, b) => a.seq - b.seq)
-      .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
-    if ((state.exitCode ?? 1) !== 0) {
-      const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim();
-      throw new Error(diagnostic || `OpenCode metadata query exited with code ${state.exitCode ?? "unknown"}.`);
-    }
-    return text;
+    throw new Error(`${options.title} timed out after ${Math.ceil(options.timeoutMs / 1000)} seconds.`);
   } finally {
-    void bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => { /* already closed by the host */ });
+    await bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => { /* already closed by the host */ });
   }
 }
 
@@ -448,7 +439,10 @@ async function syncOpenCode(
   const databasePath = expandHome(settings.openCodeDatabasePath, home) || `${home}/.local/share/opencode/opencode.db`;
   const sourceId = opaqueId(machine.id, agentId, databasePath);
   try {
-    const output = await runHostCommand(bb, machine, openCodeCommand(databasePath), signal);
+    const output = await runHostCommand(bb, machine, openCodeCommand(databasePath), signal, {
+      title: "Usage: OpenCode scan",
+      timeoutMs: OPENCODE_SYNC_TIMEOUT_MS,
+    });
     const json = extractOpenCodeJson(output);
     if (json === null) {
       reconcileSources(db, machine.id, agentId, generation);
@@ -521,21 +515,23 @@ export default async function plugin(bb: BbPluginApi) {
           for (const agent of AGENTS) upsertState(db, machine.id, agent.id, "offline", countForMachine(db, machine.id, agent.id), null, false);
           continue;
         }
-        const machineSignal = timeoutSignal(MACHINE_SYNC_TIMEOUT_MS, serviceSignal);
         let home: string;
         try {
-          home = (await bb.sdk.hosts.directory({ hostId: machine.id, signal: machineSignal })).directory;
+          home = (await bb.sdk.hosts.directory({
+            hostId: machine.id,
+            signal: timeoutSignal(HOST_DIRECTORY_TIMEOUT_MS, serviceSignal),
+          })).directory;
         } catch (error) {
           const message = `Machine home directory could not be resolved: ${errorMessage(error)}`;
           for (const agent of AGENTS) upsertState(db, machine.id, agent.id, "unavailable", countForMachine(db, machine.id, agent.id), message, false);
           continue;
         }
         await Promise.all([
-          syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, machineSignal),
-          syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, machineSignal),
-          syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, machineSignal),
-          syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, machineSignal),
-          syncOpenCode(bb, db, machine, home, collectorSettings, machineSignal),
+          syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncOpenCode(bb, db, machine, home, collectorSettings, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
       return new Date().toISOString();

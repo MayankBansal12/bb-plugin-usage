@@ -40,6 +40,17 @@ type UsageInput = {
 
 type ParseContext = { machineId: string; machineName: string };
 
+export type HostUsageAggregate = {
+  day: string;
+  modelProviderId: string;
+  model: string;
+  loggedCostUsd: number | null;
+  uncachedInputTokens: number;
+  cachedInputTokens: number;
+  cacheWriteTokens: number;
+  outputTokens: number;
+};
+
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
@@ -225,6 +236,44 @@ export function parseOpenCode(content: string, context: ParseContext): UsageReco
       modelProviderId, model, loggedCostUsd: finite(row.loggedCostUsd), uncachedInputTokens: input - cached,
       cachedInputTokens: cached, cacheWriteTokens: count(row.cacheWriteTokens),
       outputTokens: count(row.outputTokens) + count(row.reasoningTokens),
+    }, context)];
+  });
+}
+
+export function parseHostUsageAggregates(content: string, agentId: Exclude<AgentId, "opencode">, context: ParseContext): UsageRecord[] {
+  let values: unknown;
+  try {
+    values = JSON.parse(content.trim() || "[]");
+  } catch {
+    throw new Error(`${agentId} host scan returned malformed JSON.`);
+  }
+  if (!Array.isArray(values)) throw new Error(`${agentId} host scan returned an unexpected result shape.`);
+
+  const agentName = agentId === "codex" ? "Codex"
+    : agentId === "claude" ? "Claude Code"
+    : agentId === "grok" ? "Grok Agent"
+    : "Pi";
+
+  return values.flatMap((raw) => {
+    const row = object(raw);
+    if (!row) return [];
+    const day = text(row.day, "");
+    const timestamp = isoTimestamp(`${day}T00:00:00Z`);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !timestamp) return [];
+    const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
+    const model = text(row.model, "unknown");
+    return [usageRecord({
+      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}`,
+      timestamp,
+      agentId,
+      agentName,
+      modelProviderId,
+      model,
+      loggedCostUsd: finite(row.loggedCostUsd),
+      uncachedInputTokens: count(row.uncachedInputTokens),
+      cachedInputTokens: count(row.cachedInputTokens),
+      cacheWriteTokens: count(row.cacheWriteTokens),
+      outputTokens: count(row.outputTokens),
     }, context)];
   });
 }
