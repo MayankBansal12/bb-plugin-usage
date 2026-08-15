@@ -850,12 +850,12 @@ function UsageDashboard() {
               className="grid py-6"
               style={{
                 gridTemplateColumns: stackedView ? "minmax(0, 1fr)" : "minmax(330px, 0.92fr) minmax(0, 1.65fr)",
-                alignItems: "start",
+                alignItems: "stretch",
                 gap: stackedView ? 20 : contentWidth >= 1024 ? 48 : 36,
               }}
             >
               <div
-                className="min-w-0"
+                className={`min-w-0 flex flex-col${stackedView ? "" : " relative"}`}
                 style={stackedView ? {
                   border: "1px solid hsl(var(--border) / 0.7)",
                   borderRadius: 12,
@@ -863,6 +863,7 @@ function UsageDashboard() {
                   padding: compactView ? 20 : 24,
                 } : undefined}
               >
+                <div className={stackedView ? "flex min-w-0 flex-col" : "absolute inset-0 flex flex-col"}>
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-1.5">
                     <span className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</span>
@@ -900,7 +901,7 @@ function UsageDashboard() {
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
                 {!stackedView && (
-                  <div className="space-y-5" style={{ marginTop: 28 }}>
+                  <div className="space-y-5 overflow-y-auto pr-3 flex-1 min-h-0" style={{ marginTop: 28 }}>
                     {providerTotals.map((item) => (
                       <div key={item.id}>
                         <div className="flex items-center justify-between gap-4 text-sm">
@@ -956,11 +957,12 @@ function UsageDashboard() {
                       ))}
                     </div>
                   </div>
-                )}
+                  )}
+                </div>
               </div>
 
               {!stackedView && (
-                <div className="min-w-0">
+                <div className="min-w-0 flex flex-col">
                   <div className="flex items-center justify-between gap-4">
                     <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
                     <div className="flex flex-wrap items-center gap-2">
