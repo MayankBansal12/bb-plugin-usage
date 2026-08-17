@@ -778,7 +778,7 @@ function UsageDashboard() {
     ...item,
     cost: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.costUsd, 0),
     tokens: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
-  }));
+  })).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);

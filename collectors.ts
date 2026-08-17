@@ -36,6 +36,7 @@ type UsageInput = {
   cachedInputTokens: number;
   cacheWriteTokens: number;
   outputTokens: number;
+  costMode?: "estimate-or-logged" | "positive-logged-only";
 };
 
 type ParseContext = { machineId: string; machineName: string };
@@ -100,9 +101,12 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
   const writes = count(input.cacheWriteTokens);
   const output = count(input.outputTokens);
   const logged = finite(input.loggedCostUsd);
-  const estimated = pricing.price
+  const positiveLogged = logged !== null && logged > 0 ? logged : null;
+  const recordedOnly = input.costMode === "positive-logged-only";
+  const estimated = !recordedOnly && pricing.price
     ? ((uncached * pricing.price.input) + (cached * pricing.price.cached) + (writes * pricing.price.cacheWrite) + (output * pricing.price.output)) / 1_000_000
     : null;
+  const effectiveLogged = recordedOnly ? positiveLogged : logged;
   const timestamp = isoTimestamp(input.timestamp) ?? input.timestamp;
   return {
     eventKey: input.eventKey,
@@ -115,10 +119,10 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
     machineId: context.machineId,
     machineName: context.machineName,
     model: input.model,
-    costUsd: Number((estimated ?? logged ?? 0).toFixed(6)),
-    loggedCostUsd: logged === null ? null : Number(Math.max(0, logged).toFixed(6)),
-    pricingStatus: estimated !== null ? pricing.status : logged !== null ? "logged" : "unknown",
-    cacheSavingsUsd: pricing.price ? Number(((cached * Math.max(0, pricing.price.input - pricing.price.cached)) / 1_000_000).toFixed(6)) : 0,
+    costUsd: Number((estimated ?? effectiveLogged ?? 0).toFixed(6)),
+    loggedCostUsd: effectiveLogged === null ? null : Number(Math.max(0, effectiveLogged).toFixed(6)),
+    pricingStatus: estimated !== null ? pricing.status : effectiveLogged !== null ? "logged" : "unknown",
+    cacheSavingsUsd: !recordedOnly && pricing.price ? Number(((cached * Math.max(0, pricing.price.input - pricing.price.cached)) / 1_000_000).toFixed(6)) : 0,
     processedTokens: uncached + cached + writes + output,
     cachedInputTokens: cached,
     cacheWriteTokens: writes,
@@ -221,22 +225,33 @@ export function parseOpenCode(content: string, context: ParseContext): UsageReco
   }
   if (!Array.isArray(values)) throw new Error("OpenCode returned an unexpected result shape.");
 
-  return values.flatMap((raw) => {
+  return values.map((raw, index) => {
     const row = object(raw);
-    if (!row) return [];
-    const day = text(row.day, "");
+    const day = text(row?.day, "");
     const timestamp = isoTimestamp(`${day}T00:00:00Z`);
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !timestamp) return [];
-    const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
-    const model = text(row.model, "unknown");
-    const input = count(row.inputTokens);
-    const cached = Math.min(input, count(row.cachedInputTokens));
-    return [usageRecord({
-      eventKey: `opencode:${context.machineId}:${day}:${modelProviderId}:${model}`, timestamp, agentId: "opencode", agentName: "OpenCode",
-      modelProviderId, model, loggedCostUsd: finite(row.loggedCostUsd), uncachedInputTokens: input - cached,
-      cachedInputTokens: cached, cacheWriteTokens: count(row.cacheWriteTokens),
-      outputTokens: count(row.outputTokens) + count(row.reasoningTokens),
-    }, context)];
+    const modelProvider = text(row?.modelProviderId, "");
+    const model = text(row?.model, "");
+    const loggedCost = finite(row?.loggedCostUsd);
+    const tokenValues = [
+      row?.inputTokens,
+      row?.cachedInputTokens,
+      row?.cacheWriteTokens,
+      row?.outputTokens,
+      row?.reasoningTokens,
+    ].map(finite);
+    if (!row || !/^\d{4}-\d{2}-\d{2}$/.test(day) || !timestamp || !modelProvider || !model
+      || loggedCost === null
+      || tokenValues.some((value) => value === null || value < 0 || !Number.isInteger(value))) {
+      throw new Error(`OpenCode returned an invalid aggregate row at index ${index}.`);
+    }
+    const modelProviderId = normalizeProviderId(modelProvider);
+    const [input, cached, cacheWrite, output, reasoning] = tokenValues as number[];
+    return usageRecord({
+      eventKey: `opencode:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}`,
+      timestamp, agentId: "opencode", agentName: "OpenCode", modelProviderId, model,
+      loggedCostUsd: loggedCost, costMode: "positive-logged-only", uncachedInputTokens: input,
+      cachedInputTokens: cached, cacheWriteTokens: cacheWrite, outputTokens: output + reasoning,
+    }, context);
   });
 }
 
