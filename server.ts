@@ -56,7 +56,7 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { piSessionRoots: string; openCodeDatabasePath: string };
+type CollectorSettings = { piSessionRoots: string };
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
@@ -77,6 +77,8 @@ const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
+const DASHBOARD_HISTORY_DAYS = 90;
+const OPENCODE_HISTORY_DAYS = DASHBOARD_HISTORY_DAYS;
 const HISTORY_DAYS = 365;
 
 function timeoutSignal(timeoutMs: number, parent?: AbortSignal) {
@@ -370,7 +372,8 @@ export async function runHostCommand(
         if (completion) {
           const exitCode = Number(completion[1]);
           if (exitCode !== 0) {
-            const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim();
+            const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
+              ?? text.replace(/__BB_HOST_COMMAND_DONE__:\d+/g, "").trim().slice(-300);
             throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
           }
           return text;
@@ -386,75 +389,71 @@ export async function runHostCommand(
   }
 }
 
-function openCodeCommand(databasePath: string) {
+export function openCodeCommand() {
+  const oldestDayOffset = OPENCODE_HISTORY_DAYS - 1;
   const sql = `
+WITH recent_sessions AS MATERIALIZED (
+  SELECT id
+  FROM session
+  WHERE time_updated >= CAST(strftime('%s', 'now', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+)
 SELECT
-  date(time_created / 1000, 'unixepoch') AS day,
-  COALESCE(json_extract(data, '$.providerID'), 'unknown') AS modelProviderId,
-  COALESCE(json_extract(data, '$.modelID'), 'unknown') AS model,
-  ROUND(SUM(COALESCE(json_extract(data, '$.cost'), 0)), 9) AS loggedCostUsd,
-  CAST(SUM(COALESCE(json_extract(data, '$.tokens.input'), 0)) AS INTEGER) AS inputTokens,
-  CAST(SUM(COALESCE(json_extract(data, '$.tokens.cache.read'), 0)) AS INTEGER) AS cachedInputTokens,
-  CAST(SUM(COALESCE(json_extract(data, '$.tokens.cache.write'), 0)) AS INTEGER) AS cacheWriteTokens,
-  CAST(SUM(COALESCE(json_extract(data, '$.tokens.output'), 0)) AS INTEGER) AS outputTokens,
-  CAST(SUM(COALESCE(json_extract(data, '$.tokens.reasoning'), 0)) AS INTEGER) AS reasoningTokens
-FROM message
-WHERE json_extract(data, '$.role') = 'assistant'
-  AND time_created >= CAST(strftime('%s', 'now', '-365 days') AS INTEGER) * 1000
+  date(m.time_created / 1000, 'unixepoch') AS day,
+  COALESCE(json_extract(m.data, '$.providerID'), 'unknown') AS modelProviderId,
+  COALESCE(json_extract(m.data, '$.modelID'), 'unknown') AS model,
+  ROUND(SUM(COALESCE(json_extract(m.data, '$.cost'), 0)), 9) AS loggedCostUsd,
+  CAST(SUM(COALESCE(json_extract(m.data, '$.tokens.input'), 0)) AS INTEGER) AS inputTokens,
+  CAST(SUM(COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0)) AS INTEGER) AS cachedInputTokens,
+  CAST(SUM(COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0)) AS INTEGER) AS cacheWriteTokens,
+  CAST(SUM(COALESCE(json_extract(m.data, '$.tokens.output'), 0)) AS INTEGER) AS outputTokens,
+  CAST(SUM(COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0)) AS INTEGER) AS reasoningTokens
+FROM recent_sessions rs
+JOIN message m ON m.session_id = rs.id
+WHERE json_extract(m.data, '$.role') = 'assistant'
+  AND m.time_created >= CAST(strftime('%s', 'now', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
 GROUP BY day, modelProviderId, model
 ORDER BY day, modelProviderId, model;`.trim();
-  const path = shellQuote(databasePath);
   return [
-    `db=${path}`,
-    `if [ ! -f "$db" ]; then printf '%s\\n' '__BB_USAGE_NO_DATABASE__'; exit 0; fi`,
-    `if ! command -v sqlite3 >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:sqlite3 is required to collect OpenCode usage.'; exit 127; fi`,
+    `if ! command -v opencode >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:OpenCode CLI is required to collect OpenCode usage.'; exit 127; fi`,
+    `result=$(opencode db ${shellQuote(sql)} --format json 2>&1)`,
+    `bb_usage_query_status=$?`,
+    `if [ "$bb_usage_query_status" -ne 0 ]; then diagnostic=$(printf '%s' "$result" | tr '\\r\\n' ' ' | cut -c1-240); printf '%s%s\\n' '__BB_USAGE_ERROR__:OpenCode usage query failed' "\${diagnostic:+: $diagnostic}"; exit "$bb_usage_query_status"; fi`,
     `printf '%s\\n' '__BB_USAGE_BEGIN__'`,
-    `sqlite3 -readonly -json "$db" ${shellQuote(sql)}`,
-    `status=$?`,
-    `printf '\\n%s:%s\\n' '__BB_USAGE_END__' "$status"`,
-    `exit "$status"`,
+    `printf '%s\\n' "$result"`,
+    `printf '%s\\n' '__BB_USAGE_END__:0'`,
   ].join("; ");
 }
 
-function extractOpenCodeJson(output: string) {
-  if (output.includes("__BB_USAGE_NO_DATABASE__")) return null;
+export function extractOpenCodeJson(output: string) {
   const start = output.indexOf("__BB_USAGE_BEGIN__");
   const end = output.lastIndexOf("__BB_USAGE_END__:");
   if (start < 0 || end < 0 || end <= start) throw new Error("OpenCode metadata query returned incomplete output.");
   const status = Number(output.slice(end).match(/__BB_USAGE_END__:(\d+)/)?.[1] ?? NaN);
-  if (!Number.isFinite(status) || status !== 0) throw new Error(`OpenCode SQLite query failed with code ${Number.isFinite(status) ? status : "unknown"}.`);
+  if (!Number.isFinite(status) || status !== 0) throw new Error(`OpenCode usage query failed with code ${Number.isFinite(status) ? status : "unknown"}.`);
   return output.slice(start + "__BB_USAGE_BEGIN__".length, end).trim() || "[]";
 }
 
-async function syncOpenCode(
+export async function syncOpenCode(
   bb: BbPluginApi,
   db: Database,
   machine: Machine,
-  home: string,
-  settings: CollectorSettings,
   signal: AbortSignal,
+  executeHostCommand = runHostCommand,
 ) {
   const agentId: AgentId = "opencode";
   const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const databasePath = expandHome(settings.openCodeDatabasePath, home) || `${home}/.local/share/opencode/opencode.db`;
-  const sourceId = opaqueId(machine.id, agentId, databasePath);
+  const sourceId = opaqueId(machine.id, agentId, "opencode-cli-db-v1");
   try {
-    const output = await runHostCommand(bb, machine, openCodeCommand(databasePath), signal, {
+    const output = await executeHostCommand(bb, machine, openCodeCommand(), signal, {
       title: "Usage: OpenCode scan",
       timeoutMs: OPENCODE_SYNC_TIMEOUT_MS,
     });
     const json = extractOpenCodeJson(output);
-    if (json === null) {
-      reconcileSources(db, machine.id, agentId, generation);
-      upsertState(db, machine.id, agentId, "no-data", 0, null, true);
-      bb.log.info(`${machine.name}/opencode: no database found`);
-      return;
-    }
     const records = parseOpenCode(json, { machineId: machine.id, machineName: machine.name });
     const sha256 = createHash("sha256").update(json).digest("hex");
     upsertSourceEvents(db, {
       id: sourceId,
-      rootReference: opaqueId(databasePath),
+      rootReference: opaqueId("opencode-cli-db-v1"),
       sha256,
       generation,
     }, machine, agentId, records);
@@ -470,6 +469,29 @@ async function syncOpenCode(
   }
 }
 
+export function dashboardRecordsSql() {
+  return `WITH canonical AS (
+      SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
+      JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
+      GROUP BY e.event_key
+    ) SELECT day, provider_id agentId, provider_name agentName,
+    model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model,
+    SUM(cost_usd) costUsd,
+    CASE WHEN COUNT(logged_cost_usd)=0 THEN NULL ELSE SUM(logged_cost_usd) END loggedCostUsd,
+    CASE
+      WHEN SUM(CASE WHEN pricing_status='unknown' THEN 1 ELSE 0 END)>0 THEN 'unknown'
+      WHEN SUM(CASE WHEN pricing_status='logged' THEN 1 ELSE 0 END)>0 THEN 'logged'
+      WHEN SUM(CASE WHEN pricing_status='models-dev-alias' THEN 1 ELSE 0 END)>0 THEN 'models-dev-alias'
+      ELSE 'models-dev-exact'
+    END pricingStatus,
+    SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
+    SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
+    SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
+    FROM canonical WHERE day >= date('now', '-${DASHBOARD_HISTORY_DAYS - 1} days')
+    AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
+    GROUP BY day, provider_id, model_provider_id, machine_id, model ORDER BY day`;
+}
+
 function abortableDelay(ms: number, signal: AbortSignal) {
   return new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, ms);
@@ -483,12 +505,6 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Extra Pi session roots",
       description: "Optional semicolon-separated absolute paths. The default ~/.pi/agent/sessions is always scanned.",
-      default: "",
-    },
-    openCodeDatabasePath: {
-      type: "string",
-      label: "OpenCode database path",
-      description: "Optional override. Defaults to ~/.local/share/opencode/opencode.db.",
       default: "",
     },
   });
@@ -531,7 +547,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncOpenCode(bb, db, machine, home, collectorSettings, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
       return new Date().toISOString();
@@ -561,26 +577,7 @@ export default async function plugin(bb: BbPluginApi) {
       }
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
       const providerLimits = await loadProviderLimits(bb, machines);
-      const rows = db.prepare(`WITH canonical AS (
-          SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
-          JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
-          GROUP BY e.event_key
-        ) SELECT day, provider_id agentId, provider_name agentName,
-        model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model,
-        SUM(cost_usd) costUsd,
-        CASE WHEN COUNT(logged_cost_usd)=0 THEN NULL ELSE SUM(logged_cost_usd) END loggedCostUsd,
-        CASE
-          WHEN SUM(CASE WHEN pricing_status='unknown' THEN 1 ELSE 0 END)>0 THEN 'unknown'
-          WHEN SUM(CASE WHEN pricing_status='logged' THEN 1 ELSE 0 END)>0 THEN 'logged'
-          WHEN SUM(CASE WHEN pricing_status='models-dev-alias' THEN 1 ELSE 0 END)>0 THEN 'models-dev-alias'
-          ELSE 'models-dev-exact'
-        END pricingStatus,
-        SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
-        SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
-        SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-        FROM canonical WHERE day >= date('now', '-365 days')
-        AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
-        GROUP BY day, provider_id, model_provider_id, machine_id, model ORDER BY day`).all() as Array<Omit<DashboardRecord, "machineName">>;
+      const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
         last_success_at lastSuccessAt, record_count recordCount, error FROM usage_sync_state ORDER BY machine_id, provider_id`).all() as SourceState[];
@@ -599,7 +596,7 @@ export default async function plugin(bb: BbPluginApi) {
         sources,
         providerLimits,
         sync,
-        notice: "Prompts and message content are never stored. Costs use models.dev estimates when available, then agent-reported cost; subscription charges may differ.",
+        notice: "Prompts and message content are never stored. OpenCode costs use positive agent-recorded values only; other agents use models.dev estimates when available. Subscription charges may differ.",
       };
     },
     sync() {

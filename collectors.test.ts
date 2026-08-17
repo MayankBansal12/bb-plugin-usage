@@ -56,9 +56,26 @@ describe("usage collectors", () => {
     const content = JSON.stringify([{ day: "2026-08-09", modelProviderId: "anthropic", model: "claude-sonnet-5", loggedCostUsd: 0.02, inputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 15, reasoningTokens: 5 }]);
     expect(parseOpenCode(content, machine)[0]).toMatchObject({
       eventKey: "opencode:machine-a:2026-08-09:anthropic:claude-sonnet-5", agentId: "opencode",
-      modelProviderId: "anthropic", processedTokens: 125, outputTokens: 20,
+      modelProviderId: "anthropic", processedTokens: 185, cachedInputTokens: 60, uncachedInputTokens: 100,
+      outputTokens: 20, costUsd: 0.02, loggedCostUsd: 0.02, pricingStatus: "logged", cacheSavingsUsd: 0,
     });
     expect(() => parseOpenCode("not-json", machine)).toThrow("malformed JSON");
+    expect(() => parseOpenCode(JSON.stringify([{}]), machine)).toThrow("invalid aggregate row at index 0");
+    expect(() => parseOpenCode(JSON.stringify([{ day: "2026-08-09" }]), machine)).toThrow("invalid aggregate row at index 0");
+    expect(parseOpenCode("[]", machine)).toEqual([]);
+  });
+
+  it("leaves OpenCode cost unknown when the agent did not record a positive cost", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09", modelProviderId: "openai", model: "gpt-5.6-sol", loggedCostUsd: 0,
+      inputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 15, reasoningTokens: 5,
+    }]);
+    expect(parseOpenCode(content, machine)[0]).toMatchObject({
+      modelProviderId: "openai", costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown", cacheSavingsUsd: 0,
+    });
+    expect(parseOpenCode(content.replace('"loggedCostUsd":0', '"loggedCostUsd":-0.01'), machine)[0]).toMatchObject({
+      costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown",
+    });
   });
 
   it("keeps unknown models visible without inventing a price", () => {

@@ -1,3 +1,4 @@
+import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 
@@ -5,7 +6,9 @@ vi.mock("@bb/plugin-sdk", () => ({
   defineRpcContract: <T>(contract: T) => contract,
 }));
 
-import plugin, { loadProviderLimits, runHostCommand } from "./server";
+import plugin, {
+  dashboardRecordsSql, extractOpenCodeJson, loadProviderLimits, openCodeCommand, runHostCommand, syncOpenCode,
+} from "./server";
 
 describe("sync RPC", () => {
   it("returns before a slow collection completes", async () => {
@@ -105,7 +108,7 @@ describe("host command output", () => {
   });
 
   it("surfaces a command diagnostic before closing the held terminal", async () => {
-    const text = "__BB_USAGE_ERROR__:sqlite3 is missing\n__BB_HOST_COMMAND_DONE__:127\n";
+    const text = "__BB_USAGE_ERROR__:OpenCode query failed\n__BB_HOST_COMMAND_DONE__:1\n";
     const close = vi.fn(async () => undefined);
     const bb = {
       sdk: { terminals: {
@@ -122,7 +125,132 @@ describe("host command output", () => {
       "exit 127",
       new AbortController().signal,
       { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
-    )).rejects.toThrow("sqlite3 is missing");
+    )).rejects.toThrow("OpenCode query failed");
     expect(close).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces bounded terminal output when a command has no structured diagnostic", async () => {
+    const text = "CLI compatibility error\n__BB_HOST_COMMAND_DONE__:1\n";
+    const bb = {
+      sdk: { terminals: {
+        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
+        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
+        close: vi.fn(async () => undefined),
+      } },
+    } as unknown as BbPluginApi;
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      "exit 1",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).rejects.toThrow("CLI compatibility error");
+  });
+
+  it("times out and closes a stalled machine terminal", async () => {
+    const close = vi.fn(async () => undefined);
+    const bb = {
+      sdk: { terminals: {
+        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
+        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+        output: vi.fn(async () => ({ chunks: [], truncated: false })),
+        close,
+      } },
+    } as unknown as BbPluginApi;
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Stalled machine" },
+      "opencode db query",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1, pollMs: 1 },
+    )).rejects.toThrow("timed out");
+    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
+  });
+});
+
+describe("OpenCode query", () => {
+  it("uses the OpenCode CLI for a 90-day aggregate without sqlite3", () => {
+    const command = openCodeCommand();
+    expect(command).toContain("command -v opencode");
+    expect(command).toContain("opencode db");
+    expect(command).toContain("--format json");
+    expect(command).toContain("bb_usage_query_status=$?");
+    expect(command).not.toMatch(/(?:^|; )status=\$\?/);
+    expect(command).not.toContain("sqlite3");
+    expect(command).toContain("time_created >= CAST(strftime");
+    expect(command).toContain("-89 days");
+    expect(command).not.toContain("-365 days");
+    expect(command).toContain("WITH recent_sessions AS MATERIALIZED");
+    expect(command).toContain("FROM session");
+    expect(command).toContain("JOIN message m ON m.session_id = rs.id");
+    expect(command).toContain("time_updated >= CAST(strftime");
+    expect(command).toContain("$.role");
+    expect(command).toContain("assistant");
+    expect(command).toContain("$.tokens.cache.read");
+  });
+
+  it("rejects failed and incomplete OpenCode query output", () => {
+    expect(() => extractOpenCodeJson("no markers")).toThrow("incomplete output");
+    expect(() => extractOpenCodeJson("__BB_USAGE_BEGIN__\n[]\n__BB_USAGE_END__:1")).toThrow("failed with code 1");
+  });
+
+  it("retains prior usage and isolates a failed OpenCode query to its source state", async () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE usage_events (event_key TEXT PRIMARY KEY);
+      CREATE TABLE usage_sources (
+        source_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, machine_name TEXT NOT NULL, provider_id TEXT NOT NULL
+      );
+      CREATE TABLE usage_event_sources (event_key TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY (event_key, source_id));
+      CREATE TABLE usage_sync_state (
+        machine_id TEXT NOT NULL, provider_id TEXT NOT NULL, status TEXT NOT NULL, last_attempt_at TEXT,
+        last_success_at TEXT, record_count INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY (machine_id, provider_id)
+      );
+      INSERT INTO usage_events (event_key) VALUES ('existing-event');
+      INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id)
+        VALUES ('existing-source', 'host-1', 'Machine', 'opencode');
+      INSERT INTO usage_event_sources (event_key, source_id) VALUES ('existing-event', 'existing-source');
+    `);
+    const warn = vi.fn();
+    const bb = { log: { warn } } as unknown as BbPluginApi;
+
+    await expect(syncOpenCode(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      new AbortController().signal,
+      async () => { throw new Error("query stalled"); },
+    )).resolves.toBeUndefined();
+
+    expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get()).toEqual({
+      status: "unavailable", recordCount: 1, error: "query stalled",
+    });
+    expect(warn).toHaveBeenCalledWith("Machine/opencode: query stalled");
+
+    await expect(syncOpenCode(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      new AbortController().signal,
+      async () => "__BB_USAGE_BEGIN__\n[{}]\n__BB_USAGE_END__:0\n__BB_HOST_COMMAND_DONE__:0\n",
+    )).resolves.toBeUndefined();
+
+    expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get()).toEqual({
+      status: "unavailable", recordCount: 1, error: "OpenCode returned an invalid aggregate row at index 0.",
+    });
+    db.close();
+  });
+});
+
+describe("dashboard query", () => {
+  it("returns only the 90 calendar days supported by the UI", () => {
+    const sql = dashboardRecordsSql();
+    expect(sql).toContain("day >= date('now', '-89 days')");
+    expect(sql).not.toContain("-365 days");
   });
 });
