@@ -57,7 +57,9 @@ const scanResultSchema = z.object({
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
-  const cacheVersion = 1;
+  // Version 2 retains hashed Claude response identities so repeated transcript
+  // rows and copied/forked transcripts can be deduplicated before aggregation.
+  const cacheVersion = 2;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
@@ -65,7 +67,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
 
-  type CacheEntry = { signature: string; rows: HostUsageAggregate[] };
+  type CachedUsageRow = HostUsageAggregate & { eventKey?: string };
+  type CacheEntry = { signature: string; rows: CachedUsageRow[] };
   type Cache = { version: number; agentId: HostJsonAgentId; files: Record<string, CacheEntry> };
   const failures: string[] = [];
   let discoveryFailed = false;
@@ -97,7 +100,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     return result >= input.sinceDay ? result : null;
   }
 
-  function validRow(value: unknown): value is HostUsageAggregate {
+  function validRow(value: unknown): value is CachedUsageRow {
     const row = object(value);
     return Boolean(row
       && typeof row.day === "string"
@@ -107,7 +110,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       && finite(row.uncachedInputTokens) !== null
       && finite(row.cachedInputTokens) !== null
       && finite(row.cacheWriteTokens) !== null
-      && finite(row.outputTokens) !== null);
+      && finite(row.outputTokens) !== null
+      && (row.eventKey === undefined || typeof row.eventKey === "string"));
   }
 
   function validCacheEntry(value: unknown): value is CacheEntry {
@@ -141,6 +145,23 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     if (row.loggedCostUsd !== null) prior.loggedCostUsd = (prior.loggedCostUsd ?? 0) + row.loggedCostUsd;
   }
 
+  function mergeEvent(target: Map<string, CachedUsageRow>, raw: CachedUsageRow) {
+    if (!raw.eventKey) return;
+    const prior = target.get(raw.eventKey);
+    if (!prior) {
+      target.set(raw.eventKey, raw);
+      return;
+    }
+    // Claude currently repeats the same final counters on every content-block
+    // row. Maxima also handle a partially-written/incremental row safely
+    // without multiplying one API response's usage.
+    prior.uncachedInputTokens = Math.max(prior.uncachedInputTokens, raw.uncachedInputTokens);
+    prior.cachedInputTokens = Math.max(prior.cachedInputTokens, raw.cachedInputTokens);
+    prior.cacheWriteTokens = Math.max(prior.cacheWriteTokens, raw.cacheWriteTokens);
+    prior.outputTokens = Math.max(prior.outputTokens, raw.outputTokens);
+    if (raw.loggedCostUsd !== null) prior.loggedCostUsd = Math.max(prior.loggedCostUsd ?? 0, raw.loggedCostUsd);
+  }
+
   function matches(filePath: string) {
     const name = path.basename(filePath);
     if (input.agentId === "codex") return name.startsWith("rollout-") && name.endsWith(".jsonl");
@@ -166,8 +187,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     }
   }
 
-  async function parseFile(filePath: string) {
+  async function parseFile(filePath: string): Promise<CachedUsageRow[]> {
     const rows = new Map<string, HostUsageAggregate>();
+    const events = new Map<string, CachedUsageRow>();
     let codexModel = "codex-unknown";
     const stream = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 1024 * 1024 });
     const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -209,10 +231,16 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const writes = count(usage.cache_creation_input_tokens);
         const output = count(usage.output_tokens);
         if (model === "<synthetic>" && uncached + cached + writes + output === 0) continue;
-        add(rows, {
+        const rawIdentity = typeof message.id === "string" && message.id
+          ? `message:${message.id}`
+          : typeof value.requestId === "string" && value.requestId ? `request:${value.requestId}` : null;
+        const row: CachedUsageRow = {
           day: usageDay, modelProviderId: "anthropic", model, loggedCostUsd: null,
           uncachedInputTokens: uncached, cachedInputTokens: cached, cacheWriteTokens: writes, outputTokens: output,
-        });
+          eventKey: rawIdentity ? crypto.createHash("sha256").update(rawIdentity).digest("hex") : undefined,
+        };
+        if (row.eventKey) mergeEvent(events, row);
+        else add(rows, row);
         continue;
       }
 
@@ -245,7 +273,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
       });
     }
-    return [...rows.values()];
+    return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
   }
 
   let cache: Cache = { version: cacheVersion, agentId: input.agentId, files: {} };
@@ -268,6 +296,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   discovered.sort();
   const nextFiles: Record<string, CacheEntry> = {};
   const allRows = new Map<string, HostUsageAggregate>();
+  const allEvents = new Map<string, CachedUsageRow>();
   let fileCount = 0;
   let changedFileCount = 0;
   let reusedFileCount = 0;
@@ -282,19 +311,19 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       const signature = `${stat.size}:${Math.trunc(stat.mtimeMs)}`;
       if (prior?.signature === signature && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
         nextFiles[sourceId] = prior;
-        for (const row of prior.rows) add(allRows, row);
+        for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
         reusedFileCount += 1;
         continue;
       }
       const rows = await parseFile(filePath);
       nextFiles[sourceId] = { signature, rows };
-      for (const row of rows) add(allRows, row);
+      for (const row of rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
       changedFileCount += 1;
     } catch {
       failures.push("A usage log could not be read.");
       if (prior && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
         nextFiles[sourceId] = prior;
-        for (const row of prior.rows) add(allRows, row);
+        for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
       }
     }
   }
@@ -303,7 +332,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     for (const [sourceId, prior] of Object.entries(cache.files)) {
       if (nextFiles[sourceId] || !Array.isArray(prior.rows) || !prior.rows.every(validRow)) continue;
       nextFiles[sourceId] = prior;
-      for (const row of prior.rows) add(allRows, row);
+      for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
     }
   }
 
@@ -320,6 +349,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     failures.push("The metadata-only usage cache could not be updated.");
   }
 
+  for (const row of allEvents.values()) add(allRows, row);
   const rows = [...allRows.values()].sort((a, b) => a.day.localeCompare(b.day)
     || a.modelProviderId.localeCompare(b.modelProviderId) || a.model.localeCompare(b.model));
   const result: HostJsonScanResult = {
