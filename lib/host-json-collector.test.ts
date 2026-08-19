@@ -77,7 +77,7 @@ describe("host JSON usage collector", () => {
   it.each([
     ["claude", "session.jsonl", {
       type: "assistant", timestamp: "2026-08-09T00:00:00Z",
-      message: { model: "claude-sonnet-5", content: "private", usage: { input_tokens: 40, cache_read_input_tokens: 60, cache_creation_input_tokens: 5, output_tokens: 20 } },
+      message: { id: "message-private", model: "claude-sonnet-5", content: "private", usage: { input_tokens: 40, cache_read_input_tokens: 60, cache_creation_input_tokens: 5, output_tokens: 20 } },
     }, { modelProviderId: "anthropic", uncachedInputTokens: 40, cachedInputTokens: 60, outputTokens: 20 }],
     ["grok", "unified.jsonl", {
       ts: "2026-08-09T00:00:00Z", msg: "shell.turn.inference_done",
@@ -97,6 +97,67 @@ describe("host JSON usage collector", () => {
     const result = await scan(agentId, root, cachePath);
     expect(result.failureCount).toBe(0);
     expect(result.rows).toEqual([expect.objectContaining(expected)]);
-    expect(await readFile(cachePath, "utf8")).not.toContain("private");
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toContain("private");
+    expect(cache).not.toContain("message-private");
+  });
+
+  it("counts each Claude API response once across repeated rows, files, and cached scans", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "projects");
+    const cachePath = join(directory, "cache", "claude.json");
+    await mkdir(root, { recursive: true });
+    const repeated = {
+      type: "assistant", timestamp: "2026-08-09T00:00:00Z", requestId: "request-1",
+      message: { id: "message-1", model: "claude-sonnet-5", content: "private", usage: {
+        input_tokens: 40, cache_read_input_tokens: 60, cache_creation_input_tokens: 5, output_tokens: 20,
+      } },
+    };
+    const distinct = {
+      type: "assistant", timestamp: "2026-08-09T00:01:00Z", requestId: "request-2",
+      message: { id: "message-2", model: "claude-sonnet-5", usage: {
+        input_tokens: 10, cache_read_input_tokens: 20, cache_creation_input_tokens: 2, output_tokens: 8,
+      } },
+    };
+    await writeFile(join(root, "session-a.jsonl"), [repeated, repeated, distinct].map((value) => JSON.stringify(value)).join("\n"));
+    await writeFile(join(root, "session-copy.jsonl"), JSON.stringify(repeated));
+
+    const first = await scan("claude", root, cachePath);
+    expect(first).toMatchObject({ fileCount: 2, changedFileCount: 2, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual([expect.objectContaining({
+      day: "2026-08-09",
+      modelProviderId: "anthropic",
+      model: "claude-sonnet-5",
+      uncachedInputTokens: 50,
+      cachedInputTokens: 80,
+      cacheWriteTokens: 7,
+      outputTokens: 28,
+    })]);
+
+    const second = await scan("claude", root, cachePath);
+    expect(second).toMatchObject({ fileCount: 2, changedFileCount: 0, reusedFileCount: 2, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
+  it("uses the largest counters when repeated Claude rows contain an incremental snapshot", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "projects");
+    const cachePath = join(directory, "cache", "claude.json");
+    await mkdir(root, { recursive: true });
+    const event = (outputTokens: number) => ({
+      type: "assistant", timestamp: "2026-08-09T00:00:00Z",
+      message: { id: "message-1", model: "claude-sonnet-5", usage: {
+        input_tokens: 40, cache_read_input_tokens: 60, cache_creation_input_tokens: 5, output_tokens: outputTokens,
+      } },
+    });
+    await writeFile(join(root, "session.jsonl"), [event(5), event(20)].map((value) => JSON.stringify(value)).join("\n"));
+
+    const result = await scan("claude", root, cachePath);
+    expect(result.rows).toEqual([expect.objectContaining({
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    })]);
   });
 });
