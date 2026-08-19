@@ -44,7 +44,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "grok", "pi"]),
+  agentId: z.enum(["codex", "claude", "grok", "pi", "prime"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -61,7 +61,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "grok", "pi"]);
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "grok", "pi", "prime"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
 
@@ -231,19 +231,21 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         continue;
       }
 
-      if (value.type !== "message") continue;
-      const message = object(value.message);
-      const usage = object(message?.usage);
-      const usageDay = day(value.timestamp ?? message?.timestamp);
-      if (!message || message.role !== "assistant" || !usage || !usageDay) continue;
-      add(rows, {
-        day: usageDay,
-        modelProviderId: text(message.provider, "unknown"),
-        model: text(message.responseModel, text(message.model, "unknown")),
-        loggedCostUsd: finite(object(usage.cost)?.total),
-        uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
-        cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
-      });
+      if (input.agentId === "pi" || input.agentId === "prime") {
+        if (value.type !== "message") continue;
+        const message = object(value.message);
+        const usage = object(message?.usage);
+        const usageDay = day(value.timestamp ?? message?.timestamp);
+        if (!message || message.role !== "assistant" || !usage || !usageDay) continue;
+        add(rows, {
+          day: usageDay,
+          modelProviderId: text(message.provider, "unknown"),
+          model: text(message.responseModel, text(message.model, "unknown")),
+          loggedCostUsd: finite(object(usage.cost)?.total),
+          uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
+          cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
+        });
+      }
     }
     return [...rows.values()];
   }

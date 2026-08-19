@@ -1,6 +1,6 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
-export type AgentId = "codex" | "claude" | "grok" | "opencode" | "pi";
+export type AgentId = "codex" | "claude" | "grok" | "opencode" | "pi" | "prime";
 
 export type UsageRecord = {
   eventKey: string;
@@ -196,7 +196,12 @@ export function parseGrok(content: string, context: ParseContext): UsageRecord[]
   return records;
 }
 
-export function parsePi(content: string, context: ParseContext): UsageRecord[] {
+function parsePiCompatible(
+  content: string,
+  context: ParseContext,
+  agentId: "pi" | "prime",
+  agentName: "Pi" | "Prime Agent",
+): UsageRecord[] {
   const records: UsageRecord[] = [];
   let sessionId = "session-unknown";
   for (const { value, line } of lines(content)) {
@@ -207,13 +212,21 @@ export function parsePi(content: string, context: ParseContext): UsageRecord[] {
     const timestamp = isoTimestamp(value.timestamp ?? message?.timestamp);
     if (!message || message.role !== "assistant" || !usage || !timestamp) continue;
     records.push(usageRecord({
-      eventKey: `pi:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId: "pi", agentName: "Pi",
+      eventKey: `${agentId}:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId, agentName,
       modelProviderId: text(message.provider, "unknown"), model: text(message.responseModel, text(message.model, "unknown")),
       loggedCostUsd: finite(object(usage.cost)?.total), uncachedInputTokens: count(usage.input),
       cachedInputTokens: count(usage.cacheRead), cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
     }, context));
   }
   return records;
+}
+
+export function parsePi(content: string, context: ParseContext): UsageRecord[] {
+  return parsePiCompatible(content, context, "pi", "Pi");
+}
+
+export function parsePrime(content: string, context: ParseContext): UsageRecord[] {
+  return parsePiCompatible(content, context, "prime", "Prime Agent");
 }
 
 export function parseOpenCode(content: string, context: ParseContext): UsageRecord[] {
@@ -267,6 +280,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
   const agentName = agentId === "codex" ? "Codex"
     : agentId === "claude" ? "Claude Code"
     : agentId === "grok" ? "Grok Agent"
+    : agentId === "prime" ? "Prime Agent"
     : "Pi";
 
   return values.flatMap((raw) => {
