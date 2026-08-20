@@ -61,6 +61,7 @@ type CollectorSettings = { piSessionRoots: string };
 const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "fx", name: "FX" },
   { id: "grok", name: "Grok Agent" },
   { id: "opencode", name: "OpenCode" },
   { id: "pi", name: "Pi" },
@@ -252,6 +253,7 @@ function reconcileMachines(db: Database, machineIds: string[]) {
 function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
   return agentId === "codex" ? [`${home}/.codex/sessions`]
     : agentId === "claude" ? [`${home}/.claude/projects`]
+    : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
     : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home)];
 }
@@ -545,6 +547,7 @@ export default async function plugin(bb: BbPluginApi) {
         await Promise.all([
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
@@ -596,7 +599,7 @@ export default async function plugin(bb: BbPluginApi) {
         sources,
         providerLimits,
         sync,
-        notice: "Prompts and message content are never stored. OpenCode costs use positive agent-recorded values only; other agents use models.dev estimates when available. Subscription charges may differ.",
+        notice: "Prompts and message content are never stored. FX uses FX-recorded spend, OpenCode uses positive agent-recorded costs, and other agents use models.dev estimates when available. Subscription charges may differ.",
       };
     },
     sync() {

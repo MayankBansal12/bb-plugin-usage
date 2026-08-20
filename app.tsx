@@ -119,6 +119,7 @@ type DashboardData = {
 const PROVIDER_COLORS: Record<string, string> = {
   codex: "#10A37F",
   claude: "#D97757",
+  fx: "#F43F5E",
   grok: "#6E7CF6",
   opencode: "#0EA5E9",
   pi: "#F59E0B",

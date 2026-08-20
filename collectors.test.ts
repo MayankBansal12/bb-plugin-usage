@@ -104,4 +104,39 @@ describe("usage collectors", () => {
       processedTokens: 125,
     });
   });
+
+  it("uses FX-recorded spend without replacing it with API-rate estimates", () => {
+    const aggregate = (loggedCostUsd: number | null) => JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "zai",
+      model: "zai/glm-5.2",
+      loggedCostUsd,
+      uncachedInputTokens: 35,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 15,
+    }]);
+    expect(parseHostUsageAggregates(aggregate(0.015), "fx", machine)[0]).toMatchObject({
+      eventKey: "fx:machine-a:2026-08-09:zai:zai%2Fglm-5.2",
+      agentId: "fx",
+      agentName: "FX",
+      modelProviderId: "zai",
+      model: "zai/glm-5.2",
+      processedTokens: 115,
+      costUsd: 0.015,
+      loggedCostUsd: 0.015,
+      pricingStatus: "logged",
+      cacheSavingsUsd: 0,
+    });
+    expect(parseHostUsageAggregates(aggregate(0), "fx", machine)[0]).toMatchObject({
+      costUsd: 0,
+      loggedCostUsd: 0,
+      pricingStatus: "logged",
+    });
+    expect(parseHostUsageAggregates(aggregate(null), "fx", machine)[0]).toMatchObject({
+      costUsd: 0,
+      loggedCostUsd: null,
+      pricingStatus: "unknown",
+    });
+  });
 });

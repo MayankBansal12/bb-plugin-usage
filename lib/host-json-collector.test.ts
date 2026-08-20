@@ -102,6 +102,46 @@ describe("host JSON usage collector", () => {
     expect(cache).not.toContain("message-private");
   });
 
+  it("reads only FX's usage ledger and aggregates its recorded tokens and spend", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "usage.jsonl");
+    const cachePath = join(directory, "cache", "fx.json");
+    await writeFile(root, [
+      { schema_version: 1, kind: "coverage", status: "partial" },
+      { schema_version: 1, kind: "generation", fact: {
+        id: "generation-private",
+        created_at_ms: Date.parse("2026-08-09T00:00:00Z"),
+        model: "zai/glm-5.2",
+        input_tokens: 100,
+        output_tokens: 15,
+        cache_read_tokens: 60,
+        cache_write_tokens: 5,
+        reasoning_tokens: 5,
+        total_cost: 0.015,
+      } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const first = await scan("fx", root, cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual([expect.objectContaining({
+      day: "2026-08-09",
+      modelProviderId: "zai",
+      model: "zai/glm-5.2",
+      uncachedInputTokens: 35,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 15,
+      loggedCostUsd: 0.015,
+    })]);
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toContain("generation-private");
+    expect(cache).not.toContain(root);
+
+    const second = await scan("fx", root, cachePath);
+    expect(second).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
   it("counts each Claude API response once across repeated rows, files, and cached scans", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "projects");
