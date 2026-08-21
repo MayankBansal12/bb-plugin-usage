@@ -57,15 +57,11 @@ const scanResultSchema = z.object({
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
-<<<<<<< HEAD
-  // Version 2 retains hashed Claude response identities so repeated transcript
-  // rows and copied/forked transcripts can be deduplicated before aggregation.
-  const cacheVersion = 2;
-=======
-  // v2: bucket days in the host's local timezone (UTC bucketing shifted users' local 'today' into yesterday).
-  // v3: drop cached zero-token/zero-cost rows so every file re-parses with the token guard.
+  // v2: retained hashed Claude response identities so repeated transcript rows
+  // and copied/forked transcripts can be deduplicated before aggregation.
+  // v3: bucket days in the host's local timezone and drop cached zero-token /
+  // zero-cost rows, so every file re-parses with the token guard.
   const cacheVersion = 3;
->>>>>>> 14fed27 (fix: stable logged-cost pricing, local-day bucketing, cache savings)
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
