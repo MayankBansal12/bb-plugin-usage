@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, FX, Grok Agent, OpenCode, and Pi.
+- Collect usage from Codex, Claude Code, FX, Grok Agent, OpenCode, Pi, and Prime Agent.
 - Separate the coding agent from the underlying model provider.
 - Group charts and cost summaries by agent or model provider.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
@@ -21,6 +21,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - FX: `~/.fx/usage.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`
 - Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
+- Prime Agent: root sessions in `~/.prime/agent/sessions/*.jsonl` and recursive-agent sessions under `~/.prime/agent/session-artifacts/**/*.jsonl`, plus optional custom session directories in plugin settings
 - OpenCode: assistant-message usage from the last 90 days, recorded by `opencode db`
 
 JSON-log collection requires Node.js on each enrolled machine. Logs are streamed and reduced to usage metadata on that machine, so large histories are not transferred through BB's file API. A metadata-only per-file cache in `~/.cache/bb-plugin-usage/json-log-scan-v1/` makes later syncs reparse only changed files. The initial 365-day scan can take longer on machines with large histories.

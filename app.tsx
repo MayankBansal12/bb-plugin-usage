@@ -123,6 +123,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   grok: "#6E7CF6",
   opencode: "#0EA5E9",
   pi: "#F59E0B",
+  prime: "#7C3AED",
   openai: "#10A37F",
   anthropic: "#D97757",
   xai: "#6E7CF6",

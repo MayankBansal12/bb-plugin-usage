@@ -56,7 +56,7 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { piSessionRoots: string };
+type CollectorSettings = { piSessionRoots: string; primeSessionRoots: string };
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
@@ -65,6 +65,7 @@ const AGENTS = [
   { id: "grok", name: "Grok Agent" },
   { id: "opencode", name: "OpenCode" },
   { id: "pi", name: "Pi" },
+  { id: "prime", name: "Prime Agent" },
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
 
 const LIMIT_PROVIDERS = [
@@ -172,8 +173,26 @@ function expandHome(path: string, home: string) {
   return trimmed === "~" ? home : trimmed.startsWith("~/") ? `${home}/${trimmed.slice(2)}` : trimmed;
 }
 
+function normalizeRoot(path: string) {
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
+}
+
 function configuredRoots(value: string, home: string) {
-  return [...new Set(value.split(/[;\n]/).map((part) => expandHome(part, home)).filter(Boolean))];
+  return [...new Set(value.split(/[;\n]/).map((part) => normalizeRoot(expandHome(part, home))).filter(Boolean))];
+}
+
+function parentDirectory(path: string) {
+  const normalized = normalizeRoot(path);
+  const separator = normalized.lastIndexOf("/");
+  return separator > 0 ? normalized.slice(0, separator) : separator === 0 ? "/" : ".";
+}
+
+function primeRoots(home: string, configured: string) {
+  const sessionRoots = [`${home}/.prime/agent/sessions`, ...configuredRoots(configured, home)];
+  return [...new Set(sessionRoots.flatMap((root) => {
+    const parent = parentDirectory(root);
+    return [root, parent === "/" ? "/session-artifacts" : `${parent}/session-artifacts`];
+  }))];
 }
 
 function countForMachine(db: Database, machineId: string, agentId: AgentId) {
@@ -250,12 +269,17 @@ function reconcileMachines(db: Database, machineIds: string[]) {
   })();
 }
 
-function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+  const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
   return agentId === "codex" ? [`${home}/.codex/sessions`]
     : agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
-    : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home)];
+    : agentId === "prime" ? resolvedPrimeRoots
+    : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home).filter((root) => {
+      const defaultPrimeAgentRoot = `${home}/.prime/agent`;
+      return root !== defaultPrimeAgentRoot && !resolvedPrimeRoots.includes(root);
+    })];
 }
 
 function historyStartDay() {
@@ -509,6 +533,12 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Optional semicolon-separated absolute paths. The default ~/.pi/agent/sessions is always scanned.",
       default: "",
     },
+    primeSessionRoots: {
+      type: "string",
+      label: "Extra Prime Agent session roots",
+      description: "Optional semicolon-separated absolute session directories. The default ~/.prime/agent/sessions and its recursive-agent artifacts are always scanned.",
+      default: "",
+    },
   });
   const db = bb.storage.database();
   bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration]);
@@ -550,6 +580,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }

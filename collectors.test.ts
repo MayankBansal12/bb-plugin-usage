@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi } from "./collectors";
+import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi, parsePrime } from "./collectors";
 
 const machine = { machineId: "machine-a", machineName: "Machine A" };
 
@@ -49,6 +49,25 @@ describe("usage collectors", () => {
     ].map(JSON.stringify).join("\n");
     const record = parsePi(content, machine)[0]!;
     expect(record).toMatchObject({ eventKey: "pi:pi-session:entry-1", agentId: "pi", modelProviderId: "google", loggedCostUsd: 0.0012, processedTokens: 125 });
+    expect(JSON.stringify(record)).not.toContain("not retained");
+  });
+
+  it("parses Prime Agent as a distinct agent with Pi-compatible usage", () => {
+    const content = [
+      { type: "session", version: 3, id: "prime-session", timestamp: "2026-08-09T00:00:00Z" },
+      { type: "message", id: "entry-1", timestamp: "2026-08-09T00:00:01Z", message: {
+        role: "assistant", provider: "prime-inference", model: "openai/gpt-5.5", content: "not retained",
+        usage: { input: 40, output: 20, cacheRead: 60, cacheWrite: 5, totalTokens: 125, cost: { total: 0.0012 } },
+      } },
+      { type: "child_usage_attributed", id: "attribution-1", timestamp: "2026-08-09T00:00:02Z", targetId: "entry-1", aggregateUsage: {
+        input: 400, output: 200, cacheRead: 600, cacheWrite: 50, cost: { total: 0.012 },
+      } },
+    ].map(JSON.stringify).join("\n");
+    const record = parsePrime(content, machine)[0]!;
+    expect(record).toMatchObject({
+      eventKey: "prime:prime-session:entry-1", agentId: "prime", agentName: "Prime Agent",
+      modelProviderId: "prime-inference", model: "openai/gpt-5.5", loggedCostUsd: 0.0012, processedTokens: 125,
+    });
     expect(JSON.stringify(record)).not.toContain("not retained");
   });
 
@@ -102,6 +121,11 @@ describe("usage collectors", () => {
       agentId: "codex",
       modelProviderId: "openai",
       processedTokens: 125,
+    });
+    expect(parseHostUsageAggregates(content, "prime", machine)[0]).toMatchObject({
+      eventKey: "prime:machine-a:2026-08-09:openai:gpt-5.6-sol",
+      agentId: "prime",
+      agentName: "Prime Agent",
     });
   });
 
