@@ -27,6 +27,7 @@ export type UsageRecord = {
 type UsageInput = {
   eventKey: string;
   timestamp: string;
+  day?: string;
   agentId: AgentId;
   agentName: string;
   modelProviderId: string;
@@ -70,6 +71,13 @@ function text(value: unknown, fallback: string) {
   return typeof value === "string" && value.trim().length > 0 ? value : fallback;
 }
 
+function localDayOf(value: string): string {
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime())
+    ? value.slice(0, 10)
+    : `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
+}
+
 function isoTimestamp(value: unknown): string | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     const parsed = new Date(value);
@@ -111,7 +119,7 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
   return {
     eventKey: input.eventKey,
     timestamp,
-    day: timestamp.slice(0, 10),
+    day: input.day ?? localDayOf(timestamp),
     agentId: input.agentId,
     agentName: input.agentName,
     modelProviderId: pricing.modelProviderId,
@@ -122,7 +130,7 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
     costUsd: Number((estimated ?? effectiveLogged ?? 0).toFixed(6)),
     loggedCostUsd: effectiveLogged === null ? null : Number(Math.max(0, effectiveLogged).toFixed(6)),
     pricingStatus: estimated !== null ? pricing.status : effectiveLogged !== null ? "logged" : "unknown",
-    cacheSavingsUsd: !recordedOnly && pricing.price ? Number(((cached * Math.max(0, pricing.price.input - pricing.price.cached)) / 1_000_000).toFixed(6)) : 0,
+    cacheSavingsUsd: pricing.price ? Number(((cached * Math.max(0, pricing.price.input - pricing.price.cached)) / 1_000_000).toFixed(6)) : 0,
     processedTokens: uncached + cached + writes + output,
     cachedInputTokens: cached,
     cacheWriteTokens: writes,
@@ -211,10 +219,14 @@ function parsePiCompatible(
     const usage = object(message?.usage);
     const timestamp = isoTimestamp(value.timestamp ?? message?.timestamp);
     if (!message || message.role !== "assistant" || !usage || !timestamp) continue;
+    const loggedCostUsd = finite(object(usage.cost)?.total);
+    const hasTokens = count(usage.input) + count(usage.cacheRead) + count(usage.cacheWrite) + count(usage.output) > 0;
+    if (!hasTokens && !(loggedCostUsd !== null && loggedCostUsd > 0)) continue;
     records.push(usageRecord({
       eventKey: `${agentId}:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId, agentName,
       modelProviderId: text(message.provider, "unknown"), model: text(message.responseModel, text(message.model, "unknown")),
-      loggedCostUsd: finite(object(usage.cost)?.total), uncachedInputTokens: count(usage.input),
+      loggedCostUsd, costMode: "positive-logged-only",
+      uncachedInputTokens: count(usage.input),
       cachedInputTokens: count(usage.cacheRead), cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
     }, context));
   }
@@ -261,7 +273,7 @@ export function parseOpenCode(content: string, context: ParseContext): UsageReco
     const [input, cached, cacheWrite, output, reasoning] = tokenValues as number[];
     return usageRecord({
       eventKey: `opencode:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}`,
-      timestamp, agentId: "opencode", agentName: "OpenCode", modelProviderId, model,
+      timestamp, day, agentId: "opencode", agentName: "OpenCode", modelProviderId, model,
       loggedCostUsd: loggedCost, costMode: "positive-logged-only", uncachedInputTokens: input,
       cachedInputTokens: cached, cacheWriteTokens: cacheWrite, outputTokens: output + reasoning,
     }, context);
@@ -293,12 +305,13 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const model = text(row.model, "unknown");
     return [usageRecord({
       eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}`,
-      timestamp,
+      timestamp, day,
       agentId,
       agentName,
       modelProviderId,
       model,
       loggedCostUsd: finite(row.loggedCostUsd),
+      costMode: agentId === "prime" || agentId === "pi" ? "positive-logged-only" : undefined,
       uncachedInputTokens: count(row.uncachedInputTokens),
       cachedInputTokens: count(row.cachedInputTokens),
       cacheWriteTokens: count(row.cacheWriteTokens),

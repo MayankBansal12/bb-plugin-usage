@@ -57,9 +57,15 @@ const scanResultSchema = z.object({
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
+<<<<<<< HEAD
   // Version 2 retains hashed Claude response identities so repeated transcript
   // rows and copied/forked transcripts can be deduplicated before aggregation.
   const cacheVersion = 2;
+=======
+  // v2: bucket days in the host's local timezone (UTC bucketing shifted users' local 'today' into yesterday).
+  // v3: drop cached zero-token/zero-cost rows so every file re-parses with the token guard.
+  const cacheVersion = 3;
+>>>>>>> 14fed27 (fix: stable logged-cost pricing, local-day bucketing, cache savings)
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
@@ -96,7 +102,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     if ((typeof value !== "string" && typeof value !== "number") || !String(value).trim()) return null;
     const timestamp = new Date(value).getTime();
     if (!Number.isFinite(timestamp)) return null;
-    const result = new Date(timestamp).toISOString().slice(0, 10);
+    const parsed = new Date(timestamp);
+    const result = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
     return result >= input.sinceDay ? result : null;
   }
 
@@ -265,11 +272,14 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const usage = object(message?.usage);
         const usageDay = day(value.timestamp ?? message?.timestamp);
         if (!message || message.role !== "assistant" || !usage || !usageDay) continue;
+        const loggedCostUsd = finite(object(usage.cost)?.total);
+        const hasTokens = count(usage.input) + count(usage.cacheRead) + count(usage.cacheWrite) + count(usage.output) > 0;
+        if (!hasTokens && !(loggedCostUsd !== null && loggedCostUsd > 0)) continue;
         add(rows, {
           day: usageDay,
           modelProviderId: text(message.provider, "unknown"),
           model: text(message.responseModel, text(message.model, "unknown")),
-          loggedCostUsd: finite(object(usage.cost)?.total),
+          loggedCostUsd,
           uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
           cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
         });
@@ -321,8 +331,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       nextFiles[sourceId] = { signature, rows };
       for (const row of rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
       changedFileCount += 1;
-    } catch {
-      failures.push("A usage log could not be read.");
+    } catch (error) {
+      failures.push("A usage log could not be read: " + filePath + " (" + String(error) + ")");
       if (prior && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
         nextFiles[sourceId] = prior;
         for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);

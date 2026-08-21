@@ -76,7 +76,7 @@ describe("usage collectors", () => {
     expect(parseOpenCode(content, machine)[0]).toMatchObject({
       eventKey: "opencode:machine-a:2026-08-09:anthropic:claude-sonnet-5", agentId: "opencode",
       modelProviderId: "anthropic", processedTokens: 185, cachedInputTokens: 60, uncachedInputTokens: 100,
-      outputTokens: 20, costUsd: 0.02, loggedCostUsd: 0.02, pricingStatus: "logged", cacheSavingsUsd: 0,
+      outputTokens: 20, costUsd: 0.02, loggedCostUsd: 0.02, pricingStatus: "logged", cacheSavingsUsd: 0.000108,
     });
     expect(() => parseOpenCode("not-json", machine)).toThrow("malformed JSON");
     expect(() => parseOpenCode(JSON.stringify([{}]), machine)).toThrow("invalid aggregate row at index 0");
@@ -90,7 +90,7 @@ describe("usage collectors", () => {
       inputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 15, reasoningTokens: 5,
     }]);
     expect(parseOpenCode(content, machine)[0]).toMatchObject({
-      modelProviderId: "openai", costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown", cacheSavingsUsd: 0,
+      modelProviderId: "openai", costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown", cacheSavingsUsd: 0.00027,
     });
     expect(parseOpenCode(content.replace('"loggedCostUsd":0', '"loggedCostUsd":-0.01'), machine)[0]).toMatchObject({
       costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown",
@@ -103,6 +103,22 @@ describe("usage collectors", () => {
       { type: "message", id: "e", timestamp: "2026-08-09T00:00:01Z", message: { role: "assistant", provider: "custom-local", model: "my-model", usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0 } } },
     ].map(JSON.stringify).join("\n");
     expect(parsePi(content, machine)[0]).toMatchObject({ costUsd: 0, pricingStatus: "unknown", processedTokens: 15 });
+  });
+
+  it("estimates cache savings for logged-cost-only records (regression)", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "opencode-go",
+      model: "hy3",
+      loggedCostUsd: 0.01,
+      uncachedInputTokens: 100,
+      cachedInputTokens: 1000,
+      cacheWriteTokens: 1,
+      outputTokens: 200,
+    }]);
+    const record = parseHostUsageAggregates(content, "prime", machine)[0]!;
+    expect(record).toMatchObject({ pricingStatus: "logged", loggedCostUsd: 0.01 });
+    expect(record.cacheSavingsUsd).toBeGreaterThan(0);
   });
 
   it("prices host-side aggregates without exposing file metadata", () => {

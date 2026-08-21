@@ -282,8 +282,8 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
 
 function historyStartDay() {
   const start = new Date();
-  start.setUTCDate(start.getUTCDate() - HISTORY_DAYS);
-  return start.toISOString().slice(0, 10);
+  start.setDate(start.getDate() - HISTORY_DAYS);
+  return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
 }
 
 function jsonAgentCommand(input: Parameters<typeof compressedHostJsonCollectorScript>[0]) {
@@ -488,8 +488,14 @@ export async function syncOpenCode(
   } catch (error) {
     const recordCount = countForMachine(db, machine.id, agentId);
     const message = errorMessage(error);
-    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
-    bb.log.warn(`${machine.name}/opencode: ${message}`);
+    if (message.includes("OpenCode CLI is required")) {
+      upsertState(db, machine.id, agentId, "skipped", recordCount,
+        "OpenCode CLI is not installed; hosted OpenCode Go usage is already collected via Prime Agent sessions.", false);
+      bb.log.info(`${machine.name}/opencode: skipped (no local OpenCode CLI)`);
+    } else {
+      upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+      bb.log.warn(`${machine.name}/opencode: ${message}`);
+    }
   }
 }
 
@@ -511,7 +517,7 @@ export function dashboardRecordsSql() {
     SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
     SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-    FROM canonical WHERE day >= date('now', '-${DASHBOARD_HISTORY_DAYS - 1} days')
+    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS - 1} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
     GROUP BY day, provider_id, model_provider_id, machine_id, model ORDER BY day`;
 }
@@ -627,7 +633,7 @@ export default async function plugin(bb: BbPluginApi) {
         sources,
         providerLimits,
         sync,
-        notice: "Prompts and message content are never stored. OpenCode costs use positive agent-recorded values only; other agents use models.dev estimates when available. Subscription charges may differ.",
+        notice: "Prompts and message content are never stored. OpenCode, Pi, and Prime Agent costs use positive agent-recorded values only; other agents use models.dev estimates when available. Subscription charges may differ.",
       };
     },
     sync() {
