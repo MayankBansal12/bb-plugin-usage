@@ -7,8 +7,41 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  dashboardRecordsSql, extractOpenCodeJson, loadProviderLimits, openCodeCommand, runHostCommand, syncOpenCode,
+  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, openCodeCommand, runHostCommand, syncOpenCode,
 } from "./server";
+
+describe("JSON agent roots", () => {
+  it("includes Prime root and recursive-agent sessions", () => {
+    expect(jsonAgentRoots("/home/user", "prime", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.prime/agent/sessions",
+      "/home/user/.prime/agent/session-artifacts",
+    ]);
+  });
+
+  it("derives artifact directories for custom Prime session roots", () => {
+    expect(jsonAgentRoots("/home/user", "prime", {
+      piSessionRoots: "",
+      primeSessionRoots: "~/prime-sessions; /var/lib/prime/sessions/",
+    })).toEqual([
+      "/home/user/.prime/agent/sessions",
+      "/home/user/.prime/agent/session-artifacts",
+      "/home/user/prime-sessions",
+      "/home/user/session-artifacts",
+      "/var/lib/prime/sessions",
+      "/var/lib/prime/session-artifacts",
+    ]);
+  });
+
+  it("moves known Prime roots out of legacy Pi extra roots", () => {
+    expect(jsonAgentRoots("/home/user", "pi", {
+      piSessionRoots: "~/.prime/agent; ~/.prime/agent/sessions; ~/.prime/agent/session-artifacts; /data/pi; /data/prime/sessions",
+      primeSessionRoots: "/data/prime/sessions",
+    })).toEqual([
+      "/home/user/.pi/agent/sessions",
+      "/data/pi",
+    ]);
+  });
+});
 
 describe("sync RPC", () => {
   it("returns before a slow collection completes", async () => {
@@ -250,7 +283,7 @@ describe("OpenCode query", () => {
 describe("dashboard query", () => {
   it("returns only the 90 calendar days supported by the UI", () => {
     const sql = dashboardRecordsSql();
-    expect(sql).toContain("day >= date('now', '-89 days')");
+    expect(sql).toContain("day >= date('now', 'localtime', '-89 days')");
     expect(sql).not.toContain("-365 days");
   });
 });

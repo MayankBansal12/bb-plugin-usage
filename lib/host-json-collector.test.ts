@@ -19,10 +19,10 @@ async function temporaryDirectory() {
   return directory;
 }
 
-async function scan(agentId: HostJsonAgentId, root: string, cachePath: string) {
+async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath: string) {
   const script = compressedHostJsonCollectorScript({
     agentId,
-    roots: [root],
+    roots: Array.isArray(root) ? root : [root],
     cachePath,
     sinceDay: "2026-08-01",
   });
@@ -42,9 +42,9 @@ describe("host JSON usage collector", () => {
     const cachePath = join(directory, "cache", "codex.json");
     await mkdir(root, { recursive: true });
     await writeFile(join(root, "rollout-test.jsonl"), [
-      { timestamp: "2026-08-09T00:00:00Z", type: "session_meta", payload: { id: "session-1", prompt: "must not be cached" } },
-      { timestamp: "2026-08-09T00:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
-      { timestamp: "2026-08-09T00:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1", prompt: "must not be cached" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
     ].map((value) => JSON.stringify(value)).join("\n"));
 
     const first = await scan("codex", root, cachePath);
@@ -87,6 +87,10 @@ describe("host JSON usage collector", () => {
       type: "message", timestamp: "2026-08-09T00:00:00Z",
       message: { role: "assistant", provider: "google", model: "gemini-2.5-pro", content: "private", usage: { input: 40, cacheRead: 60, cacheWrite: 5, output: 20, cost: { total: 0.01 } } },
     }, { modelProviderId: "google", uncachedInputTokens: 40, cachedInputTokens: 60, outputTokens: 20, loggedCostUsd: 0.01 }],
+    ["prime", "session.jsonl", {
+      type: "message", timestamp: "2026-08-09T00:00:00Z",
+      message: { role: "assistant", provider: "prime-inference", model: "openai/gpt-5.5", content: "private", usage: { input: 40, cacheRead: 60, cacheWrite: 5, output: 20, cost: { total: 0.01 } } },
+    }, { modelProviderId: "prime-inference", model: "openai/gpt-5.5", uncachedInputTokens: 40, cachedInputTokens: 60, outputTokens: 20, loggedCostUsd: 0.01 }],
   ] as const)("extracts %s usage without retaining message content", async (agentId, filename, event, expected) => {
     const directory = await temporaryDirectory();
     const root = join(directory, "logs");
@@ -159,5 +163,49 @@ describe("host JSON usage collector", () => {
       cacheWriteTokens: 5,
       outputTokens: 20,
     })]);
+  });
+
+  it("counts Prime recursive-agent transcripts once and ignores parent attribution aggregates", async () => {
+    const directory = await temporaryDirectory();
+    const sessionsRoot = join(directory, "sessions");
+    const artifactsRoot = join(directory, "session-artifacts");
+    const childRoot = join(artifactsRoot, "root-session", "sub-reviewer");
+    const cachePath = join(directory, "cache", "prime.json");
+    await mkdir(sessionsRoot, { recursive: true });
+    await mkdir(childRoot, { recursive: true });
+    await writeFile(join(sessionsRoot, "root-session.jsonl"), [
+      { type: "session", version: 3, id: "root-session", timestamp: "2026-08-09T00:00:00Z" },
+      { type: "message", id: "parent-message", timestamp: "2026-08-09T00:00:01Z", message: {
+        role: "assistant", provider: "google", model: "gemini-2.5-pro", content: "private parent content",
+        usage: { input: 40, cacheRead: 10, cacheWrite: 5, output: 5, cost: { total: 0.01 } },
+      } },
+      { type: "child_usage_attributed", id: "attribution", parentId: "parent-message", timestamp: "2026-08-09T00:00:03Z",
+        targetId: "parent-message",
+        childUsage: { input: 30, cacheRead: 0, cacheWrite: 0, output: 15, cost: { total: 0.02 } },
+        aggregateUsage: { input: 70, cacheRead: 10, cacheWrite: 5, output: 20, cost: { total: 0.03 } },
+      },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+    await writeFile(join(childRoot, "child-session.jsonl"), [
+      { type: "session", version: 3, id: "child-session", timestamp: "2026-08-09T00:00:01Z" },
+      { type: "message", id: "child-message", timestamp: "2026-08-09T00:00:02Z", message: {
+        role: "assistant", provider: "google", model: "gemini-2.5-pro", content: "private child content",
+        usage: { input: 30, cacheRead: 0, cacheWrite: 0, output: 15, cost: { total: 0.02 } },
+      } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const result = await scan("prime", [sessionsRoot, artifactsRoot], cachePath);
+    expect(result).toMatchObject({ agentId: "prime", fileCount: 2, failureCount: 0 });
+    expect(result.rows).toEqual([expect.objectContaining({
+      modelProviderId: "google",
+      model: "gemini-2.5-pro",
+      uncachedInputTokens: 70,
+      cachedInputTokens: 10,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+      loggedCostUsd: 0.03,
+    })]);
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toContain("private parent content");
+    expect(cache).not.toContain("private child content");
   });
 });

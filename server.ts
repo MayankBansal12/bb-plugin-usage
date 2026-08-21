@@ -56,7 +56,7 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { piSessionRoots: string };
+type CollectorSettings = { piSessionRoots: string; primeSessionRoots: string };
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
@@ -64,6 +64,7 @@ const AGENTS = [
   { id: "grok", name: "Grok Agent" },
   { id: "opencode", name: "OpenCode" },
   { id: "pi", name: "Pi" },
+  { id: "prime", name: "Prime Agent" },
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
 
 const LIMIT_PROVIDERS = [
@@ -171,8 +172,26 @@ function expandHome(path: string, home: string) {
   return trimmed === "~" ? home : trimmed.startsWith("~/") ? `${home}/${trimmed.slice(2)}` : trimmed;
 }
 
+function normalizeRoot(path: string) {
+  return path.length > 1 ? path.replace(/\/+$/, "") : path;
+}
+
 function configuredRoots(value: string, home: string) {
-  return [...new Set(value.split(/[;\n]/).map((part) => expandHome(part, home)).filter(Boolean))];
+  return [...new Set(value.split(/[;\n]/).map((part) => normalizeRoot(expandHome(part, home))).filter(Boolean))];
+}
+
+function parentDirectory(path: string) {
+  const normalized = normalizeRoot(path);
+  const separator = normalized.lastIndexOf("/");
+  return separator > 0 ? normalized.slice(0, separator) : separator === 0 ? "/" : ".";
+}
+
+function primeRoots(home: string, configured: string) {
+  const sessionRoots = [`${home}/.prime/agent/sessions`, ...configuredRoots(configured, home)];
+  return [...new Set(sessionRoots.flatMap((root) => {
+    const parent = parentDirectory(root);
+    return [root, parent === "/" ? "/session-artifacts" : `${parent}/session-artifacts`];
+  }))];
 }
 
 function countForMachine(db: Database, machineId: string, agentId: AgentId) {
@@ -249,17 +268,22 @@ function reconcileMachines(db: Database, machineIds: string[]) {
   })();
 }
 
-function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+  const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
   return agentId === "codex" ? [`${home}/.codex/sessions`]
     : agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
-    : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home)];
+    : agentId === "prime" ? resolvedPrimeRoots
+    : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home).filter((root) => {
+      const defaultPrimeAgentRoot = `${home}/.prime/agent`;
+      return root !== defaultPrimeAgentRoot && !resolvedPrimeRoots.includes(root);
+    })];
 }
 
 function historyStartDay() {
   const start = new Date();
-  start.setUTCDate(start.getUTCDate() - HISTORY_DAYS);
-  return start.toISOString().slice(0, 10);
+  start.setDate(start.getDate() - HISTORY_DAYS);
+  return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
 }
 
 function jsonAgentCommand(input: Parameters<typeof compressedHostJsonCollectorScript>[0]) {
@@ -464,8 +488,14 @@ export async function syncOpenCode(
   } catch (error) {
     const recordCount = countForMachine(db, machine.id, agentId);
     const message = errorMessage(error);
-    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
-    bb.log.warn(`${machine.name}/opencode: ${message}`);
+    if (message.includes("OpenCode CLI is required")) {
+      upsertState(db, machine.id, agentId, "skipped", recordCount,
+        "OpenCode CLI is not installed; hosted OpenCode Go usage is already collected via Prime Agent sessions.", false);
+      bb.log.info(`${machine.name}/opencode: skipped (no local OpenCode CLI)`);
+    } else {
+      upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+      bb.log.warn(`${machine.name}/opencode: ${message}`);
+    }
   }
 }
 
@@ -487,7 +517,7 @@ export function dashboardRecordsSql() {
     SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
     SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-    FROM canonical WHERE day >= date('now', '-${DASHBOARD_HISTORY_DAYS - 1} days')
+    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS - 1} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
     GROUP BY day, provider_id, model_provider_id, machine_id, model ORDER BY day`;
 }
@@ -505,6 +535,12 @@ export default async function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Extra Pi session roots",
       description: "Optional semicolon-separated absolute paths. The default ~/.pi/agent/sessions is always scanned.",
+      default: "",
+    },
+    primeSessionRoots: {
+      type: "string",
+      label: "Extra Prime Agent session roots",
+      description: "Optional semicolon-separated absolute session directories. The default ~/.prime/agent/sessions and its recursive-agent artifacts are always scanned.",
       default: "",
     },
   });
@@ -547,6 +583,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
@@ -596,7 +633,7 @@ export default async function plugin(bb: BbPluginApi) {
         sources,
         providerLimits,
         sync,
-        notice: "Prompts and message content are never stored. OpenCode costs use positive agent-recorded values only; other agents use models.dev estimates when available. Subscription charges may differ.",
+        notice: "Prompts and message content are never stored. OpenCode, Pi, and Prime Agent costs use positive agent-recorded values only; other agents use models.dev estimates when available. Subscription charges may differ.",
       };
     },
     sync() {

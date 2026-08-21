@@ -122,6 +122,7 @@ const PROVIDER_COLORS: Record<string, string> = {
   grok: "#6E7CF6",
   opencode: "#0EA5E9",
   pi: "#F59E0B",
+  prime: "#7C3AED",
   openai: "#10A37F",
   anthropic: "#D97757",
   xai: "#6E7CF6",
@@ -172,11 +173,11 @@ function formatDay(day: string, includeYear = false) {
 
 function rangeDays(range: Range) {
   const today = new Date();
-  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   return Array.from({ length: range }, (_, index) => {
     const day = new Date(end);
-    day.setUTCDate(end.getUTCDate() - range + index + 1);
-    return day.toISOString().slice(0, 10);
+    day.setDate(end.getDate() - range + index + 1);
+    return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
   });
 }
 

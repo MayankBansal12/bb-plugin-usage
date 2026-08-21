@@ -44,7 +44,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "grok", "pi"]),
+  agentId: z.enum(["codex", "claude", "grok", "pi", "prime"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -57,13 +57,15 @@ const scanResultSchema = z.object({
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
-  // Version 2 retains hashed Claude response identities so repeated transcript
-  // rows and copied/forked transcripts can be deduplicated before aggregation.
-  const cacheVersion = 2;
+  // v2: retained hashed Claude response identities so repeated transcript rows
+  // and copied/forked transcripts can be deduplicated before aggregation.
+  // v3: bucket days in the host's local timezone and drop cached zero-token /
+  // zero-cost rows, so every file re-parses with the token guard.
+  const cacheVersion = 3;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "grok", "pi"]);
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "grok", "pi", "prime"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
 
@@ -96,7 +98,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     if ((typeof value !== "string" && typeof value !== "number") || !String(value).trim()) return null;
     const timestamp = new Date(value).getTime();
     if (!Number.isFinite(timestamp)) return null;
-    const result = new Date(timestamp).toISOString().slice(0, 10);
+    const parsed = new Date(timestamp);
+    const result = `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
     return result >= input.sinceDay ? result : null;
   }
 
@@ -259,19 +262,24 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         continue;
       }
 
-      if (value.type !== "message") continue;
-      const message = object(value.message);
-      const usage = object(message?.usage);
-      const usageDay = day(value.timestamp ?? message?.timestamp);
-      if (!message || message.role !== "assistant" || !usage || !usageDay) continue;
-      add(rows, {
-        day: usageDay,
-        modelProviderId: text(message.provider, "unknown"),
-        model: text(message.responseModel, text(message.model, "unknown")),
-        loggedCostUsd: finite(object(usage.cost)?.total),
-        uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
-        cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
-      });
+      if (input.agentId === "pi" || input.agentId === "prime") {
+        if (value.type !== "message") continue;
+        const message = object(value.message);
+        const usage = object(message?.usage);
+        const usageDay = day(value.timestamp ?? message?.timestamp);
+        if (!message || message.role !== "assistant" || !usage || !usageDay) continue;
+        const loggedCostUsd = finite(object(usage.cost)?.total);
+        const hasTokens = count(usage.input) + count(usage.cacheRead) + count(usage.cacheWrite) + count(usage.output) > 0;
+        if (!hasTokens && !(loggedCostUsd !== null && loggedCostUsd > 0)) continue;
+        add(rows, {
+          day: usageDay,
+          modelProviderId: text(message.provider, "unknown"),
+          model: text(message.responseModel, text(message.model, "unknown")),
+          loggedCostUsd,
+          uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
+          cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
+        });
+      }
     }
     return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
   }
@@ -319,8 +327,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       nextFiles[sourceId] = { signature, rows };
       for (const row of rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
       changedFileCount += 1;
-    } catch {
-      failures.push("A usage log could not be read.");
+    } catch (error) {
+      failures.push("A usage log could not be read: " + filePath + " (" + String(error) + ")");
       if (prior && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
         nextFiles[sourceId] = prior;
         for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
