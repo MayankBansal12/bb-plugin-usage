@@ -42,9 +42,9 @@ describe("host JSON usage collector", () => {
     const cachePath = join(directory, "cache", "codex.json");
     await mkdir(root, { recursive: true });
     await writeFile(join(root, "rollout-test.jsonl"), [
-      { timestamp: "2026-08-09T00:00:00Z", type: "session_meta", payload: { id: "session-1", prompt: "must not be cached" } },
-      { timestamp: "2026-08-09T00:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
-      { timestamp: "2026-08-09T00:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1", prompt: "must not be cached" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
     ].map((value) => JSON.stringify(value)).join("\n"));
 
     const first = await scan("codex", root, cachePath);

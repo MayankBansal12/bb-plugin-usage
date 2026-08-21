@@ -283,7 +283,7 @@ describe("OpenCode query", () => {
 describe("dashboard query", () => {
   it("returns only the 90 calendar days supported by the UI", () => {
     const sql = dashboardRecordsSql();
-    expect(sql).toContain("day >= date('now', '-89 days')");
+    expect(sql).toContain("day >= date('now', 'localtime', '-89 days')");
     expect(sql).not.toContain("-365 days");
   });
 });
