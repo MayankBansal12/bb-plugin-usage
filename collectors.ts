@@ -1,6 +1,6 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
-export type AgentId = "codex" | "claude" | "grok" | "opencode" | "pi" | "prime";
+export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime";
 
 export type UsageRecord = {
   eventKey: string;
@@ -36,7 +36,7 @@ type UsageInput = {
   cachedInputTokens: number;
   cacheWriteTokens: number;
   outputTokens: number;
-  costMode?: "estimate-or-logged" | "positive-logged-only";
+  costMode?: "estimate-or-logged" | "logged-only" | "positive-logged-only";
 };
 
 type ParseContext = { machineId: string; machineName: string };
@@ -102,11 +102,14 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
   const output = count(input.outputTokens);
   const logged = finite(input.loggedCostUsd);
   const positiveLogged = logged !== null && logged > 0 ? logged : null;
-  const recordedOnly = input.costMode === "positive-logged-only";
+  const loggedOnly = input.costMode === "logged-only";
+  const recordedOnly = loggedOnly || input.costMode === "positive-logged-only";
   const estimated = !recordedOnly && pricing.price
     ? ((uncached * pricing.price.input) + (cached * pricing.price.cached) + (writes * pricing.price.cacheWrite) + (output * pricing.price.output)) / 1_000_000
     : null;
-  const effectiveLogged = recordedOnly ? positiveLogged : logged;
+  const effectiveLogged = input.costMode === "positive-logged-only"
+    ? positiveLogged
+    : loggedOnly && logged !== null ? Math.max(0, logged) : logged;
   const timestamp = isoTimestamp(input.timestamp) ?? input.timestamp;
   return {
     eventKey: input.eventKey,
@@ -280,6 +283,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
   const agentName = agentId === "codex" ? "Codex"
     : agentId === "claude" ? "Claude Code"
     : agentId === "grok" ? "Grok Agent"
+    : agentId === "fx" ? "FX"
     : agentId === "prime" ? "Prime Agent"
     : "Pi";
 
@@ -299,6 +303,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       modelProviderId,
       model,
       loggedCostUsd: finite(row.loggedCostUsd),
+      costMode: agentId === "fx" ? "logged-only" : undefined,
       uncachedInputTokens: count(row.uncachedInputTokens),
       cachedInputTokens: count(row.cachedInputTokens),
       cacheWriteTokens: count(row.cacheWriteTokens),

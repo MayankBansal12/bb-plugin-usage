@@ -44,7 +44,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "grok", "pi", "prime"]),
+  agentId: z.enum(["codex", "claude", "fx", "grok", "pi", "prime"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -63,7 +63,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "grok", "pi", "prime"]);
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "fx", "grok", "pi", "prime"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
 
@@ -165,6 +165,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   function matches(filePath: string) {
     const name = path.basename(filePath);
     if (input.agentId === "codex") return name.startsWith("rollout-") && name.endsWith(".jsonl");
+    if (input.agentId === "fx") return name === "usage.jsonl";
     if (input.agentId === "grok") return name === "unified.jsonl";
     return name.endsWith(".jsonl");
   }
@@ -174,7 +175,19 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     try {
       entries = await fs.promises.readdir(directory, { withFileTypes: true });
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOTDIR") {
+        try {
+          const stat = await fs.promises.stat(directory);
+          if (stat.isFile() && matches(directory)) {
+            files.push(directory);
+            return;
+          }
+        } catch {
+          // The standard discovery error below is sufficient.
+        }
+      }
+      if (code !== "ENOENT") {
         discoveryFailed = true;
         failures.push("A usage directory could not be read.");
       }
@@ -255,6 +268,29 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           day: usageDay, modelProviderId: "xai", model: text(usage.model, "grok-build-0.1"), loggedCostUsd: null,
           uncachedInputTokens: prompt - cached, cachedInputTokens: cached, cacheWriteTokens: 0,
           outputTokens: count(usage.completion_tokens) + count(usage.reasoning_tokens),
+        });
+        continue;
+      }
+
+      if (input.agentId === "fx") {
+        if (value.kind !== "generation") continue;
+        const fact = object(value.fact);
+        const usageDay = day(fact?.created_at_ms);
+        if (!fact || !usageDay) continue;
+        const model = text(fact.model, "unknown");
+        const separator = model.indexOf("/");
+        const inputTokens = count(fact.input_tokens);
+        const cached = Math.min(inputTokens, count(fact.cache_read_tokens));
+        const cacheWrite = Math.min(inputTokens - cached, count(fact.cache_write_tokens));
+        add(rows, {
+          day: usageDay,
+          modelProviderId: separator > 0 ? model.slice(0, separator) : "unknown",
+          model,
+          loggedCostUsd: finite(fact.total_cost),
+          uncachedInputTokens: inputTokens - cached - cacheWrite,
+          cachedInputTokens: cached,
+          cacheWriteTokens: cacheWrite,
+          outputTokens: count(fact.output_tokens),
         });
         continue;
       }
