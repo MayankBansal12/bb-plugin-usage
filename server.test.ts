@@ -11,6 +11,12 @@ import plugin, {
 } from "./server";
 
 describe("JSON agent roots", () => {
+  it("points Antigravity at the provider bridge's own usage log", () => {
+    expect(jsonAgentRoots("/home/user", "antigravity", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.antigravity-acp/usage.jsonl",
+    ]);
+  });
+
   it("includes Prime root and recursive-agent sessions", () => {
     expect(jsonAgentRoots("/home/user", "prime", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.prime/agent/sessions",

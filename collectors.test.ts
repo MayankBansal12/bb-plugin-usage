@@ -163,4 +163,24 @@ describe("usage collectors", () => {
       pricingStatus: "unknown",
     });
   });
+
+  it("parses Antigravity host aggregates with the Antigravity agent name", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "google",
+      model: "gemini-4-ultra-preview",
+      loggedCostUsd: null,
+      uncachedInputTokens: 13814,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 53,
+    }]);
+    expect(parseHostUsageAggregates(content, "antigravity", machine)[0]).toMatchObject({
+      eventKey: "antigravity:machine-a:2026-08-09:google:gemini-4-ultra-preview",
+      agentId: "antigravity",
+      agentName: "Antigravity",
+      modelProviderId: "google",
+      processedTokens: 13867,
+    });
+  });
 });
