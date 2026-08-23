@@ -37,6 +37,7 @@ const aggregateSchema = z.object({
   day: z.string(),
   modelProviderId: z.string(),
   model: z.string(),
+  project: z.string().default("Unknown"),
   loggedCostUsd: z.number().finite().nullable(),
   uncachedInputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
@@ -59,7 +60,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
   // Version 2 retains hashed Claude response identities so repeated transcript
   // rows and copied/forked transcripts can be deduplicated before aggregation.
-  const cacheVersion = 2;
+  // Version 3 adds the per-session project label to every aggregate row.
+  const cacheVersion = 3;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
@@ -92,6 +94,15 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     return typeof value === "string" && value.trim() ? value : fallback;
   }
 
+  // Only the working directory's final segment is recorded, so usage can be
+  // grouped by project without storing the machine's directory layout.
+  function projectName(value: unknown) {
+    if (typeof value !== "string" || !value.trim()) return "Unknown";
+    const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+    const segment = normalized.slice(normalized.lastIndexOf("/") + 1);
+    return segment.trim() ? segment.trim().slice(0, 80) : "Unknown";
+  }
+
   function day(value: unknown) {
     if ((typeof value !== "string" && typeof value !== "number") || !String(value).trim()) return null;
     const timestamp = new Date(value).getTime();
@@ -106,6 +117,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       && typeof row.day === "string"
       && typeof row.modelProviderId === "string"
       && typeof row.model === "string"
+      && typeof row.project === "string"
       && (row.loggedCostUsd === null || finite(row.loggedCostUsd) !== null)
       && finite(row.uncachedInputTokens) !== null
       && finite(row.cachedInputTokens) !== null
@@ -126,13 +138,14 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       day: raw.day,
       modelProviderId: text(raw.modelProviderId, "unknown"),
       model: text(raw.model, "unknown"),
+      project: text(raw.project, "Unknown"),
       loggedCostUsd: finite(raw.loggedCostUsd),
       uncachedInputTokens: count(raw.uncachedInputTokens),
       cachedInputTokens: count(raw.cachedInputTokens),
       cacheWriteTokens: count(raw.cacheWriteTokens),
       outputTokens: count(raw.outputTokens),
     };
-    const key = JSON.stringify([row.day, row.modelProviderId, row.model]);
+    const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project]);
     const prior = target.get(key);
     if (!prior) {
       target.set(key, row);
@@ -204,6 +217,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     const rows = new Map<string, HostUsageAggregate>();
     const events = new Map<string, CachedUsageRow>();
     let codexModel = "codex-unknown";
+    // Session-scoped project, learned from the first record that carries a
+    // working directory and reused for later rows in the same file.
+    let sessionProject = "Unknown";
     const stream = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 1024 * 1024 });
     const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
     for await (const line of lines) {
@@ -217,6 +233,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const payload = object(value.payload);
         if ((value.type === "turn_context" || value.type === "session_meta") && payload) {
           codexModel = text(payload.model, codexModel);
+          if (typeof payload.cwd === "string") sessionProject = projectName(payload.cwd);
         }
         if (value.type !== "event_msg" || payload?.type !== "token_count") continue;
         const usage = object(object(payload.info)?.last_token_usage);
@@ -225,7 +242,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const inputTokens = count(usage.input_tokens);
         const cached = Math.min(inputTokens, count(usage.cached_input_tokens));
         add(rows, {
-          day: usageDay, modelProviderId: "openai", model: codexModel, loggedCostUsd: null,
+          day: usageDay, modelProviderId: "openai", model: codexModel, project: sessionProject, loggedCostUsd: null,
           uncachedInputTokens: inputTokens - cached, cachedInputTokens: cached,
           cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
         });
@@ -247,8 +264,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const rawIdentity = typeof message.id === "string" && message.id
           ? `message:${message.id}`
           : typeof value.requestId === "string" && value.requestId ? `request:${value.requestId}` : null;
+        if (typeof value.cwd === "string") sessionProject = projectName(value.cwd);
         const row: CachedUsageRow = {
-          day: usageDay, modelProviderId: "anthropic", model, loggedCostUsd: null,
+          day: usageDay, modelProviderId: "anthropic", model, project: sessionProject, loggedCostUsd: null,
           uncachedInputTokens: uncached, cachedInputTokens: cached, cacheWriteTokens: writes, outputTokens: output,
           eventKey: rawIdentity ? crypto.createHash("sha256").update(rawIdentity).digest("hex") : undefined,
         };
@@ -264,8 +282,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         if (!usage || usage.prompt_tokens === undefined || !usageDay) continue;
         const prompt = count(usage.prompt_tokens);
         const cached = Math.min(prompt, count(usage.cached_prompt_tokens));
+        if (typeof value.cwd === "string") sessionProject = projectName(value.cwd);
         add(rows, {
-          day: usageDay, modelProviderId: "xai", model: text(usage.model, "grok-build-0.1"), loggedCostUsd: null,
+          day: usageDay, modelProviderId: "xai", model: text(usage.model, "grok-build-0.1"), project: sessionProject, loggedCostUsd: null,
           uncachedInputTokens: prompt - cached, cachedInputTokens: cached, cacheWriteTokens: 0,
           outputTokens: count(usage.completion_tokens) + count(usage.reasoning_tokens),
         });
@@ -286,6 +305,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           day: usageDay,
           modelProviderId: separator > 0 ? model.slice(0, separator) : "unknown",
           model,
+          project: projectName(fact.cwd ?? fact.workspace ?? value.cwd),
           loggedCostUsd: finite(fact.total_cost),
           uncachedInputTokens: inputTokens - cached - cacheWrite,
           cachedInputTokens: cached,
@@ -296,6 +316,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       }
 
       if (input.agentId === "pi" || input.agentId === "prime") {
+        const directory = value.cwd ?? value.directory ?? object(value.session)?.cwd;
+        if (typeof directory === "string") sessionProject = projectName(directory);
         if (value.type !== "message") continue;
         const message = object(value.message);
         const usage = object(message?.usage);
@@ -305,6 +327,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           day: usageDay,
           modelProviderId: text(message.provider, "unknown"),
           model: text(message.responseModel, text(message.model, "unknown")),
+          project: sessionProject,
           loggedCostUsd: finite(object(usage.cost)?.total),
           uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
           cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
@@ -389,7 +412,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
 
   for (const row of allEvents.values()) add(allRows, row);
   const rows = [...allRows.values()].sort((a, b) => a.day.localeCompare(b.day)
-    || a.modelProviderId.localeCompare(b.modelProviderId) || a.model.localeCompare(b.model));
+    || a.modelProviderId.localeCompare(b.modelProviderId) || a.model.localeCompare(b.model)
+    || a.project.localeCompare(b.project));
   const result: HostJsonScanResult = {
     agentId: input.agentId,
     fileCount,

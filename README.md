@@ -9,6 +9,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Collect usage from Codex, Claude Code, FX, Grok Agent, OpenCode, Pi, and Prime Agent.
 - Separate the coding agent from the underlying model provider.
 - Group charts and cost summaries by agent or model provider.
+- Break usage down by model, project, or day.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
 - Resolve model prices from [models.dev](https://models.dev), refreshed daily at runtime with the bundled snapshot as fallback, without inventing prices for ambiguous models.
@@ -30,7 +31,7 @@ FX history follows the rolling retention of FX's local usage ledger. The plugin 
 
 OpenCode collection requires an OpenCode CLI with `opencode db --format json` support on each enrolled machine. The fixed `SELECT` query aggregates assistant-message usage from the last 90 calendar days—the longest range the dashboard supports—returns only usage metadata, is limited to 900 KB of output, and times out after 60 seconds. OpenCode costs use only positive values recorded by OpenCode; providers with no recorded cost remain unknown with zero cost.
 
-The plugin never stores prompts or message content. It stores timestamps, agent/model identifiers, token buckets, pricing status, and aggregate cost. FX uses the spend recorded in its local usage ledger, OpenCode uses positive agent-recorded costs only, and other agents use standard API-rate estimates when models.dev can resolve a model, then agent-reported cost when available. They are not subscription-billing totals.
+The plugin never stores prompts or message content. It stores timestamps, agent/model identifiers, token buckets, pricing status, and aggregate cost. To break usage down by project it also records the working directory's final segment (the project folder name, e.g. `bb-plugin-usage`) for agents that log one; the full directory path is never stored or transferred. FX uses the spend recorded in its local usage ledger, OpenCode uses positive agent-recorded costs only, and other agents use standard API-rate estimates when models.dev can resolve a model, then agent-reported cost when available. They are not subscription-billing totals.
 
 Missing log roots are treated as normal “no data” results. Offline machines, unreadable files, malformed collector output, missing runtime tools, query failures, and timeouts are retained as per-agent sync states so available history remains visible with an error notice.
 

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import type { ReactNode } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
@@ -7,15 +8,17 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
+import { ProviderLogo, BRAND_COLORS } from "@/components/provider-logo";
 import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
 import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWindow } from "@/lib/provider-limits";
+import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
 
 type Range = 7 | 30 | 90;
 type ChartMode = "cost" | "tokens";
-type BreakdownMode = "model" | "day";
+type BreakdownMode = "model" | "project" | "day";
 type DimensionMode = "agent" | "provider";
 
 const BREAKDOWN_PAGE_SIZE = 10;
@@ -75,6 +78,7 @@ type UsageRecord = {
   machineId: string;
   machineName: string;
   model: string;
+  project: string;
   costUsd: number;
   loggedCostUsd: number | null;
   pricingStatus: string;
@@ -116,34 +120,18 @@ type DashboardData = {
   notice: string;
 };
 
-const PROVIDER_COLORS: Record<string, string> = {
-  codex: "#10A37F",
-  claude: "#D97757",
-  fx: "#F43F5E",
-  grok: "#6E7CF6",
-  opencode: "#0EA5E9",
-  pi: "#F59E0B",
-  prime: "#7C3AED",
-  openai: "#10A37F",
-  anthropic: "#D97757",
-  xai: "#6E7CF6",
-  google: "#4285F4",
-  openrouter: "#8B5CF6",
-  cursor: "#A855F7",
-};
-
 const FALLBACK_PROVIDER_COLORS = ["#0EA5E9", "#F59E0B", "#EC4899", "#14B8A6"];
 
 function providerColor(providerId: string) {
   const normalizedId = providerId.toLowerCase();
-  if (PROVIDER_COLORS[normalizedId]) return PROVIDER_COLORS[normalizedId];
+  if (BRAND_COLORS[normalizedId]) return BRAND_COLORS[normalizedId];
   let hash = 0;
   for (const character of normalizedId) hash = ((hash << 5) - hash + character.charCodeAt(0)) | 0;
   return FALLBACK_PROVIDER_COLORS[Math.abs(hash) % FALLBACK_PROVIDER_COLORS.length];
 }
 
 function money(value: number) {
-  return new Intl.NumberFormat(undefined, {
+  return new Intl.NumberFormat("en-US", {
     style: "currency",
     currency: "USD",
     minimumFractionDigits: 2,
@@ -152,11 +140,44 @@ function money(value: number) {
 }
 
 function compact(value: number) {
-  return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value);
+  return new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(value);
 }
 
 function percentage(value: number, total: number) {
   return total > 0 ? `${((value / total) * 100).toFixed(1)}%` : "0.0%";
+}
+
+// Renders a USD cost with a hover tooltip showing the equivalent in the
+// browser's local currency. Falls back to plain USD when no rate is available.
+function CostValue({ value, className }: { value: number; className?: string }) {
+  const [localLabel, setLocalLabel] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLocalLabel(null);
+    void (async () => {
+      const info = localCurrency();
+      const rate = await usdToLocalRate(info.currency);
+      if (!cancelled && rate !== null) setLocalLabel(formatLocalMoney(value, info, rate));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [value]);
+
+  if (!localLabel) return <span className={className}>{money(value)}</span>;
+  return (
+    <TooltipProvider>
+      <Tooltip delayDuration={150}>
+        <TooltipTrigger asChild>
+          <span className={className}>{money(value)}</span>
+        </TooltipTrigger>
+        <TooltipContent side="top">
+          ≈ {localLabel} ({localCurrency().currency})
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  );
 }
 
 function parseDay(day: string) {
@@ -222,12 +243,23 @@ function ToggleGroup<T extends string | number>({
   label: string;
   fill?: boolean;
 }) {
+  const activeIndex = Math.max(0, options.findIndex((option) => option.value === value));
+  const count = Math.max(1, options.length);
   return (
     <div
-      className={`${fill ? "flex w-full" : "inline-flex"} h-8 items-center rounded-md border border-border/70 bg-muted/30 p-0.5`}
+      className={`${fill ? "grid w-full" : "grid w-max"} relative h-8 items-center rounded-lg bg-muted p-[3px]`}
+      style={{ gridTemplateColumns: `repeat(${count}, 1fr)` }}
       role="group"
       aria-label={label}
     >
+      <span
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-y-[3px] left-[3px] z-0 rounded-md bg-background shadow-sm transition-transform duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none"
+        style={{
+          width: `calc((100% - 6px) / ${count})`,
+          transform: `translateX(${activeIndex * 100}%)`,
+        }}
+      />
       {options.map((option) => {
         const active = option.value === value;
         return (
@@ -236,11 +268,7 @@ function ToggleGroup<T extends string | number>({
             type="button"
             aria-pressed={active}
             onClick={() => onChange(option.value)}
-            className={`inline-flex h-6 items-center justify-center rounded-[5px] px-2.5 text-xs font-medium leading-none transition-[background-color,color,box-shadow,transform] duration-150 ease-out active:scale-[0.97] ${fill ? "flex-1" : ""} ${
-              active
-                ? "bg-background text-foreground shadow-sm"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
+            className={`relative z-10 inline-flex h-full min-w-[56px] items-center justify-center whitespace-nowrap px-3 text-xs font-medium leading-none outline-none focus-visible:rounded-md focus-visible:ring-1 focus-visible:ring-ring ${active ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
           >
             {option.label}
           </button>
@@ -273,7 +301,7 @@ function MachineFilter({
     <Select value={value} onValueChange={onChange}>
       <SelectTrigger
         aria-label={ariaLabel}
-        className="h-8 border-border/70 bg-muted/20 px-2.5 py-0 text-xs font-medium shadow-none hover:bg-muted/40 focus:ring-1 data-[state=open]:bg-muted/40 [&>svg]:size-3.5 [&>svg]:opacity-60"
+        className="h-8 border-border/70 bg-muted/20 px-2.5 py-0 text-xs font-medium shadow-none hover:bg-muted/40 data-[state=open]:bg-muted/40 [&>svg]:size-3.5 [&>svg]:opacity-60"
         style={{ width: fill ? "100%" : width }}
       >
         <SelectValue>{triggerLabel}</SelectValue>
@@ -297,6 +325,72 @@ function MachineFilter({
   );
 }
 
+function Sparkline({ values, color }: { values: number[]; color: string }) {
+  const width = 100;
+  const height = 32;
+  const gradientId = useRef(`spark-${Math.random().toString(36).slice(2)}`);
+  const maximum = Math.max(1e-9, ...values);
+  const points = values.map((value, index) => ({
+    x: values.length > 1 ? (index / (values.length - 1)) * width : width / 2,
+    y: height - (value / maximum) * (height - 3) - 1.5,
+  }));
+  const line = smoothPath(points, 1.5, height - 1.5);
+  const area = points.length > 0 ? `${line} L ${width} ${height} L 0 ${height} Z` : "";
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      preserveAspectRatio="none"
+      className="h-8 w-full overflow-visible"
+      role="presentation"
+      aria-hidden="true"
+    >
+      <defs>
+        <linearGradient id={gradientId.current} x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stopColor={color} stopOpacity="0.22" />
+          <stop offset="100%" stopColor={color} stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      {area && <path d={area} fill={`url(#${gradientId.current})`} />}
+      {line && (
+        <path
+          d={line}
+          fill="none"
+          stroke={color}
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      )}
+    </svg>
+  );
+}
+
+function StatCard({
+  label,
+  value,
+  detail,
+  values,
+  color,
+}: {
+  label: string;
+  value: ReactNode;
+  detail?: ReactNode;
+  values: number[];
+  color: string;
+}) {
+  return (
+    <div className={`flex min-w-[172px] flex-1 shrink-0 snap-start flex-col justify-between gap-3 p-4 sm:min-w-0 sm:p-5 ${CARD_CLASSES}`}>
+      <div className="min-w-0">
+        <div className="text-xs font-medium text-muted-foreground">{label}</div>
+        <div className="mt-1.5 truncate text-2xl font-semibold leading-8 tracking-tight tabular-nums">{value}</div>
+        {detail && <div className="mt-1 truncate text-xs text-muted-foreground">{detail}</div>}
+      </div>
+      <Sparkline values={values} color={color} />
+    </div>
+  );
+}
+
 function UsageChart({
   records,
   providers,
@@ -314,10 +408,11 @@ function UsageChart({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [measuredWidth, setMeasuredWidth] = useState(980);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const width = Math.max(compactView ? 240 : 360, measuredWidth);
   const height = compactView ? 250 : 322;
   const inset = compactView
-    ? { top: 12, right: 4, bottom: 30, left: 48 }
+    ? { top: 12, right: 4, bottom: 30, left: 58 }
     : { top: 14, right: 8, bottom: 32, left: 62 };
   const days = useMemo(() => rangeDays(range), [range]);
   const totalsByKey = new Map<string, number>();
@@ -351,9 +446,38 @@ function UsageChart({
   const y = (value: number) => inset.top + chartHeight - (value / maximum) * chartHeight;
   const formatValue = mode === "cost" ? money : compact;
 
+  const updateHoverFromClientX = useCallback((clientX: number) => {
+    const svg = containerRef.current?.querySelector("svg");
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const scaleX = rect.width > 0 ? width / rect.width : 1;
+    const localX = (clientX - rect.left) * scaleX;
+    const ratio = Math.min(1, Math.max(0, (localX - inset.left) / Math.max(1, chartWidth)));
+    setHoverIndex(Math.round(ratio * (days.length - 1)));
+  }, [width, inset.left, chartWidth, days.length]);
+
+  const hoverDay = hoverIndex !== null ? days[hoverIndex] : null;
+  const hoverSeries = hoverIndex !== null
+    ? series
+        .map((item) => ({ id: item.id, name: item.name, value: item.values[hoverIndex!] }))
+        .filter((item) => item.value > 0)
+        .sort((a, b) => b.value - a.value)
+    : [];
+  const tooltipLeft = hoverIndex !== null ? x(hoverIndex) : 0;
+  const tooltipOnRight = tooltipLeft < width * 0.6;
+
   return (
-    <div ref={containerRef} className="min-w-0 overflow-hidden">
-      <svg width={width} height={height} className="block max-w-full" role="img" aria-label={`Daily ${mode} by ${groupBy}`}>
+    <div ref={containerRef} className="relative min-w-0 overflow-hidden">
+      <svg
+        width={width}
+        height={height}
+        className="block max-w-full touch-pan-y"
+        role="img"
+        aria-label={`Daily ${mode} by ${groupBy}`}
+        onPointerMove={(event) => updateHoverFromClientX(event.clientX)}
+        onPointerDown={(event) => updateHoverFromClientX(event.clientX)}
+        onPointerLeave={() => setHoverIndex(null)}
+      >
         <defs>
           {providers.map((provider) => (
             <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
@@ -379,7 +503,7 @@ function UsageChart({
                 strokeWidth="1"
                 vectorEffect="non-scaling-stroke"
               />
-              <text x={inset.left - 12} y={y(value) + 4} textAnchor="end" className="fill-muted-foreground text-[11px] tabular-nums">
+              <text x={inset.left - 10} y={y(value) + 4} textAnchor="end" className="fill-muted-foreground text-[11px] tabular-nums">
                 {formatValue(value)}
               </text>
             </g>
@@ -408,19 +532,178 @@ function UsageChart({
           })}
         </g>
 
+        {hoverIndex !== null && (
+          <g pointerEvents="none">
+            <line
+              x1={x(hoverIndex)}
+              x2={x(hoverIndex)}
+              y1={inset.top}
+              y2={inset.top + chartHeight}
+              className="stroke-foreground/25"
+              strokeWidth="1"
+              vectorEffect="non-scaling-stroke"
+            />
+            {series.map((item) => (
+              <circle
+                key={item.id}
+                cx={x(hoverIndex)}
+                cy={y(item.values[hoverIndex])}
+                r="3.5"
+                fill={providerColor(item.id)}
+                stroke="var(--background)"
+                strokeWidth="1.5"
+              />
+            ))}
+          </g>
+        )}
+
         {[0, Math.floor((days.length - 1) / 2), days.length - 1].map((index, labelIndex) => (
           <text
             key={`${days[index]}:${labelIndex}`}
             x={x(index)}
             y={height - 7}
             textAnchor={labelIndex === 0 ? "start" : labelIndex === 2 ? "end" : "middle"}
-            className="fill-muted-foreground text-[11px] uppercase"
+            className="fill-muted-foreground text-[11px] tabular-nums"
           >
             {formatDay(days[index])}
           </text>
         ))}
       </svg>
+
+      {hoverIndex !== null && hoverDay && (
+        <div
+          className="pointer-events-none absolute top-2 z-10 min-w-[140px] max-w-[220px] rounded-lg border border-border/70 bg-popover px-2.5 py-2 text-xs shadow-md"
+          style={{
+            left: tooltipOnRight ? Math.min(tooltipLeft + 12, width - 12) : undefined,
+            right: tooltipOnRight ? undefined : Math.max(width - tooltipLeft + 12, 12),
+          }}
+        >
+          <div className="font-medium text-foreground">{formatDay(hoverDay, true)}</div>
+          {hoverSeries.length === 0 ? (
+            <div className="mt-1 text-muted-foreground">No usage</div>
+          ) : (
+            <div className="mt-1.5 space-y-1">
+              {hoverSeries.slice(0, 6).map((item) => (
+                <div key={item.id} className="flex items-center justify-between gap-3">
+                  <span className="flex min-w-0 items-center gap-1.5 truncate text-muted-foreground">
+                    <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
+                    <span className="truncate">{item.name}</span>
+                  </span>
+                  <span className="shrink-0 tabular-nums text-foreground">{formatValue(item.value)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
+  );
+}
+
+function ProviderCostRow({
+  item,
+  total,
+}: {
+  item: { id: string; name: string; cost: number; tokens: number };
+  total: number;
+}) {
+  const share = total > 0 ? (item.cost / total) * 100 : 0;
+  return (
+    <div className="min-w-0">
+      <div className="flex items-center justify-between gap-4 text-sm">
+        <span className="flex min-w-0 items-center gap-2.5 font-medium">
+          <ProviderLogo id={item.id} name={item.name} size="md" />
+          <span className="truncate">{item.name}</span>
+        </span>
+        <span className="shrink-0 tabular-nums"><CostValue value={item.cost} /></span>
+      </div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full transition-[width] duration-500 ease-out motion-reduce:transition-none"
+          style={{
+            width: `${share}%`,
+            minWidth: item.cost > 0 ? 3 : 0,
+            backgroundColor: providerColor(item.id),
+          }}
+        />
+      </div>
+      <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</div>
+    </div>
+  );
+}
+
+function ChartLegend({ providers }: { providers: Array<{ id: string; name: string }> }) {
+  if (providers.length === 0) return null;
+  return (
+    <div
+      aria-label="Chart series"
+      className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-xs text-muted-foreground"
+    >
+      {providers.map((item) => (
+        <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
+          <ProviderLogo id={item.id} name={item.name} size="sm" />
+          {item.name}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const CARD_CLASSES = "rounded-xl border border-border/70 bg-muted/[0.08]";
+
+// A project row names its highest-cost agent and folds the rest into `+N`,
+// which lists them with their own cost on hover or focus.
+function AgentCell({
+  agentId,
+  agent,
+  others,
+}: {
+  agentId: string;
+  agent: string;
+  others?: Array<{ id: string; name: string; cost: number }>;
+}) {
+  return (
+    <span className="inline-flex min-w-0 items-center gap-2 text-muted-foreground">
+      <ProviderLogo id={agentId} name={agent} size="sm" />
+      <span className="truncate">{agent}</span>
+      {others && others.length > 0 && (
+        <TooltipProvider>
+          <Tooltip delayDuration={150}>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                aria-label={`${others.length} more ${others.length === 1 ? "agent" : "agents"}`}
+                className="shrink-0 rounded border border-border/60 bg-muted/40 px-1 py-0.5 text-[10px] font-medium leading-none tabular-nums text-muted-foreground transition-colors duration-150 hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                +{others.length}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              <div className="font-medium text-foreground/90">Also used here</div>
+              <div className="mt-1 space-y-0.5">
+                {others.map((item) => (
+                  <div key={item.id} className="flex items-center justify-between gap-3">
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <ProviderLogo id={item.id} name={item.name} size="sm" />
+                      <span className="truncate">{item.name}</span>
+                    </span>
+                    <span className="shrink-0 tabular-nums">{money(item.cost)}</span>
+                  </div>
+                ))}
+              </div>
+            </TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+      )}
+    </span>
+  );
+}
+
+function RowBadge({ children }: { children: ReactNode }) {
+  return (
+    <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border/50 bg-muted/40 px-1.5 py-1 text-[11px] leading-none text-muted-foreground">
+      {children}
+    </span>
   );
 }
 
@@ -446,31 +729,34 @@ function ProviderLimits({
   const constrainHeight = contentWidth >= 1024;
 
   return (
-    <section className="mt-3 rounded-lg border border-border/70 bg-muted/[0.08] px-3 py-2.5" aria-labelledby="provider-limits-title">
-      <div className="flex items-baseline justify-between gap-3 px-0.5">
+    <section className="rounded-xl border border-border/70 bg-muted/[0.08] p-4 sm:p-5" aria-labelledby="provider-limits-title">
+      <div className="flex items-baseline justify-between gap-3">
         <h2 id="provider-limits-title" className="text-sm font-medium">Usage limits</h2>
         <span className="text-xs text-muted-foreground">Current plan windows</span>
       </div>
       {machines.length === 0 ? (
-        <p className="mt-2 px-0.5 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
+        <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
       ) : (
         <div
-          className={`mt-4 grid gap-2 ${constrainHeight ? "max-h-60 overflow-y-auto pr-1" : ""}`}
+          className={`mt-4 grid gap-3 ${constrainHeight ? "max-h-60 overflow-y-auto pr-1" : ""}`}
           style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
         >
           {machines.map((machine) => (
             <div
               key={machine.machineId}
-              className="min-w-0 rounded-md border border-border/60 bg-muted/20 px-2.5 py-2"
+              className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
             >
-              <div className="truncate text-[11px] font-medium text-muted-foreground" title={machine.machineName}>
+              <div className="truncate text-[11px] font-medium leading-4 text-muted-foreground" title={machine.machineName}>
                 {machine.machineName}
               </div>
-              <div className="mt-1 divide-y divide-border/50 border-t border-border/50">
+              <div className="mt-2 divide-y divide-border/50 border-t border-border/50">
                 {machine.providers.map((limit) => (
-                  <div key={limit.providerId} className="py-2 first:pt-1.5 last:pb-0">
-                    <div className="flex min-w-0 items-baseline justify-between gap-3">
-                      <div className="min-w-0 truncate text-xs font-medium">{limit.providerName}</div>
+                  <div key={limit.providerId} className="py-2.5 first:pt-2 last:pb-0.5">
+                    <div className="flex min-w-0 items-center justify-between gap-3">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
+                        <span className="truncate text-xs font-medium">{limit.providerName}</span>
+                      </span>
                       {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
                     </div>
                     <div className="mt-1.5 space-y-1.5">
@@ -513,61 +799,65 @@ function ProviderLimits({
     </section>
   );
 }
-
 function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
   const toolbar = useUsageToolbar();
-  const phoneToolbar = useMediaQuery("(max-width: 479px)");
   const inBody = placement === "body";
   const selectedMachineLabel = toolbar.machine === "all"
     ? "All machines"
     : toolbar.machines.find((item) => item.id === toolbar.machine)?.name;
 
-  return (
-    <div className={inBody
-      ? "flex w-full flex-wrap items-center gap-2 rounded-lg border border-border/70 bg-muted/[0.12] p-2"
-      : "flex min-w-0 items-center gap-2"}
-    >
-      {!inBody && (
-        <label className="flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground">
-          <Checkbox
-            checked={toolbar.showUsageLimits}
-            onCheckedChange={(checked) => rememberShowUsageLimits(checked === true)}
-            aria-label="Show usage limits"
-          />
-          <span>Show usage limits</span>
-        </label>
-      )}
+  const rangeSelect = (
+    <div className={`min-w-0 ${inBody ? "flex-1" : "w-[118px]"}`}>
       <MachineFilter
         value={String(toolbar.range)}
         onChange={(value) => updateUsageToolbar({ range: Number(value) as Range })}
         ariaLabel="Usage duration"
-        width={inBody ? (phoneToolbar ? 96 : 110) : 118}
         contentWidth={148}
+        fill={inBody}
         triggerLabel={`Last ${toolbar.range} days`}
         options={[7, 30, 90].map((value) => ({ value: String(value), label: `Last ${value} days` }))}
       />
-      <div className={inBody ? "min-w-[120px] flex-1" : undefined}>
-        <MachineFilter
-          value={toolbar.machine}
-          onChange={(machine) => updateUsageToolbar({ machine })}
-          ariaLabel="Filter usage by machine"
-          width={160}
-          fill={inBody}
-          triggerLabel={selectedMachineLabel}
-          options={[{ value: "all", label: "All machines" }, ...toolbar.machines.map((item) => ({ value: item.id, label: item.name }))]}
-        />
+    </div>
+  );
+  const machineSelect = (
+    <div className={`min-w-0 ${inBody ? "flex-1" : "w-[160px]"}`}>
+      <MachineFilter
+        value={toolbar.machine}
+        onChange={(machine) => updateUsageToolbar({ machine })}
+        ariaLabel="Filter usage by machine"
+        triggerLabel={selectedMachineLabel}
+        options={[{ value: "all", label: "All machines" }, ...toolbar.machines.map((item) => ({ value: item.id, label: item.name }))]}
+      />
+    </div>
+  );
+  const limitsLabel = (
+    <label className="inline-flex h-8 cursor-pointer items-center gap-2 whitespace-nowrap rounded-md px-1.5 text-xs font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted/40 hover:text-foreground">
+      <Checkbox
+        checked={toolbar.showUsageLimits}
+        onCheckedChange={(checked) => rememberShowUsageLimits(checked === true)}
+        aria-label="Show usage limits"
+      />
+      <span>Usage limits</span>
+    </label>
+  );
+
+  if (!inBody) {
+    return (
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <div className="shrink-0">{limitsLabel}</div>
+        <div className="shrink-0">{rangeSelect}</div>
+        <div className="shrink-0">{machineSelect}</div>
+        <div className="shrink-0"><UsageSyncButton /></div>
       </div>
-      {inBody && (
-        <label className={`flex h-8 shrink-0 cursor-pointer items-center gap-2 rounded-md px-2 text-xs font-medium text-muted-foreground hover:bg-muted/40 hover:text-foreground ${phoneToolbar ? "w-full" : ""}`}>
-          <Checkbox
-            checked={toolbar.showUsageLimits}
-            onCheckedChange={(checked) => rememberShowUsageLimits(checked === true)}
-            aria-label="Show usage limits"
-          />
-          <span>Show usage limits</span>
-        </label>
-      )}
-      {!inBody && <UsageSyncButton />}
+    );
+  }
+  return (
+    <div className="flex flex-col gap-2 rounded-xl bg-muted/[0.08] p-2">
+      <div className="flex min-w-0 items-center gap-2">
+        <div className="min-w-0 flex-1">{rangeSelect}</div>
+        <div className="min-w-0 flex-1">{machineSelect}</div>
+      </div>
+      <div className="flex min-w-0 items-center">{limitsLabel}</div>
     </div>
   );
 }
@@ -618,9 +908,9 @@ function UsageDashboard() {
   const [error, setError] = useState<string | null>(null);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
-  const [costGroup, setCostGroup] = useState<DimensionMode>("agent");
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
+  const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
   const [syncRequested, setSyncRequested] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
@@ -706,7 +996,35 @@ function UsageDashboard() {
     output: sum.output + row.outputTokens,
   }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0 }), [rows]);
 
-  type BreakdownRow = { key: string; label: string; agent: string; agentId: string; provider: string; providerId: string; cost: number; tokens: number };
+  const dailySeries = useMemo(() => {
+    const days = rangeDays(range);
+    const empty = () => new Map(days.map((day) => [day, 0]));
+    const buckets = { cost: empty(), processed: empty(), cached: empty(), output: empty(), cacheSavings: empty() };
+    for (const row of rows) {
+      if (!buckets.cost.has(row.day)) continue;
+      buckets.cost.set(row.day, buckets.cost.get(row.day)! + row.costUsd);
+      buckets.processed.set(row.day, buckets.processed.get(row.day)! + row.processedTokens);
+      buckets.cached.set(row.day, buckets.cached.get(row.day)! + row.cachedInputTokens);
+      buckets.output.set(row.day, buckets.output.get(row.day)! + row.outputTokens);
+      buckets.cacheSavings.set(row.day, buckets.cacheSavings.get(row.day)! + row.cacheSavingsUsd);
+    }
+    const toArray = (map: Map<string, number>) => days.map((day) => map.get(day) ?? 0);
+    return {
+      cost: toArray(buckets.cost),
+      processed: toArray(buckets.processed),
+      cached: toArray(buckets.cached),
+      output: toArray(buckets.output),
+      cacheSavings: toArray(buckets.cacheSavings),
+    };
+  }, [rows, range]);
+
+  type BreakdownRow = {
+    key: string; label: string; agent: string; agentId: string; provider: string; providerId: string;
+    cost: number; tokens: number;
+    // Only project rows fold several agents into one badge; the folded ones are
+    // listed here so the `+N` suffix can name them on hover.
+    otherAgents?: Array<{ id: string; name: string; cost: number }>;
+  };
   const modelBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
@@ -717,6 +1035,37 @@ function UsageDashboard() {
       map.set(key, current);
     }
     return [...map.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
+  }, [rows]);
+
+  // Projects can be worked on from several agents and providers, so a row keeps
+  // the dominant one by cost for its badge instead of claiming a single owner.
+  const projectBreakdown = useMemo(() => {
+    const map = new Map<string, BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> }>();
+    for (const row of rows) {
+      const current = map.get(row.project) ?? {
+        key: row.project, label: row.project, agent: row.agentName, agentId: row.agentId,
+        provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0,
+        byAgent: new Map<string, { name: string; cost: number }>(),
+      };
+      current.cost += row.costUsd;
+      current.tokens += row.processedTokens;
+      const agent = current.byAgent.get(row.agentId) ?? { name: row.agentName, cost: 0 };
+      agent.cost += row.costUsd;
+      current.byAgent.set(row.agentId, agent);
+      map.set(row.project, current);
+    }
+    return [...map.values()].map((item) => {
+      const ranked = [...item.byAgent.entries()]
+        .map(([id, value]) => ({ id, name: value.name, cost: value.cost }))
+        .sort((a, b) => b.cost - a.cost);
+      const [dominant, ...others] = ranked;
+      return {
+        ...item,
+        agentId: dominant?.id ?? item.agentId,
+        agent: dominant?.name ?? item.agent,
+        otherAgents: others,
+      };
+    }).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
   }, [rows]);
 
   const dayBreakdown = useMemo(() => {
@@ -775,11 +1124,14 @@ function UsageDashboard() {
   const activeAgents = data.agents.filter((item) => usedAgentIds.has(item.id));
   const activeModelProviders = data.modelProviders.filter((item) => usedProviderIds.has(item.id));
   const activeProviders = chartGroup === "agent" ? activeAgents : activeModelProviders;
-  const costDimensions = costGroup === "agent" ? activeAgents : activeModelProviders;
+  // A single dimension control (next to the chart) drives both the chart and
+  // the cost rows so the agent/provider tabs never repeat.
+  const costDimension = chartGroup;
+  const costDimensions = costDimension === "agent" ? activeAgents : activeModelProviders;
   const providerTotals = costDimensions.map((item) => ({
     ...item,
-    cost: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.costUsd, 0),
-    tokens: rows.filter((row) => (costGroup === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
+    cost: rows.filter((row) => (costDimension === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.costUsd, 0),
+    tokens: rows.filter((row) => (costDimension === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
   })).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
@@ -799,31 +1151,25 @@ function UsageDashboard() {
     sources: visibleSources,
     hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
-  const breakdown = breakdownMode === "model" ? modelBreakdown : dayBreakdown;
+  const breakdown = breakdownMode === "model" ? modelBreakdown
+    : breakdownMode === "project" ? projectBreakdown
+    : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
   const visibleProviderLimits = data.providerLimits.filter((limit) => machine === "all" || limit.machineId === machine);
 
   const metrics = [
-    { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day` },
-    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of input · ${compact(totals.cacheWrites)} writes` },
-    { label: "Output", value: compact(totals.output), detail: "Includes reasoning tokens" },
-    { label: "Cache savings", value: money(totals.cacheSavings), detail: totals.cost > 0 ? `${(totals.cacheSavings / totals.cost).toFixed(1)}× the raw token cost` : `Price sheet ${data.pricingVersion}` },
+    { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day`, values: dailySeries.processed, color: FALLBACK_PROVIDER_COLORS[0] },
+    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of input · ${compact(totals.cacheWrites)} writes`, values: dailySeries.cached, color: FALLBACK_PROVIDER_COLORS[1] },
+    { label: "Output", value: compact(totals.output), detail: "Includes reasoning tokens", values: dailySeries.output, color: FALLBACK_PROVIDER_COLORS[2] },
+    { label: "Cache savings", value: money(totals.cacheSavings), detail: totals.cost > 0 ? `${(totals.cacheSavings / totals.cost).toFixed(1)}× the raw token cost` : `Price sheet ${data.pricingVersion}`, cost: totals.cacheSavings, values: dailySeries.cacheSavings, color: FALLBACK_PROVIDER_COLORS[3] },
   ];
 
   return (
     <div className="h-full overflow-y-auto bg-background">
       <main
         ref={mainRef}
-        className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col px-4 py-4 md:px-5 md:py-5 lg:px-6"
-        style={{
-          boxSizing: "border-box",
-          width: "100%",
-          minHeight: "100%",
-          maxWidth: 1440,
-          margin: "0 auto",
-          padding: compactView ? "16px" : "20px 24px",
-        }}
+        className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col gap-4 px-4 py-3 sm:gap-5 sm:px-5 sm:py-5 md:px-6 lg:gap-8"
       >
         <UsageResponsiveControls />
 
@@ -848,27 +1194,27 @@ function UsageDashboard() {
           </div>
         ) : (
           <>
+            {stackedView && (
+              <ToggleGroup
+                value={mobileSection}
+                onChange={setMobileSection}
+                label="Dashboard section"
+                fill
+                options={[{ value: "chart", label: "Usage chart" }, { value: "breakdown", label: "Breakdown" }]}
+              />
+            )}
+
+            {(!stackedView || mobileSection === "chart") && (
+            <>
             <section
-              className="grid py-6"
-              style={{
-                gridTemplateColumns: stackedView ? "minmax(0, 1fr)" : "minmax(330px, 0.92fr) minmax(0, 1.65fr)",
-                alignItems: "stretch",
-                gap: stackedView ? 20 : contentWidth >= 1024 ? 48 : 36,
-              }}
+              className={`grid items-stretch ${stackedView ? "gap-4 sm:gap-5" : "gap-10 lg:gap-14"}`}
+              style={stackedView ? undefined : { gridTemplateColumns: "minmax(330px, 0.92fr) minmax(0, 1.65fr)" }}
             >
-              <div
-                className={`min-w-0 flex flex-col${stackedView ? "" : " relative"}`}
-                style={stackedView ? {
-                  border: "1px solid hsl(var(--border) / 0.7)",
-                  borderRadius: 12,
-                  background: "hsl(var(--muted) / 0.18)",
-                  padding: compactView ? 20 : 24,
-                } : undefined}
-              >
-                <div className={stackedView ? "flex min-w-0 flex-col" : "absolute inset-0 flex flex-col"}>
-                <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className={stackedView ? `flex min-w-0 flex-col p-4 sm:p-5 ${CARD_CLASSES}` : "relative flex min-w-0 flex-col"}>
+                <div className={stackedView ? "flex min-w-0 flex-col" : "absolute inset-0 flex min-w-0 flex-col"}>
+                <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-medium uppercase tracking-[0.08em] text-muted-foreground">Raw token cost</span>
+                    <span className="text-xs font-medium text-muted-foreground">Raw token cost</span>
                     {dataWarning && (
                       <TooltipProvider>
                         <Tooltip delayDuration={150}>
@@ -889,7 +1235,6 @@ function UsageDashboard() {
                       </TooltipProvider>
                     )}
                   </div>
-                  <ToggleGroup value={costGroup} onChange={setCostGroup} label="Cost breakdown" options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]} />
                 </div>
                 <div
                   className="mt-2 font-semibold tracking-tight tabular-nums"
@@ -899,47 +1244,22 @@ function UsageDashboard() {
                     letterSpacing: "-0.025em",
                   }}
                 >
-                  {money(totals.cost)}*
+                  <CostValue value={totals.cost} />
+                  *
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
                 {!stackedView && (
-                  <div className="space-y-5 overflow-y-auto pr-3 flex-1 min-h-0" style={{ marginTop: 28 }}>
+                  <div className="mt-7 min-h-0 flex-1 space-y-6 overflow-y-auto pr-3">
                     {providerTotals.map((item) => (
-                      <div key={item.id}>
-                        <div className="flex items-center justify-between gap-4 text-sm">
-                          <span className="flex min-w-0 items-center gap-2 font-medium">
-                            <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
-                            <span className="truncate">{item.name}</span>
-                          </span>
-                          <span className="tabular-nums">{money(item.cost)}</span>
-                        </div>
-                        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-                          <div
-                            className="h-full rounded-full"
-                            style={{
-                              width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
-                              backgroundColor: providerColor(item.id),
-                            }}
-                          />
-                        </div>
-                        <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, totals.cost)} of cost · {compact(item.tokens)} tokens</div>
-                      </div>
+                      <ProviderCostRow key={item.id} item={item} total={totals.cost} />
                     ))}
                   </div>
                 )}
 
                 {stackedView && (
-                  <div className="mt-7 min-w-0 border-t border-border/60 pt-4">
-                    <div className="flex flex-wrap items-center gap-2">
+                  <div className="mt-5 min-w-0 border-t border-border/60 pt-4">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
                       <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
-                      <ToggleGroup
-                        value={chartGroup}
-                        onChange={setChartGroup}
-                        label="Chart series"
-                        options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
-
-                      />
-
                       <ToggleGroup
                         value={chartMode}
                         onChange={setChartMode}
@@ -950,13 +1270,8 @@ function UsageDashboard() {
                     <div className="mt-3">
                       <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} groupBy={chartGroup} compactView={compactView} />
                     </div>
-                    <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label={`Usage ${chartGroup === "agent" ? "agents" : "model providers"}`}>
-                      {activeProviders.map((item) => (
-                        <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
-                          <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
-                          {item.name}
-                        </span>
-                      ))}
+                    <div className="mt-2">
+                      <ChartLegend providers={activeProviders} />
                     </div>
                   </div>
                   )}
@@ -964,8 +1279,8 @@ function UsageDashboard() {
               </div>
 
               {!stackedView && (
-                <div className="min-w-0 flex flex-col">
-                  <div className="flex items-center justify-between gap-4">
+                <div className="flex min-w-0 flex-col">
+                  <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
                     <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
                     <div className="flex flex-wrap items-center gap-2">
                       <ToggleGroup
@@ -973,9 +1288,7 @@ function UsageDashboard() {
                         onChange={setChartGroup}
                         label="Chart series"
                         options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
-
                       />
-
                       <ToggleGroup
                         value={chartMode}
                         onChange={setChartMode}
@@ -987,40 +1300,19 @@ function UsageDashboard() {
                   <div className="mt-4">
                     <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} groupBy={chartGroup} />
                   </div>
-                  <div className="mt-1 flex flex-wrap items-center justify-center gap-x-4 gap-y-1.5 text-xs text-muted-foreground" aria-label={`Usage ${chartGroup === "agent" ? "agents" : "model providers"}`}>
-                    {activeProviders.map((item) => (
-                      <span key={item.id} className="flex items-center gap-1.5 whitespace-nowrap">
-                        <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} aria-hidden="true" />
-                        {item.name}
-                      </span>
-                    ))}
+                  <div className="mt-2">
+                    <ChartLegend providers={activeProviders} />
                   </div>
                 </div>
               )}
 
-              {stackedView && (
+              {stackedView && providerTotals.length > 0 && (
                 <div>
-                  <h2 className="mb-3 text-sm font-medium text-muted-foreground">{costGroup === "agent" ? "Agents" : "Model providers"}</h2>
-                  <div className="overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]">
-                    {providerTotals.map((item, index) => (
-                      <div key={item.id} className={index === 0 ? "p-4" : "border-t border-border/60 p-4"}>
-                        <div className="flex items-center justify-between gap-4 text-sm">
-                          <span className="flex min-w-0 items-center gap-2 font-medium">
-                            <span className="size-2 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
-                            <span className="truncate">{item.name}</span>
-                          </span>
-                          <span className="tabular-nums">{money(item.cost)}</span>
-                        </div>
-                        <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-                          <div
-                            className="h-full rounded-full"
-                            style={{
-                              width: `${totals.cost ? (item.cost / totals.cost) * 100 : 0}%`,
-                              backgroundColor: providerColor(item.id),
-                            }}
-                          />
-                        </div>
-                        <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, totals.cost)} of cost · {compact(item.tokens)} tokens</div>
+                  <h2 className="mb-2.5 text-sm font-medium text-muted-foreground">{chartGroup === "agent" ? "Agents" : "Model providers"}</h2>
+                  <div className={`overflow-hidden ${CARD_CLASSES}`}>
+                    {providerTotals.map((item) => (
+                      <div key={item.id} className="border-t border-border/60 px-4 py-3.5 first:border-t-0">
+                        <ProviderCostRow item={item} total={totals.cost} />
                       </div>
                     ))}
                   </div>
@@ -1028,136 +1320,154 @@ function UsageDashboard() {
               )}
             </section>
 
-            <section className={stackedView ? "pb-2" : "overflow-x-auto border-y border-border"}>
-              {stackedView && <h2 className="mb-3 text-sm font-medium text-muted-foreground">Totals</h2>}
-              <div
-                className={stackedView ? "grid overflow-hidden rounded-xl border border-border/70 bg-muted/[0.12]" : "grid min-w-[720px] grid-cols-4 divide-x divide-border"}
-                style={{
-                  minWidth: stackedView ? 0 : 720,
-                  gridTemplateColumns: stackedView
-                    ? `repeat(${compactView ? 1 : 2}, minmax(0, 1fr))`
-                    : "repeat(4, minmax(0, 1fr))",
-                }}
-              >
-                {metrics.map((metric, index) => {
-                  const columnCount = compactView ? 1 : 2;
-                  return (
-                    <div
-                      key={metric.label}
-                      className="min-w-0"
-                      style={{
-                        padding: compactView ? 16 : 20,
-                        borderLeft: stackedView && index % columnCount !== 0
-                          ? "1px solid hsl(var(--border) / 0.6)"
-                          : undefined,
-                        borderTop: stackedView && index >= columnCount
-                          ? "1px solid hsl(var(--border) / 0.6)"
-                          : undefined,
-                      }}
-                    >
-                      <div className="text-sm text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.label}</div>
-                      <div className="mt-1 text-2xl font-medium tabular-nums" style={{ fontSize: 24, lineHeight: "32px" }}>{metric.value}</div>
-                      <div className="mt-1 text-sm leading-5 text-muted-foreground" style={{ fontSize: 13, lineHeight: "20px" }}>{metric.detail}</div>
-                    </div>
-                  );
-                })}
+            <section>
+              <h2 className="mb-2.5 text-sm font-medium text-muted-foreground">Totals</h2>
+              <div className="-mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-1 sm:mx-0 sm:grid sm:snap-none sm:gap-4 sm:overflow-visible sm:px-0 sm:pb-0" style={{ gridTemplateColumns: `repeat(${metrics.length}, minmax(0, 1fr))` }}>
+                {metrics.map((metric) => (
+                  <StatCard
+                    key={metric.label}
+                    label={metric.label}
+                    value={"cost" in metric && typeof metric.cost === "number" ? <CostValue value={metric.cost} /> : metric.value}
+                    detail={metric.detail}
+                    values={metric.values}
+                    color={metric.color}
+                  />
+                ))}
               </div>
             </section>
+            </>
+            )}
 
-            <section className="py-6">
+            {(!stackedView || mobileSection === "breakdown") && (
+            <section>
               <div className="flex items-center justify-between gap-4">
-                <h2 className="text-base font-semibold">Breakdown</h2>
+                <h2 className="text-sm font-semibold">Breakdown</h2>
                 <ToggleGroup
                   value={breakdownMode}
                   onChange={setBreakdownMode}
                   label="Breakdown grouping"
-                  options={[{ value: "model", label: "Model" }, { value: "day", label: "Day" }]}
+                  options={[{ value: "model", label: "Model" }, { value: "project", label: "Project" }, { value: "day", label: "Day" }]}
                 />
               </div>
 
               {compactView ? (
-                <div className="mt-3 overflow-hidden rounded-xl border border-border/70">
-                  {paginatedBreakdown.items.map((row, index) => (
-                    <div key={row.key} className={index === 0 ? "p-4" : "border-t border-border/60 p-4"}>
-                      <div className="flex items-start justify-between gap-4">
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium">{row.label}</div>
-                          <div className="mt-1 text-xs text-muted-foreground">{row.agent} · {row.provider}</div>
-                        </div>
-                        <div className="shrink-0 text-right">
-                          <div className="text-sm tabular-nums">{money(row.cost)}</div>
-                          <div className="mt-1 text-xs tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</div>
-                        </div>
+                <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                  {paginatedBreakdown.items.map((row) => (
+                    <div key={row.key} className="border-t border-border/60 px-3.5 py-3 first:border-t-0">
+                      <div className="flex items-baseline justify-between gap-3">
+                        <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                          {breakdownMode === "model" && (
+                            <ProviderLogo id={row.providerId} name={row.provider} size="sm" />
+                          )}
+                          <span className="truncate">{row.label}</span>
+                        </span>
+                        <span className="shrink-0 text-sm font-medium tabular-nums"><CostValue value={row.cost} /></span>
                       </div>
-                      <div className="mt-3 text-xs tabular-nums text-muted-foreground">{compact(row.tokens)} tokens</div>
+                      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
+                        {breakdownMode !== "day" && (
+                          <RowBadge>
+                            <ProviderLogo id={row.agentId} name={row.agent} size="sm" />
+                            <span className="max-w-[110px] truncate">{row.agent}</span>
+                            {row.otherAgents && row.otherAgents.length > 0 && (
+                              <span
+                                className="shrink-0 tabular-nums text-foreground/70"
+                                title={row.otherAgents.map((item) => `${item.name} ${money(item.cost)}`).join(" · ")}
+                              >
+                                +{row.otherAgents.length}
+                              </span>
+                            )}
+                          </RowBadge>
+                        )}
+                        <RowBadge>
+                          <span className="tabular-nums text-foreground/80">{compact(row.tokens)}</span>
+                          <span>tokens</span>
+                        </RowBadge>
+                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</span>
+                      </div>
                     </div>
                   ))}
                 </div>
               ) : (
-                <div className="mt-3 overflow-x-auto">
-                  <table className="w-full min-w-[900px] border-collapse text-sm">
+                <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
+                  <table className="w-full border-collapse text-sm" style={{ minWidth: breakdownMode === "day" ? 520 : 640 }}>
                     <thead>
-                      <tr className="border-b border-border text-xs text-muted-foreground">
-                        <th className="pb-3 text-left font-normal">{breakdownMode === "model" ? "Model" : "Day"}</th>
-                        <th className="pb-3 text-left font-normal">Agent</th>
-                        <th className="pb-3 text-left font-normal">Model provider</th>
-                        <th className="pb-3 text-right font-normal">Cost</th>
-                        <th className="pb-3 text-right font-normal">Share</th>
-                        <th className="pb-3 text-right font-normal">Tokens</th>
+                      <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
+                        <th className="px-4 py-2.5 text-left font-medium">
+                          {breakdownMode === "model" ? "Model" : breakdownMode === "project" ? "Project" : "Day"}
+                        </th>
+                        {breakdownMode !== "day" && (
+                          <th className="px-4 py-2.5 text-left font-medium">Agent</th>
+                        )}
+                        <th className="px-4 py-2.5 text-right font-medium">Cost</th>
+                        <th className="px-4 py-2.5 text-right font-medium">Share</th>
+                        <th className="px-4 py-2.5 text-right font-medium">Tokens</th>
                       </tr>
                     </thead>
                     <tbody>
                       {paginatedBreakdown.items.map((row) => (
                         <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
-                          <td className="py-3 font-medium">{row.label}</td>
-                          <td className="py-3 text-muted-foreground">{row.agent}</td>
-                          <td className="py-3 text-muted-foreground">{row.provider}</td>
-                          <td className="py-3 text-right tabular-nums">{money(row.cost)}</td>
-                          <td className="py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
-                          <td className="py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
+                          <td className="px-4 py-3 font-medium">
+                            {breakdownMode === "model" ? (
+                              <span className="inline-flex min-w-0 items-center gap-2">
+                                <ProviderLogo id={row.providerId} name={row.provider} size="sm" />
+                                <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
+                              </span>
+                            ) : (
+                              <span className="truncate" title={row.label}>{row.label}</span>
+                            )}
+                          </td>
+                          {breakdownMode !== "day" && (
+                            <td className="px-4 py-3">
+                              <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} />
+                            </td>
+                          )}
+                          <td className="px-4 py-3 text-right tabular-nums"><CostValue value={row.cost} /></td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
                         </tr>
                       ))}
                     </tbody>
-                  </table>
-                </div>
-              )}
+                   </table>
+                 </div>
+               )}
 
-              {breakdown.length > BREAKDOWN_PAGE_SIZE && (
-                <div className="mt-3 flex items-center justify-end gap-2 text-xs tabular-nums text-muted-foreground">
-                  <span>{paginatedBreakdown.rangeStart}–{paginatedBreakdown.rangeEnd} of {paginatedBreakdown.totalItems}</span>
-                  <button
-                    type="button"
-                    aria-label="Previous breakdown page"
-                    title="Previous page"
-                    disabled={!paginatedBreakdown.canPrevious}
-                    onClick={() => setBreakdownPage(paginatedBreakdown.page - 1)}
-                    className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40"
-                  >
-                    <Icon name="ChevronLeft" className="size-3.5" aria-hidden="true" />
-                  </button>
-                  <button
-                    type="button"
-                    aria-label="Next breakdown page"
-                    title="Next page"
-                    disabled={!paginatedBreakdown.canNext}
-                    onClick={() => setBreakdownPage(paginatedBreakdown.page + 1)}
-                    className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40"
-                  >
-                    <Icon name="ChevronRight" className="size-3.5" aria-hidden="true" />
-                  </button>
-                </div>
-              )}
-            </section>
-          </>
-        )}
+               {breakdown.length > BREAKDOWN_PAGE_SIZE && (
+                 <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs tabular-nums text-muted-foreground sm:justify-end">
+                   <span>{paginatedBreakdown.rangeStart}–{paginatedBreakdown.rangeEnd} of {paginatedBreakdown.totalItems}</span>
+                   <button
+                     type="button"
+                     aria-label="Previous breakdown page"
+                     title="Previous page"
+                     disabled={!paginatedBreakdown.canPrevious}
+                     onClick={() => setBreakdownPage(paginatedBreakdown.page - 1)}
+                     className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40"
+                   >
+                     <Icon name="ChevronLeft" className="size-3.5" aria-hidden="true" />
+                   </button>
+                   <button
+                     type="button"
+                     aria-label="Next breakdown page"
+                     title="Next page"
+                     disabled={!paginatedBreakdown.canNext}
+                     onClick={() => setBreakdownPage(paginatedBreakdown.page + 1)}
+                     className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40"
+                   >
+                     <Icon name="ChevronRight" className="size-3.5" aria-hidden="true" />
+                   </button>
+                 </div>
+               )}
+             </section>
+             )}
+           </>
+         )}
 
-        <footer className={`flex flex-wrap items-center gap-x-6 gap-y-2 pb-1 text-xs text-muted-foreground ${rows.length > 0 ? "border-t border-border/70 pt-4" : "pt-2"}`}>
-          {rows.length > 0 && <span className="min-w-0 flex-1">{data.notice} Price sheet {data.pricingVersion}.</span>}
+        <footer className={`flex flex-col gap-2 pb-1 text-xs text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-x-4 ${rows.length > 0 ? "border-t border-border/70 pt-4" : "pt-2"}`}>
+          {rows.length > 0 && <span className="min-w-0 flex-1 leading-5 sm:max-w-[60%]">{data.notice} Price sheet {data.pricingVersion}.</span>}
           <a
             href="https://github.com/MayankBansal12/bb-plugin-usage/issues"
             target="_blank"
             rel="noreferrer"
-            className="ml-auto inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 font-medium transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.97]"
+            className="inline-flex items-center gap-1.5 self-start rounded-md px-2 py-1.5 font-medium transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.97] sm:ml-auto sm:self-auto"
           >
             Report issue or request feature
             <Icon name="ExternalLink" className="size-3.5" aria-hidden="true" />

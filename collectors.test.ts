@@ -26,6 +26,31 @@ describe("usage collectors", () => {
     expect(JSON.stringify(record)).not.toContain("must not be retained");
   });
 
+  it("labels usage by project without retaining the full working directory", () => {
+    const codex = [
+      { timestamp: "2026-08-09T00:00:00Z", type: "session_meta", payload: { id: "session-1", cwd: "/home/ai/code/bb-plugin-usage" } },
+      { timestamp: "2026-08-09T00:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T00:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 10, output_tokens: 2 } } } },
+    ].map(JSON.stringify).join("\n");
+    const codexRecord = parseCodex(codex, machine)[0]!;
+    expect(codexRecord.project).toBe("bb-plugin-usage");
+    expect(JSON.stringify(codexRecord)).not.toContain("/home/ai/code");
+
+    const claude = JSON.stringify({
+      type: "assistant", timestamp: "2026-08-09T00:00:00Z", cwd: "/home/ai/code/usage-redesign/",
+      message: { id: "message-2", model: "claude-sonnet-5", usage: { input_tokens: 10, output_tokens: 2 } },
+    });
+    expect(parseClaude(claude, machine)[0]!.project).toBe("usage-redesign");
+  });
+
+  it("falls back to an unknown project when no working directory is recorded", () => {
+    const content = JSON.stringify({
+      type: "assistant", timestamp: "2026-08-09T00:00:00Z",
+      message: { id: "message-3", model: "claude-sonnet-5", usage: { input_tokens: 10, output_tokens: 2 } },
+    });
+    expect(parseClaude(content, machine)[0]!.project).toBe("Unknown");
+  });
+
   it("ignores zero-token synthetic Claude messages and malformed JSONL tails", () => {
     const content = `${JSON.stringify({ type: "assistant", timestamp: "2026-08-09T00:00:00Z", message: { id: "status", model: "<synthetic>", usage: {} } })}\n{"incomplete"`;
     expect(parseClaude(content, machine)).toEqual([]);
@@ -117,13 +142,13 @@ describe("usage collectors", () => {
       outputTokens: 20,
     }]);
     expect(parseHostUsageAggregates(content, "codex", machine)[0]).toMatchObject({
-      eventKey: "codex:machine-a:2026-08-09:openai:gpt-5.6-sol",
+      eventKey: "codex:machine-a:2026-08-09:openai:gpt-5.6-sol:Unknown",
       agentId: "codex",
       modelProviderId: "openai",
       processedTokens: 125,
     });
     expect(parseHostUsageAggregates(content, "prime", machine)[0]).toMatchObject({
-      eventKey: "prime:machine-a:2026-08-09:openai:gpt-5.6-sol",
+      eventKey: "prime:machine-a:2026-08-09:openai:gpt-5.6-sol:Unknown",
       agentId: "prime",
       agentName: "Prime Agent",
     });
@@ -141,7 +166,7 @@ describe("usage collectors", () => {
       outputTokens: 15,
     }]);
     expect(parseHostUsageAggregates(aggregate(0.015), "fx", machine)[0]).toMatchObject({
-      eventKey: "fx:machine-a:2026-08-09:zai:zai%2Fglm-5.2",
+      eventKey: "fx:machine-a:2026-08-09:zai:zai%2Fglm-5.2:Unknown",
       agentId: "fx",
       agentName: "FX",
       modelProviderId: "zai",

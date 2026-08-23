@@ -19,7 +19,7 @@ import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigrat
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
   modelProviderId: z.string(), modelProviderName: z.string(),
-  machineId: z.string(), machineName: z.string(), model: z.string(),
+  machineId: z.string(), machineName: z.string(), model: z.string(), project: z.string(),
   costUsd: z.number(), loggedCostUsd: z.number().nullable(), pricingStatus: z.string(),
   cacheSavingsUsd: z.number(), processedTokens: z.number().int(), cachedInputTokens: z.number().int(),
   cacheWriteTokens: z.number().int(), uncachedInputTokens: z.number().int(), outputTokens: z.number().int(),
@@ -150,6 +150,10 @@ UPDATE usage_events SET
   pricing_status='models-dev-alias';
 CREATE INDEX IF NOT EXISTS usage_events_model_provider_idx ON usage_events(model_provider_id, day);
 `;
+const projectMigration = `
+ALTER TABLE usage_events ADD COLUMN project TEXT NOT NULL DEFAULT 'Unknown';
+CREATE INDEX IF NOT EXISTS usage_events_project_idx ON usage_events(project, day);
+`;
 const pricingCatalogMigration = `CREATE TABLE IF NOT EXISTS pricing_catalog (
   id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, fetched_at TEXT NOT NULL, data TEXT NOT NULL
 );`;
@@ -215,10 +219,10 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
   const insertEvent = db.prepare(`INSERT INTO usage_events (
       event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,
       processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens,
-      model_provider_id, model_provider_name, logged_cost_usd, pricing_status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
-    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd,
+    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd, project=excluded.project,
     cache_savings_usd=excluded.cache_savings_usd, processed_tokens=excluded.processed_tokens,
     cached_input_tokens=excluded.cached_input_tokens, cache_write_tokens=excluded.cache_write_tokens,
     uncached_input_tokens=excluded.uncached_input_tokens, output_tokens=excluded.output_tokens,
@@ -237,7 +241,7 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       insertEvent.run(
         row.eventKey, row.timestamp, row.day, row.agentId, row.agentName, row.model, row.costUsd, row.cacheSavingsUsd,
         row.processedTokens, row.cachedInputTokens, row.cacheWriteTokens, row.uncachedInputTokens, row.outputTokens,
-        row.modelProviderId, row.modelProviderName, row.loggedCostUsd, row.pricingStatus,
+        row.modelProviderId, row.modelProviderName, row.loggedCostUsd, row.pricingStatus, row.project,
       );
       insertMapping.run(row.eventKey, source.id);
     }
@@ -501,7 +505,7 @@ export function dashboardRecordsSql() {
       JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
       GROUP BY e.event_key
     ) SELECT day, provider_id agentId, provider_name agentName,
-    model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model,
+    model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model, project,
     SUM(cost_usd) costUsd,
     CASE WHEN COUNT(logged_cost_usd)=0 THEN NULL ELSE SUM(logged_cost_usd) END loggedCostUsd,
     CASE
@@ -515,7 +519,7 @@ export function dashboardRecordsSql() {
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
     FROM canonical WHERE day >= date('now', '-${DASHBOARD_HISTORY_DAYS - 1} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
-    GROUP BY day, provider_id, model_provider_id, machine_id, model ORDER BY day`;
+    GROUP BY day, provider_id, model_provider_id, machine_id, model, project ORDER BY day`;
 }
 
 function abortableDelay(ms: number, signal: AbortSignal) {
@@ -541,7 +545,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
