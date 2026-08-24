@@ -40,6 +40,7 @@ const providerLimitWindowSchema = z.object({
 const providerLimitSchema = z.object({
   machineId: z.string(), machineName: z.string(), providerId: z.string(), providerName: z.string(),
   planLabel: z.string().nullable(), windows: z.array(providerLimitWindowSchema),
+  status: z.enum(["ok", "error"]), error: z.string().nullable(),
 });
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
@@ -91,28 +92,64 @@ function timeoutSignal(timeoutMs: number, parent?: AbortSignal) {
 export async function loadProviderLimits(
   bb: BbPluginApi,
   machines: Array<Machine & { status: string }>,
+  db: Database,
   timeoutMs = PROVIDER_LIMITS_TIMEOUT_MS,
-) {
+): Promise<Array<z.infer<typeof providerLimitSchema>>> {
   return (await Promise.all(machines
     .filter((machine) => machine.status === "connected")
     .map(async (machine) => {
+      const presentRows = db.prepare(`SELECT DISTINCT s.provider_id agentId FROM usage_sources s
+        JOIN usage_event_sources es ON es.source_id = s.source_id
+        WHERE s.machine_id = ? AND s.provider_id IN (?, ?, ?)`)
+        .all(machine.id, "codex", "claude", "cursor") as Array<{ agentId: string }>;
+      const present = new Set(presentRows.map((row) => row.agentId));
       try {
         const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
-        return LIMIT_PROVIDERS.flatMap((provider) => {
+        return LIMIT_PROVIDERS.flatMap((provider): Array<z.infer<typeof providerLimitSchema>> => {
           const limit = usage[provider.key];
-          if (limit.status !== "ok" || limit.windows.length === 0) return [];
-          return [{
+          if (limit.status === "ok") {
+            if (limit.windows.length === 0) return [];
+            return [{
+              machineId: machine.id,
+              machineName: machine.name,
+              providerId: provider.id,
+              providerName: provider.name,
+              planLabel: limit.planLabel,
+              windows: limit.windows,
+              status: "ok",
+              error: null,
+            }];
+          }
+          if (limit.status === "error") {
+            bb.log.debug(`Provider limits unavailable for ${provider.name} on ${machine.name}: ${limit.message}`);
+            return [{
+              machineId: machine.id,
+              machineName: machine.name,
+              providerId: provider.id,
+              providerName: provider.name,
+              planLabel: limit.planLabel,
+              windows: [],
+              status: "error",
+              error: limit.message,
+            }];
+          }
+          return [];
+        });
+      } catch (error) {
+        const message = `Provider limits unavailable: ${errorMessage(error)}`;
+        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
+        return LIMIT_PROVIDERS
+          .filter((provider) => present.has(provider.id))
+          .map((provider): z.infer<typeof providerLimitSchema> => ({
             machineId: machine.id,
             machineName: machine.name,
             providerId: provider.id,
             providerName: provider.name,
-            planLabel: limit.planLabel,
-            windows: limit.windows,
-          }];
-        });
-      } catch (error) {
-        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
-        return [];
+            planLabel: null,
+            windows: [],
+            status: "error",
+            error: message,
+          }));
       }
     }))).flat();
 }
@@ -614,7 +651,7 @@ export default async function plugin(bb: BbPluginApi) {
           FROM usage_sources GROUP BY machine_id ORDER BY name`).all() as typeof machines;
       }
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
-      const providerLimits = await loadProviderLimits(bb, machines);
+      const providerLimits = await loadProviderLimits(bb, machines, db);
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
