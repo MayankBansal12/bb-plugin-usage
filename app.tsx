@@ -6,6 +6,7 @@ import { Icon } from "@/components/ui/icon";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ToggleGroup } from "@/components/ui/toggle-group";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
@@ -230,54 +231,6 @@ function smoothPath(points: Array<{ x: number; y: number }>, top: number, bottom
     path += ` C ${control1X} ${control1Y}, ${control2X} ${control2Y}, ${next.x} ${next.y}`;
   }
   return path;
-}
-
-function ToggleGroup<T extends string | number>({
-  value,
-  options,
-  onChange,
-  label,
-  fill = false,
-}: {
-  value: T;
-  options: Array<{ value: T; label: string }>;
-  onChange: (value: T) => void;
-  label: string;
-  fill?: boolean;
-}) {
-  const activeIndex = Math.max(0, options.findIndex((option) => option.value === value));
-  const count = Math.max(1, options.length);
-  return (
-    <div
-      className={`${fill ? "grid w-full" : "grid w-max"} relative h-8 items-center rounded-lg bg-muted p-[3px]`}
-      style={{ gridTemplateColumns: `repeat(${count}, 1fr)` }}
-      role="group"
-      aria-label={label}
-    >
-      <span
-        aria-hidden="true"
-        className="pointer-events-none absolute inset-y-[3px] left-[3px] z-0 rounded-md bg-background shadow-sm transition-transform duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none"
-        style={{
-          width: `calc((100% - 6px) / ${count})`,
-          transform: `translateX(${activeIndex * 100}%)`,
-        }}
-      />
-      {options.map((option) => {
-        const active = option.value === value;
-        return (
-          <button
-            key={option.value}
-            type="button"
-            aria-pressed={active}
-            onClick={() => onChange(option.value)}
-            className={`relative z-10 inline-flex h-full min-w-[56px] items-center justify-center whitespace-nowrap px-3 text-xs font-medium leading-none outline-none focus-visible:rounded-md focus-visible:ring-1 focus-visible:ring-ring ${active ? "text-foreground" : "text-muted-foreground hover:text-foreground"}`}
-          >
-            {option.label}
-          </button>
-        );
-      })}
-    </div>
-  );
 }
 
 function MachineFilter({

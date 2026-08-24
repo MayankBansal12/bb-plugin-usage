@@ -329,6 +329,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           day: usageDay,
           modelProviderId: text(fact.provider, "google"),
           model: text(fact.model, "unknown"),
+          project: projectName(fact.cwd ?? fact.workspace ?? value.cwd),
           loggedCostUsd: finite(fact.total_cost),
           uncachedInputTokens: inputTokens - cached,
           cachedInputTokens: cached,

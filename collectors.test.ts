@@ -194,6 +194,7 @@ describe("usage collectors", () => {
       day: "2026-08-09",
       modelProviderId: "google",
       model: "gemini-4-ultra-preview",
+      project: "Unknown",
       loggedCostUsd: null,
       uncachedInputTokens: 2302,
       cachedInputTokens: 8113,
@@ -201,7 +202,7 @@ describe("usage collectors", () => {
       outputTokens: 657,
     }]);
     expect(parseHostUsageAggregates(content, "antigravity", machine)[0]).toMatchObject({
-      eventKey: "antigravity:machine-a:2026-08-09:google:gemini-4-ultra-preview",
+      eventKey: "antigravity:machine-a:2026-08-09:google:gemini-4-ultra-preview:Unknown",
       agentId: "antigravity",
       agentName: "Antigravity",
       modelProviderId: "google",

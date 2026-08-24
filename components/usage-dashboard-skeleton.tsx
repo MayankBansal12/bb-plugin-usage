@@ -1,4 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
+import { ToggleGroupPreview } from "@/components/ui/toggle-group";
 
 // The theme exposes its colors as complete color-mix() values rather than HSL
 // channel triplets, so every translucent tone here goes through color-mix too.
@@ -153,10 +154,10 @@ export function UsageDashboardSkeleton() {
             <div className="mt-5 border-t border-border/60 pt-4 lg:hidden">
               <div className="flex items-center justify-between gap-2">
                 <Label className="text-sm font-semibold">Daily cost</Label>
-                <div className="flex h-8 items-center gap-1 rounded-lg bg-muted p-[3px] text-xs font-medium">
-                  <span className="rounded-md bg-background px-3 py-1 shadow-sm">Cost</span>
-                  <span className="px-3 py-1 text-muted-foreground">Tokens</span>
-                </div>
+                <ToggleGroupPreview
+                  value="cost"
+                  options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+                />
               </div>
               <div className="mt-3">
                 <ChartSkeleton />
@@ -177,14 +178,14 @@ export function UsageDashboardSkeleton() {
             <div className="flex items-center justify-between gap-4">
               <Label className="text-sm font-semibold">Daily cost</Label>
               <div className="flex items-center gap-2">
-                <div className="flex h-8 items-center gap-1 rounded-lg bg-muted p-[3px] text-xs font-medium">
-                  <span className="rounded-md bg-background px-3 py-1 shadow-sm">Agents</span>
-                  <span className="px-3 py-1 text-muted-foreground">Providers</span>
-                </div>
-                <div className="flex h-8 items-center gap-1 rounded-lg bg-muted p-[3px] text-xs font-medium">
-                  <span className="rounded-md bg-background px-3 py-1 shadow-sm">Cost</span>
-                  <span className="px-3 py-1 text-muted-foreground">Tokens</span>
-                </div>
+                <ToggleGroupPreview
+                  value="agent"
+                  options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
+                />
+                <ToggleGroupPreview
+                  value="cost"
+                  options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+                />
               </div>
             </div>
             <div className="mt-4">
@@ -224,11 +225,14 @@ export function UsageDashboardSkeleton() {
         <section>
           <div className="flex items-center justify-between gap-4">
             <Label className="text-sm font-semibold">Breakdown</Label>
-            <div className="flex h-8 items-center gap-1 rounded-lg bg-muted p-[3px] text-xs font-medium">
-              <span className="rounded-md bg-background px-3 py-1 shadow-sm">Model</span>
-              <span className="px-3 py-1 text-muted-foreground">Project</span>
-              <span className="px-3 py-1 text-muted-foreground">Day</span>
-            </div>
+            <ToggleGroupPreview
+              value="model"
+              options={[
+                { value: "model", label: "Model" },
+                { value: "project", label: "Project" },
+                { value: "day", label: "Day" },
+              ]}
+            />
           </div>
 
           <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
