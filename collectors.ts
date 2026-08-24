@@ -1,6 +1,6 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
-export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime";
+export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity";
 
 export type UsageRecord = {
   eventKey: string;
@@ -285,6 +285,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     : agentId === "grok" ? "Grok Agent"
     : agentId === "fx" ? "FX"
     : agentId === "prime" ? "Prime Agent"
+    : agentId === "antigravity" ? "Antigravity"
     : "Pi";
 
   return values.flatMap((raw) => {
