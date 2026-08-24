@@ -191,6 +191,15 @@ describe("sync RPC", () => {
 });
 
 describe("provider limit loading", () => {
+  function emptyDb() {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE usage_sources (source_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, machine_name TEXT NOT NULL, provider_id TEXT NOT NULL);
+      CREATE TABLE usage_event_sources (event_key TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY (event_key, source_id));
+    `);
+    return db;
+  }
+
   it("does not block the dashboard when a connected machine stalls", async () => {
     const usageLimits = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise<never>((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -203,7 +212,7 @@ describe("provider limit loading", () => {
 
     await expect(loadProviderLimits(bb, [
       { id: "host_1", name: "Slow machine", status: "connected" },
-    ], 10)).resolves.toEqual([]);
+    ], emptyDb(), 10)).resolves.toEqual([]);
     expect(usageLimits).toHaveBeenCalledWith({ hostId: "host_1", signal: expect.any(AbortSignal) });
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
@@ -225,11 +234,56 @@ describe("provider limit loading", () => {
 
     await expect(loadProviderLimits(bb, [
       { id: "host_1", name: "Fast machine", status: "connected" },
-    ], 1_000)).resolves.toEqual([expect.objectContaining({
+    ], emptyDb(), 1_000)).resolves.toEqual([expect.objectContaining({
       machineId: "host_1",
       providerId: "codex",
       planLabel: "Pro",
+      status: "ok",
     })]);
+  });
+
+  it("surfaces a provider error (e.g. rate limited) instead of hiding the provider", async () => {
+    const usageLimits = vi.fn(async () => ({
+      codex: { status: "ok", planLabel: "Pro", windows: [{ label: "5 hours", usedPercent: 10, resetsAt: null }] },
+      claudeCode: { status: "error", message: "rate limited", planLabel: null, accountEmail: null },
+      cursor: { status: "not_installed" },
+    }));
+    const debug = vi.fn();
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug },
+    } as unknown as BbPluginApi;
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Fast machine", status: "connected" },
+    ], emptyDb(), 1_000)).resolves.toEqual([
+      expect.objectContaining({ providerId: "codex", status: "ok" }),
+      expect.objectContaining({ providerId: "claude", status: "error", error: "rate limited" }),
+    ]);
+  });
+
+  it("surfaces an error for providers with usage records when the whole limits call fails", async () => {
+    const usageLimits = vi.fn(async () => { throw new Error("rate limited"); });
+    const debug = vi.fn();
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug },
+    } as unknown as BbPluginApi;
+
+    const db = emptyDb();
+    db.prepare("INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id) VALUES (?, ?, ?, ?)")
+      .run("claude-source", "host_1", "Fast machine", "claude");
+    db.prepare("INSERT INTO usage_event_sources (event_key, source_id) VALUES (?, ?)")
+      .run("event-1", "claude-source");
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Fast machine", status: "connected" },
+    ], db, 1_000)).resolves.toEqual([expect.objectContaining({
+      machineId: "host_1",
+      providerId: "claude",
+      status: "error",
+    })]);
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
 });
 

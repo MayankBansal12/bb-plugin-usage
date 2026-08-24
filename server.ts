@@ -19,7 +19,7 @@ import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigrat
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
   modelProviderId: z.string(), modelProviderName: z.string(),
-  machineId: z.string(), machineName: z.string(), model: z.string(),
+  machineId: z.string(), machineName: z.string(), model: z.string(), project: z.string(),
   costUsd: z.number(), loggedCostUsd: z.number().nullable(), pricingStatus: z.string(),
   cacheSavingsUsd: z.number(), processedTokens: z.number().int(), cachedInputTokens: z.number().int(),
   cacheWriteTokens: z.number().int(), uncachedInputTokens: z.number().int(), outputTokens: z.number().int(),
@@ -40,6 +40,7 @@ const providerLimitWindowSchema = z.object({
 const providerLimitSchema = z.object({
   machineId: z.string(), machineName: z.string(), providerId: z.string(), providerName: z.string(),
   planLabel: z.string().nullable(), windows: z.array(providerLimitWindowSchema),
+  status: z.enum(["ok", "error"]), error: z.string().nullable(),
 });
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
@@ -92,28 +93,64 @@ function timeoutSignal(timeoutMs: number, parent?: AbortSignal) {
 export async function loadProviderLimits(
   bb: BbPluginApi,
   machines: Array<Machine & { status: string }>,
+  db: Database,
   timeoutMs = PROVIDER_LIMITS_TIMEOUT_MS,
-) {
+): Promise<Array<z.infer<typeof providerLimitSchema>>> {
   return (await Promise.all(machines
     .filter((machine) => machine.status === "connected")
     .map(async (machine) => {
+      const presentRows = db.prepare(`SELECT DISTINCT s.provider_id agentId FROM usage_sources s
+        JOIN usage_event_sources es ON es.source_id = s.source_id
+        WHERE s.machine_id = ? AND s.provider_id IN (?, ?, ?)`)
+        .all(machine.id, "codex", "claude", "cursor") as Array<{ agentId: string }>;
+      const present = new Set(presentRows.map((row) => row.agentId));
       try {
         const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
-        return LIMIT_PROVIDERS.flatMap((provider) => {
+        return LIMIT_PROVIDERS.flatMap((provider): Array<z.infer<typeof providerLimitSchema>> => {
           const limit = usage[provider.key];
-          if (limit.status !== "ok" || limit.windows.length === 0) return [];
-          return [{
+          if (limit.status === "ok") {
+            if (limit.windows.length === 0) return [];
+            return [{
+              machineId: machine.id,
+              machineName: machine.name,
+              providerId: provider.id,
+              providerName: provider.name,
+              planLabel: limit.planLabel,
+              windows: limit.windows,
+              status: "ok",
+              error: null,
+            }];
+          }
+          if (limit.status === "error") {
+            bb.log.debug(`Provider limits unavailable for ${provider.name} on ${machine.name}: ${limit.message}`);
+            return [{
+              machineId: machine.id,
+              machineName: machine.name,
+              providerId: provider.id,
+              providerName: provider.name,
+              planLabel: limit.planLabel,
+              windows: [],
+              status: "error",
+              error: limit.message,
+            }];
+          }
+          return [];
+        });
+      } catch (error) {
+        const message = `Provider limits unavailable: ${errorMessage(error)}`;
+        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
+        return LIMIT_PROVIDERS
+          .filter((provider) => present.has(provider.id))
+          .map((provider): z.infer<typeof providerLimitSchema> => ({
             machineId: machine.id,
             machineName: machine.name,
             providerId: provider.id,
             providerName: provider.name,
-            planLabel: limit.planLabel,
-            windows: limit.windows,
-          }];
-        });
-      } catch (error) {
-        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
-        return [];
+            planLabel: null,
+            windows: [],
+            status: "error",
+            error: message,
+          }));
       }
     }))).flat();
 }
@@ -150,6 +187,10 @@ UPDATE usage_events SET
   model_provider_name=CASE provider_id WHEN 'codex' THEN 'OpenAI' WHEN 'claude' THEN 'Anthropic' WHEN 'grok' THEN 'xAI' ELSE 'Unknown' END,
   pricing_status='models-dev-alias';
 CREATE INDEX IF NOT EXISTS usage_events_model_provider_idx ON usage_events(model_provider_id, day);
+`;
+const projectMigration = `
+ALTER TABLE usage_events ADD COLUMN project TEXT NOT NULL DEFAULT 'Unknown';
+CREATE INDEX IF NOT EXISTS usage_events_project_idx ON usage_events(project, day);
 `;
 const pricingCatalogMigration = `CREATE TABLE IF NOT EXISTS pricing_catalog (
   id INTEGER PRIMARY KEY CHECK (id = 1), revision TEXT NOT NULL, fetched_at TEXT NOT NULL, data TEXT NOT NULL
@@ -216,10 +257,10 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
   const insertEvent = db.prepare(`INSERT INTO usage_events (
       event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,
       processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens,
-      model_provider_id, model_provider_name, logged_cost_usd, pricing_status
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
-    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd,
+    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd, project=excluded.project,
     cache_savings_usd=excluded.cache_savings_usd, processed_tokens=excluded.processed_tokens,
     cached_input_tokens=excluded.cached_input_tokens, cache_write_tokens=excluded.cache_write_tokens,
     uncached_input_tokens=excluded.uncached_input_tokens, output_tokens=excluded.output_tokens,
@@ -238,7 +279,7 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       insertEvent.run(
         row.eventKey, row.timestamp, row.day, row.agentId, row.agentName, row.model, row.costUsd, row.cacheSavingsUsd,
         row.processedTokens, row.cachedInputTokens, row.cacheWriteTokens, row.uncachedInputTokens, row.outputTokens,
-        row.modelProviderId, row.modelProviderName, row.loggedCostUsd, row.pricingStatus,
+        row.modelProviderId, row.modelProviderName, row.loggedCostUsd, row.pricingStatus, row.project,
       );
       insertMapping.run(row.eventKey, source.id);
     }
@@ -503,7 +544,7 @@ export function dashboardRecordsSql() {
       JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
       GROUP BY e.event_key
     ) SELECT day, provider_id agentId, provider_name agentName,
-    model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model,
+    model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model, project,
     SUM(cost_usd) costUsd,
     CASE WHEN COUNT(logged_cost_usd)=0 THEN NULL ELSE SUM(logged_cost_usd) END loggedCostUsd,
     CASE
@@ -517,7 +558,7 @@ export function dashboardRecordsSql() {
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
     FROM canonical WHERE day >= date('now', '-${DASHBOARD_HISTORY_DAYS - 1} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
-    GROUP BY day, provider_id, model_provider_id, machine_id, model ORDER BY day`;
+    GROUP BY day, provider_id, model_provider_id, machine_id, model, project ORDER BY day`;
 }
 
 function abortableDelay(ms: number, signal: AbortSignal) {
@@ -543,7 +584,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -613,7 +654,7 @@ export default async function plugin(bb: BbPluginApi) {
           FROM usage_sources GROUP BY machine_id ORDER BY name`).all() as typeof machines;
       }
       const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
-      const providerLimits = await loadProviderLimits(bb, machines);
+      const providerLimits = await loadProviderLimits(bb, machines, db);
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
@@ -633,7 +674,7 @@ export default async function plugin(bb: BbPluginApi) {
         sources,
         providerLimits,
         sync,
-        notice: "Prompts and message content are never stored. FX uses FX-recorded spend, OpenCode uses positive agent-recorded costs, and other agents use models.dev estimates when available. Subscription charges may differ.",
+        notice: "Prompts and message content are never stored.",
       };
     },
     sync() {
