@@ -121,22 +121,6 @@ export function UsageDashboardSkeleton() {
       <style>{SHIMMER_STYLE}</style>
       <span className="sr-only">Loading usage…</span>
       <main className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col gap-4 px-4 py-3 sm:gap-5 sm:px-5 sm:py-5 md:px-6 lg:gap-8">
-        {/* toolbar: the controls exist and read normally, only inert while loading */}
-        <div className="flex flex-col gap-2 rounded-xl bg-muted/[0.08] p-2 lg:hidden">
-          <div className="flex min-w-0 items-center gap-2">
-            <div className="flex h-8 min-w-0 flex-1 items-center rounded-md border border-border/70 bg-muted/20 px-2.5 text-xs font-medium text-muted-foreground">
-              Last 7 days
-            </div>
-            <div className="flex h-8 min-w-0 flex-1 items-center rounded-md border border-border/70 bg-muted/20 px-2.5 text-xs font-medium text-muted-foreground">
-              All machines
-            </div>
-          </div>
-          <div className="flex h-8 items-center gap-2 px-1.5 text-xs font-medium text-muted-foreground">
-            <span className="size-4 rounded border border-border/70" aria-hidden="true" />
-            Usage limits
-          </div>
-        </div>
-
         <section className="grid items-stretch gap-4 sm:gap-5 lg:grid-cols-[minmax(330px,0.92fr)_minmax(0,1.65fr)] lg:gap-14">
           {/* left: headline cost + per-agent rows */}
           <div className={`flex min-w-0 flex-col p-4 sm:p-5 lg:border-0 lg:bg-transparent lg:p-0 ${CARD_CLASSES} lg:rounded-none`}>
@@ -217,9 +201,8 @@ export function UsageDashboardSkeleton() {
           </div>
         </section>
 
-        {/* totals: real card labels, shimmering values */}
+        {/* metric cards: real labels, shimmering values */}
         <section>
-          <Label className="mb-2.5 text-sm font-medium text-muted-foreground">Totals</Label>
           <div className="-mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-1 sm:mx-0 sm:grid sm:grid-cols-4 sm:snap-none sm:gap-4 sm:overflow-visible sm:px-0 sm:pb-0">
             {METRIC_LABELS.map((label, index) => (
               <div

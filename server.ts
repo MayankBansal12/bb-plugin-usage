@@ -671,7 +671,7 @@ export default async function plugin(bb: BbPluginApi) {
         sources,
         providerLimits,
         sync,
-        notice: "Prompts and message content are never stored. FX uses FX-recorded spend, OpenCode uses positive agent-recorded costs, and other agents use models.dev estimates when available. Subscription charges may differ.",
+        notice: "Prompts and message content are never stored.",
       };
     },
     sync() {

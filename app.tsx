@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
-import { ProviderLogo, BRAND_COLORS } from "@/components/provider-logo";
+import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
 import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
@@ -799,6 +799,7 @@ function ProviderLimits({
                         );
                       })}
                     </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -809,38 +810,10 @@ function ProviderLimits({
     </section>
   );
 }
-function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
+function UsageLimitsToggle() {
   const toolbar = useUsageToolbar();
-  const inBody = placement === "body";
-  const selectedMachineLabel = toolbar.machine === "all"
-    ? "All machines"
-    : toolbar.machines.find((item) => item.id === toolbar.machine)?.name;
 
-  const rangeSelect = (
-    <div className={`min-w-0 ${inBody ? "flex-1" : "w-[118px]"}`}>
-      <MachineFilter
-        value={String(toolbar.range)}
-        onChange={(value) => updateUsageToolbar({ range: Number(value) as Range })}
-        ariaLabel="Usage duration"
-        contentWidth={148}
-        fill={inBody}
-        triggerLabel={`Last ${toolbar.range} days`}
-        options={[7, 30, 90].map((value) => ({ value: String(value), label: `Last ${value} days` }))}
-      />
-    </div>
-  );
-  const machineSelect = (
-    <div className={`min-w-0 ${inBody ? "flex-1" : "w-[160px]"}`}>
-      <MachineFilter
-        value={toolbar.machine}
-        onChange={(machine) => updateUsageToolbar({ machine })}
-        ariaLabel="Filter usage by machine"
-        triggerLabel={selectedMachineLabel}
-        options={[{ value: "all", label: "All machines" }, ...toolbar.machines.map((item) => ({ value: item.id, label: item.name }))]}
-      />
-    </div>
-  );
-  const limitsLabel = (
+  return (
     <label className="inline-flex h-8 cursor-pointer items-center gap-2 whitespace-nowrap rounded-md px-1.5 text-xs font-medium text-muted-foreground transition-colors duration-150 hover:bg-muted/40 hover:text-foreground">
       <Checkbox
         checked={toolbar.showUsageLimits}
@@ -850,11 +823,45 @@ function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
       <span>Usage limits</span>
     </label>
   );
+}
 
+function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
+  const toolbar = useUsageToolbar();
+  const inBody = placement === "body";
+  const selectedMachineLabel = toolbar.machine === "all"
+    ? "All machines"
+    : toolbar.machines.find((item) => item.id === toolbar.machine)?.name;
+
+  const rangeSelect = (
+    <div className={`min-w-0 ${inBody ? "w-full" : "w-[132px]"}`}>
+      <MachineFilter
+        value={String(toolbar.range)}
+        onChange={(value) => updateUsageToolbar({ range: Number(value) as Range })}
+        ariaLabel="Usage duration"
+        contentWidth={148}
+        fill
+        triggerLabel={`Last ${toolbar.range} days`}
+        options={[7, 30, 90].map((value) => ({ value: String(value), label: `Last ${value} days` }))}
+      />
+    </div>
+  );
+  const machineSelect = (
+    <div className={`min-w-0 ${inBody ? "w-full" : "w-[200px]"}`}>
+      <MachineFilter
+        value={toolbar.machine}
+        onChange={(machine) => updateUsageToolbar({ machine })}
+        ariaLabel="Filter usage by machine"
+        contentWidth={240}
+        fill
+        triggerLabel={selectedMachineLabel}
+        options={[{ value: "all", label: "All machines" }, ...toolbar.machines.map((item) => ({ value: item.id, label: item.name }))]}
+      />
+    </div>
+  );
   if (!inBody) {
     return (
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <div className="shrink-0">{limitsLabel}</div>
+      <div className="flex min-w-0 flex-nowrap items-center gap-2">
+        <div className="shrink-0"><UsageLimitsToggle /></div>
         <div className="shrink-0">{rangeSelect}</div>
         <div className="shrink-0">{machineSelect}</div>
         <div className="shrink-0"><UsageSyncButton /></div>
@@ -862,13 +869,12 @@ function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
     );
   }
   return (
-    <div className="flex flex-col gap-2 rounded-xl bg-muted/[0.08] p-2">
-      <div className="flex min-w-0 items-center gap-2">
-        <div className="min-w-0 flex-1">{rangeSelect}</div>
-        <div className="min-w-0 flex-1">{machineSelect}</div>
+    <section aria-label="Usage filters" className="min-w-0 rounded-xl border border-border/60 bg-muted/[0.08] p-2">
+      <div className="grid min-w-0 grid-cols-[minmax(112px,0.72fr)_minmax(0,1.28fr)] gap-2">
+        {rangeSelect}
+        {machineSelect}
       </div>
-      <div className="flex min-w-0 items-center">{limitsLabel}</div>
-    </div>
+    </section>
   );
 }
 
@@ -890,7 +896,7 @@ function UsageSyncButton() {
 }
 
 function UsageHeaderControls() {
-  const compactHeader = useMediaQuery("(max-width: 1023px)");
+  const compactHeader = useMediaQuery("(max-width: 1279px)");
 
   useEffect(() => {
     try {
@@ -900,12 +906,19 @@ function UsageHeaderControls() {
     }
   }, []);
 
-  if (compactHeader) return <UsageSyncButton />;
+  if (compactHeader) {
+    return (
+      <div className="flex items-center gap-1">
+        <UsageLimitsToggle />
+        <UsageSyncButton />
+      </div>
+    );
+  }
   return <UsageToolbarControls placement="header" />;
 }
 
 function UsageResponsiveControls() {
-  const compactHeader = useMediaQuery("(max-width: 1023px)");
+  const compactHeader = useMediaQuery("(max-width: 1279px)");
   if (!compactHeader) return null;
   return <UsageToolbarControls placement="body" />;
 }
@@ -1331,7 +1344,6 @@ function UsageDashboard() {
             </section>
 
             <section>
-              <h2 className="mb-2.5 text-sm font-medium text-muted-foreground">Totals</h2>
               <div className="-mx-4 flex snap-x snap-mandatory gap-3 overflow-x-auto px-4 pb-1 sm:mx-0 sm:grid sm:snap-none sm:gap-4 sm:overflow-visible sm:px-0 sm:pb-0" style={{ gridTemplateColumns: `repeat(${metrics.length}, minmax(0, 1fr))` }}>
                 {metrics.map((metric) => (
                   <StatCard
@@ -1367,7 +1379,7 @@ function UsageDashboard() {
                       <div className="flex items-baseline justify-between gap-3">
                         <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
                           {breakdownMode === "model" && (
-                            <ProviderLogo id={row.providerId} name={row.provider} size="sm" />
+                            <ProviderLogo id={modelLogoId(row.label)} size="sm" />
                           )}
                           <span className="truncate">{row.label}</span>
                         </span>
@@ -1419,7 +1431,7 @@ function UsageDashboard() {
                           <td className="px-4 py-3 font-medium">
                             {breakdownMode === "model" ? (
                               <span className="inline-flex min-w-0 items-center gap-2">
-                                <ProviderLogo id={row.providerId} name={row.provider} size="sm" />
+                                <ProviderLogo id={modelLogoId(row.label)} size="sm" />
                                 <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
                               </span>
                             ) : (
@@ -1472,7 +1484,7 @@ function UsageDashboard() {
          )}
 
         <footer className={`flex flex-col gap-2 pb-1 text-xs text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:justify-between sm:gap-x-4 ${rows.length > 0 ? "border-t border-border/70 pt-4" : "pt-2"}`}>
-          {rows.length > 0 && <span className="min-w-0 flex-1 leading-5 sm:max-w-[60%]">{data.notice} Price sheet {data.pricingVersion}.</span>}
+          {rows.length > 0 && <span className="min-w-0 flex-1 leading-5 sm:max-w-[60%]">{data.notice} Costs use models.dev pricing as of {data.pricingVersion}.</span>}
           <a
             href="https://github.com/MayankBansal12/bb-plugin-usage/issues"
             target="_blank"
