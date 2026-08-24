@@ -303,15 +303,17 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const fact = object(value.fact);
         const usageDay = day(fact?.created_at_ms);
         if (!fact || !usageDay) continue;
+        const inputTokens = count(fact.input_tokens);
+        const cached = Math.min(inputTokens, count(fact.cache_read_tokens));
         add(rows, {
           day: usageDay,
           modelProviderId: text(fact.provider, "google"),
           model: text(fact.model, "unknown"),
           loggedCostUsd: finite(fact.total_cost),
-          uncachedInputTokens: count(fact.input_tokens),
-          cachedInputTokens: count(fact.cache_read_tokens),
+          uncachedInputTokens: inputTokens - cached,
+          cachedInputTokens: cached,
           cacheWriteTokens: 0,
-          outputTokens: count(fact.output_tokens) + count(fact.thinking_tokens),
+          outputTokens: count(fact.output_tokens),
         });
         continue;
       }

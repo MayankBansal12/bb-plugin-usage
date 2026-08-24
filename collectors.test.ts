@@ -170,17 +170,17 @@ describe("usage collectors", () => {
       modelProviderId: "google",
       model: "gemini-4-ultra-preview",
       loggedCostUsd: null,
-      uncachedInputTokens: 13814,
-      cachedInputTokens: 0,
+      uncachedInputTokens: 2302,
+      cachedInputTokens: 8113,
       cacheWriteTokens: 0,
-      outputTokens: 53,
+      outputTokens: 657,
     }]);
     expect(parseHostUsageAggregates(content, "antigravity", machine)[0]).toMatchObject({
       eventKey: "antigravity:machine-a:2026-08-09:google:gemini-4-ultra-preview",
       agentId: "antigravity",
       agentName: "Antigravity",
       modelProviderId: "google",
-      processedTokens: 13867,
+      processedTokens: 11072,
     });
   });
 });

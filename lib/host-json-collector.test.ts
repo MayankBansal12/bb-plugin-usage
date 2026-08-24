@@ -156,10 +156,10 @@ describe("host JSON usage collector", () => {
         created_at_ms: Date.parse("2026-08-09T00:00:00Z"),
         provider: "google",
         model: "gemini-4-ultra-preview",
-        input_tokens: 13814,
-        output_tokens: 27,
-        thinking_tokens: 26,
-        cache_read_tokens: 0,
+        input_tokens: 10415,
+        output_tokens: 657,
+        thinking_tokens: 616,
+        cache_read_tokens: 8113,
         total_cost: null,
       } },
     ].map((value) => JSON.stringify(value)).join("\n"));
@@ -170,10 +170,10 @@ describe("host JSON usage collector", () => {
       day: "2026-08-09",
       modelProviderId: "google",
       model: "gemini-4-ultra-preview",
-      uncachedInputTokens: 13814,
-      cachedInputTokens: 0,
+      uncachedInputTokens: 2302,
+      cachedInputTokens: 8113,
       cacheWriteTokens: 0,
-      outputTokens: 53,
+      outputTokens: 657,
       loggedCostUsd: null,
     })]);
 
