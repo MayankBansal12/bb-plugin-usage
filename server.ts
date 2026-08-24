@@ -67,6 +67,7 @@ const AGENTS = [
   { id: "opencode", name: "OpenCode" },
   { id: "pi", name: "Pi" },
   { id: "prime", name: "Prime Agent" },
+  { id: "antigravity", name: "Antigravity" },
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
 
 const LIMIT_PROVIDERS = [
@@ -316,6 +317,7 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
     : agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
+    : agentId === "antigravity" ? [`${home}/.antigravity-acp/usage.jsonl`]
     : agentId === "prime" ? resolvedPrimeRoots
     : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home).filter((root) => {
       const defaultPrimeAgentRoot = `${home}/.prime/agent`;
@@ -622,6 +624,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
