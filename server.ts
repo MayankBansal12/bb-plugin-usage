@@ -415,16 +415,22 @@ export async function runHostCommand(
   }
 }
 
-export function openCodeCommand() {
+// OpenCode usage is collected on the enrolled HOST (via `opencode db`), so the
+// day bucket and the 90-day cutoff MUST use the host's local timezone, not
+// UTC. Otherwise machines in a positive/negative offset see "today"'s usage
+// land in the previous/next UTC day. The plugin server owns the rolling window
+// (dashboardRecordsSql uses `localtime` too); in a single-machine deployment
+// the BB server runs in the same timezone as the enrolled host.
+export function openCodeSql(): string {
   const oldestDayOffset = OPENCODE_HISTORY_DAYS - 1;
-  const sql = `
+  return `
 WITH recent_sessions AS MATERIALIZED (
   SELECT id
   FROM session
-  WHERE time_updated >= CAST(strftime('%s', 'now', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  WHERE time_updated >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
 )
 SELECT
-  date(m.time_created / 1000, 'unixepoch') AS day,
+  date(m.time_created / 1000, 'unixepoch', 'localtime') AS day,
   COALESCE(json_extract(m.data, '$.providerID'), 'unknown') AS modelProviderId,
   COALESCE(json_extract(m.data, '$.modelID'), 'unknown') AS model,
   ROUND(SUM(COALESCE(json_extract(m.data, '$.cost'), 0)), 9) AS loggedCostUsd,
@@ -436,9 +442,13 @@ SELECT
 FROM recent_sessions rs
 JOIN message m ON m.session_id = rs.id
 WHERE json_extract(m.data, '$.role') = 'assistant'
-  AND m.time_created >= CAST(strftime('%s', 'now', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
 GROUP BY day, modelProviderId, model
 ORDER BY day, modelProviderId, model;`.trim();
+}
+
+export function openCodeCommand() {
+  const sql = openCodeSql();
   return [
     `if ! command -v opencode >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:OpenCode CLI is required to collect OpenCode usage.'; exit 127; fi`,
     `result=$(opencode db ${shellQuote(sql)} --format json 2>&1)`,

@@ -10,6 +10,11 @@ import {
   type HostJsonAgentId,
 } from "./host-json-collector";
 
+function localDay(timestamp: string): string {
+  const d = new Date(timestamp);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
 
@@ -50,7 +55,7 @@ describe("host JSON usage collector", () => {
     const first = await scan("codex", root, cachePath);
     expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T12:00:00Z"),
       modelProviderId: "openai",
       model: "gpt-5.6-sol",
       uncachedInputTokens: 40,
@@ -128,7 +133,7 @@ describe("host JSON usage collector", () => {
     const first = await scan("fx", root, cachePath);
     expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T00:00:00Z"),
       modelProviderId: "zai",
       model: "zai/glm-5.2",
       uncachedInputTokens: 35,
@@ -169,7 +174,7 @@ describe("host JSON usage collector", () => {
     const first = await scan("claude", root, cachePath);
     expect(first).toMatchObject({ fileCount: 2, changedFileCount: 2, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T00:00:00Z"),
       modelProviderId: "anthropic",
       model: "claude-sonnet-5",
       uncachedInputTokens: 50,

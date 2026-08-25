@@ -7,8 +7,13 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, openCodeCommand, runHostCommand, syncOpenCode,
+  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, openCodeCommand, openCodeSql, runHostCommand, syncOpenCode,
 } from "./server";
+
+function localDay(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 describe("JSON agent roots", () => {
   it("includes Prime root and recursive-agent sessions", () => {
@@ -276,6 +281,41 @@ describe("OpenCode query", () => {
     expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get()).toEqual({
       status: "unavailable", recordCount: 1, error: "OpenCode returned an invalid aggregate row at index 0.",
     });
+    db.close();
+  });
+
+  it("buckets OpenCode usage by the enrolled host's local day, not UTC", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+      CREATE TABLE message (session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+    `);
+    const seed = (localHour: number, localMinute: number, id: string) => {
+      const d = new Date();
+      d.setHours(localHour, localMinute, 0, 0);
+      const t = d.getTime();
+      db.prepare("INSERT INTO session (id, time_updated) VALUES (?, ?)").run(id, t);
+      db.prepare("INSERT INTO message (session_id, time_created, data) VALUES (?, ?, ?)").run(
+        id,
+        t,
+        JSON.stringify({
+          role: "assistant",
+          providerID: "anthropic",
+          modelID: "claude-sonnet-5",
+          cost: 0.02,
+          tokens: { input: 100, "cache.read": 60, "cache.write": 5, output: 15, reasoning: 5 },
+        }),
+      );
+      return t;
+    };
+    // Local 00:30 exercises positive offsets (UTC day is the previous day);
+    // local 17:30 exercises negative offsets (UTC day is the next day).
+    const tA = seed(0, 30, "sA");
+    const tB = seed(17, 30, "sB");
+    const rows = db.prepare(openCodeSql()).all() as Array<{ day: string }>;
+    const days = new Set(rows.map((r) => r.day));
+    expect(days.has(localDay(tA))).toBe(true);
+    expect(days.has(localDay(tB))).toBe(true);
     db.close();
   });
 });
