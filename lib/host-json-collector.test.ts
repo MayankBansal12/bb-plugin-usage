@@ -151,6 +151,42 @@ describe("host JSON usage collector", () => {
     expect(second.rows).toEqual(first.rows);
   });
 
+  it("streams Antigravity's provider-bridge usage log", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "usage.jsonl");
+    const cachePath = join(directory, "cache", "antigravity.json");
+    await writeFile(root, [
+      { kind: "coverage", status: "partial" },
+      { kind: "generation", fact: {
+        created_at_ms: Date.parse("2026-08-09T00:00:00Z"),
+        provider: "google",
+        model: "gemini-4-ultra-preview",
+        input_tokens: 10415,
+        output_tokens: 657,
+        thinking_tokens: 616,
+        cache_read_tokens: 8113,
+        total_cost: null,
+      } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const first = await scan("antigravity", root, cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual([expect.objectContaining({
+      day: localDay("2026-08-09T00:00:00Z"),
+      modelProviderId: "google",
+      model: "gemini-4-ultra-preview",
+      uncachedInputTokens: 2302,
+      cachedInputTokens: 8113,
+      cacheWriteTokens: 0,
+      outputTokens: 657,
+      loggedCostUsd: null,
+    })]);
+
+    const second = await scan("antigravity", root, cachePath);
+    expect(second).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
   it("counts each Claude API response once across repeated rows, files, and cached scans", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "projects");

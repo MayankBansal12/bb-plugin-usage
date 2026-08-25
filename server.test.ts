@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 
@@ -15,7 +16,26 @@ function localDay(ts: number): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+// Same markers host-json-collector.ts's hostJsonCollector() wraps its
+// gzipped result in; not exported (they're a private wire format between
+// the generated host script and extractHostJsonScan), so the fixture
+// reproduces them rather than importing.
+const SCAN_BEGIN = "__BB_USAGE_SCAN_BEGIN__";
+const SCAN_END = "__BB_USAGE_SCAN_END__";
+
+function fakeHostScanOutput(agentId: string, rows: Array<Record<string, unknown>>) {
+  const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0, error: null, rows };
+  const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
+  return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+}
+
 describe("JSON agent roots", () => {
+  it("points Antigravity at the provider bridge's own usage log", () => {
+    expect(jsonAgentRoots("/home/user", "antigravity", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.antigravity-acp/usage.jsonl",
+    ]);
+  });
+
   it("includes Prime root and recursive-agent sessions", () => {
     expect(jsonAgentRoots("/home/user", "prime", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.prime/agent/sessions",
@@ -72,9 +92,119 @@ describe("sync RPC", () => {
     expect(handlers?.sync()).toEqual({ ok: true });
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
+
+  it("actually dispatches an Antigravity scan through syncAll, not just through direct scan() calls", async () => {
+    // Regression test for the exact gap flagged in review on
+    // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
+    // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
+    // never called syncJsonAgent(..., "antigravity", ...), so no scan ever
+    // ran for it in production even though the unit tests (which call
+    // scan()/parseHostUsageAggregates directly) all passed. This drives the
+    // real, unmodified plugin factory end-to-end through its public sync()
+    // RPC and asserts a row actually lands in the database for Antigravity.
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+
+    // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
+    // where the gzipped payload is the generated collector script with
+    // agentId/roots baked in as a literal object — decode it the same way
+    // to tell which JSON-agent sync this particular terminal is for.
+    function agentIdFromCommand(command: string): string | null {
+      // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
+      // the closing quote of the base64 argument — the rest of the call
+      // (,'base64')) has its single quotes mangled by shellQuote's bash
+      // escaping (' becomes '"'"') once this is embedded in the full
+      // command, so anchoring on that literal text would never match here.
+      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+      if (!outer) return null;
+      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+      // Inner layer: the collector function is invoked as
+      // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
+      // encodedInput is JSON.stringify(input) base64'd separately from the
+      // gzip layer above.
+      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+      if (!inner) return null;
+      const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
+      return input.agentId ?? null;
+    }
+
+    const commandsByTerminalId = new Map<string, string>();
+
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandsByTerminalId.get(args.terminalId) ?? "";
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === "antigravity"
+              ? fakeHostScanOutput("antigravity", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "google",
+                model: "gemini-4-ultra-preview",
+                loggedCostUsd: null,
+                uncachedInputTokens: 13814,
+                cachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                outputTokens: 53,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'antigravity'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    const syncState = db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'antigravity'",
+    ).get();
+    expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    db.close();
+  });
 });
 
 describe("provider limit loading", () => {
+  function emptyDb() {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE usage_sources (source_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, machine_name TEXT NOT NULL, provider_id TEXT NOT NULL);
+      CREATE TABLE usage_event_sources (event_key TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY (event_key, source_id));
+    `);
+    return db;
+  }
+
   it("does not block the dashboard when a connected machine stalls", async () => {
     const usageLimits = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise<never>((_resolve, reject) => {
       signal.addEventListener("abort", () => reject(signal.reason), { once: true });
@@ -87,7 +217,7 @@ describe("provider limit loading", () => {
 
     await expect(loadProviderLimits(bb, [
       { id: "host_1", name: "Slow machine", status: "connected" },
-    ], 10)).resolves.toEqual([]);
+    ], emptyDb(), 10)).resolves.toEqual([]);
     expect(usageLimits).toHaveBeenCalledWith({ hostId: "host_1", signal: expect.any(AbortSignal) });
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
@@ -109,11 +239,56 @@ describe("provider limit loading", () => {
 
     await expect(loadProviderLimits(bb, [
       { id: "host_1", name: "Fast machine", status: "connected" },
-    ], 1_000)).resolves.toEqual([expect.objectContaining({
+    ], emptyDb(), 1_000)).resolves.toEqual([expect.objectContaining({
       machineId: "host_1",
       providerId: "codex",
       planLabel: "Pro",
+      status: "ok",
     })]);
+  });
+
+  it("surfaces a provider error (e.g. rate limited) instead of hiding the provider", async () => {
+    const usageLimits = vi.fn(async () => ({
+      codex: { status: "ok", planLabel: "Pro", windows: [{ label: "5 hours", usedPercent: 10, resetsAt: null }] },
+      claudeCode: { status: "error", message: "rate limited", planLabel: null, accountEmail: null },
+      cursor: { status: "not_installed" },
+    }));
+    const debug = vi.fn();
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug },
+    } as unknown as BbPluginApi;
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Fast machine", status: "connected" },
+    ], emptyDb(), 1_000)).resolves.toEqual([
+      expect.objectContaining({ providerId: "codex", status: "ok" }),
+      expect.objectContaining({ providerId: "claude", status: "error", error: "rate limited" }),
+    ]);
+  });
+
+  it("surfaces an error for providers with usage records when the whole limits call fails", async () => {
+    const usageLimits = vi.fn(async () => { throw new Error("rate limited"); });
+    const debug = vi.fn();
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug },
+    } as unknown as BbPluginApi;
+
+    const db = emptyDb();
+    db.prepare("INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id) VALUES (?, ?, ?, ?)")
+      .run("claude-source", "host_1", "Fast machine", "claude");
+    db.prepare("INSERT INTO usage_event_sources (event_key, source_id) VALUES (?, ?)")
+      .run("event-1", "claude-source");
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Fast machine", status: "connected" },
+    ], db, 1_000)).resolves.toEqual([expect.objectContaining({
+      machineId: "host_1",
+      providerId: "claude",
+      status: "error",
+    })]);
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
 });
 

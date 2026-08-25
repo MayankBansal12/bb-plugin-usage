@@ -1,6 +1,6 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
-export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime";
+export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity";
 
 export type UsageRecord = {
   eventKey: string;
@@ -13,6 +13,7 @@ export type UsageRecord = {
   machineId: string;
   machineName: string;
   model: string;
+  project: string;
   costUsd: number;
   loggedCostUsd: number | null;
   pricingStatus: PricingStatus;
@@ -32,6 +33,7 @@ type UsageInput = {
   agentName: string;
   modelProviderId: string;
   model: string;
+  project?: string;
   loggedCostUsd?: number | null;
   uncachedInputTokens: number;
   cachedInputTokens: number;
@@ -46,6 +48,7 @@ export type HostUsageAggregate = {
   day: string;
   modelProviderId: string;
   model: string;
+  project: string;
   loggedCostUsd: number | null;
   uncachedInputTokens: number;
   cachedInputTokens: number;
@@ -76,6 +79,15 @@ function localDayOf(value: string): string {
   return Number.isNaN(parsed.getTime())
     ? value.slice(0, 10)
     : `${parsed.getFullYear()}-${String(parsed.getMonth() + 1).padStart(2, "0")}-${String(parsed.getDate()).padStart(2, "0")}`;
+}
+
+// Only the working directory's final segment is recorded, so usage can be
+// grouped by project without storing the machine's directory layout.
+export function projectName(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return "Unknown";
+  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+  const segment = normalized.slice(normalized.lastIndexOf("/") + 1).trim();
+  return segment ? segment.slice(0, 80) : "Unknown";
 }
 
 function isoTimestamp(value: unknown): string | null {
@@ -130,6 +142,7 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
     machineId: context.machineId,
     machineName: context.machineName,
     model: input.model,
+    project: text(input.project, "Unknown"),
     costUsd: Number((estimated ?? effectiveLogged ?? 0).toFixed(6)),
     loggedCostUsd: effectiveLogged === null ? null : Number(Math.max(0, effectiveLogged).toFixed(6)),
     pricingStatus: estimated !== null ? pricing.status : effectiveLogged !== null ? "logged" : "unknown",
@@ -146,10 +159,12 @@ export function parseCodex(content: string, context: ParseContext): UsageRecord[
   const records: UsageRecord[] = [];
   let model = "codex-unknown";
   let sessionId = "session-unknown";
+  let project = "Unknown";
   for (const { value, line } of lines(content)) {
     const payload = object(value.payload);
     if ((value.type === "turn_context" || value.type === "session_meta") && payload) {
       model = text(payload.model, model);
+      if (typeof payload.cwd === "string") project = projectName(payload.cwd);
       if (value.type === "session_meta") sessionId = text(payload.id, sessionId);
     }
     if (value.type !== "event_msg" || payload?.type !== "token_count") continue;
@@ -160,7 +175,7 @@ export function parseCodex(content: string, context: ParseContext): UsageRecord[
     const cached = Math.min(input, count(usage.cached_input_tokens));
     records.push(usageRecord({
       eventKey: `codex:${sessionId}:${timestamp}:${line}`, timestamp, agentId: "codex", agentName: "Codex",
-      modelProviderId: "openai", model, uncachedInputTokens: input - cached, cachedInputTokens: cached,
+      modelProviderId: "openai", model, project, uncachedInputTokens: input - cached, cachedInputTokens: cached,
       cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
     }, context));
   }
@@ -180,7 +195,7 @@ export function parseClaude(content: string, context: ParseContext): UsageRecord
     if (model === "<synthetic>" && processed === 0) continue;
     records.push(usageRecord({
       eventKey: `claude:${text(message.id, String(line))}`, timestamp, agentId: "claude", agentName: "Claude Code",
-      modelProviderId: "anthropic", model, uncachedInputTokens: count(usage.input_tokens),
+      modelProviderId: "anthropic", model, project: projectName(value.cwd), uncachedInputTokens: count(usage.input_tokens),
       cachedInputTokens: count(usage.cache_read_input_tokens), cacheWriteTokens: count(usage.cache_creation_input_tokens),
       outputTokens: count(usage.output_tokens),
     }, context));
@@ -200,7 +215,7 @@ export function parseGrok(content: string, context: ParseContext): UsageRecord[]
     records.push(usageRecord({
       eventKey: `grok:${text(value.sid, "session")}:${timestamp}:${count(usage.loop_index) || line}`, timestamp,
       agentId: "grok", agentName: "Grok Agent", modelProviderId: "xai", model: text(usage.model, "grok-build-0.1"),
-      uncachedInputTokens: input - cached, cachedInputTokens: cached, cacheWriteTokens: 0,
+      project: projectName(value.cwd), uncachedInputTokens: input - cached, cachedInputTokens: cached, cacheWriteTokens: 0,
       outputTokens: count(usage.completion_tokens) + count(usage.reasoning_tokens),
     }, context));
   }
@@ -215,8 +230,11 @@ function parsePiCompatible(
 ): UsageRecord[] {
   const records: UsageRecord[] = [];
   let sessionId = "session-unknown";
+  let project = "Unknown";
   for (const { value, line } of lines(content)) {
     if (value.type === "session") sessionId = text(value.id, sessionId);
+    const directory = value.cwd ?? value.directory ?? object(value.session)?.cwd;
+    if (typeof directory === "string") project = projectName(directory);
     if (value.type !== "message") continue;
     const message = object(value.message);
     const usage = object(message?.usage);
@@ -228,7 +246,7 @@ function parsePiCompatible(
     records.push(usageRecord({
       eventKey: `${agentId}:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId, agentName,
       modelProviderId: text(message.provider, "unknown"), model: text(message.responseModel, text(message.model, "unknown")),
-      loggedCostUsd, costMode: "positive-logged-only",
+      project, loggedCostUsd, costMode: "positive-logged-only",
       uncachedInputTokens: count(usage.input),
       cachedInputTokens: count(usage.cacheRead), cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
     }, context));
@@ -297,6 +315,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     : agentId === "grok" ? "Grok Agent"
     : agentId === "fx" ? "FX"
     : agentId === "prime" ? "Prime Agent"
+    : agentId === "antigravity" ? "Antigravity"
     : "Pi";
 
   return values.flatMap((raw) => {
@@ -307,13 +326,15 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !timestamp) return [];
     const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
     const model = text(row.model, "unknown");
+    const project = text(row.project, "Unknown");
     return [usageRecord({
-      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}`,
-      timestamp, day,
+      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}`,
+      timestamp,
       agentId,
       agentName,
       modelProviderId,
       model,
+      project,
       loggedCostUsd: finite(row.loggedCostUsd),
       costMode: agentId === "fx" ? "logged-only"
         : agentId === "prime" || agentId === "pi" ? "positive-logged-only"
