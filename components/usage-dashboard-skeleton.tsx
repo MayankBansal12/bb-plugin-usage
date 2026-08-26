@@ -122,9 +122,11 @@ export function UsageDashboardSkeleton() {
       <style>{SHIMMER_STYLE}</style>
       <span className="sr-only">Loading usage…</span>
       <main className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col gap-4 px-4 py-3 sm:gap-5 sm:px-5 sm:py-5 md:px-6 lg:gap-8">
-        <section className="grid items-stretch gap-4 sm:gap-5 lg:grid-cols-[minmax(330px,0.92fr)_minmax(0,1.65fr)] lg:gap-14">
+        <section
+          className={`grid items-stretch gap-4 p-4 sm:gap-5 sm:p-5 lg:grid-cols-[minmax(330px,0.92fr)_minmax(0,1.65fr)] lg:gap-14 lg:border-0 lg:bg-transparent lg:p-0 ${CARD_CLASSES} lg:rounded-none`}
+        >
           {/* left: headline cost + per-agent rows */}
-          <div className={`flex min-w-0 flex-col p-4 sm:p-5 lg:border-0 lg:bg-transparent lg:p-0 ${CARD_CLASSES} lg:rounded-none`}>
+          <div className="flex min-w-0 flex-col">
             <Label className="text-xs font-medium text-muted-foreground">Raw token cost</Label>
             <Shimmer className="mt-2 h-[42px] w-[190px] rounded-lg" />
             <Label className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</Label>
@@ -149,39 +151,19 @@ export function UsageDashboardSkeleton() {
                 </div>
               ))}
             </div>
-
-            {/* stacked layouts show the chart inside this card */}
-            <div className="mt-5 border-t border-border/60 pt-4 lg:hidden">
-              <div className="flex items-center justify-between gap-2">
-                <Label className="text-sm font-semibold">Daily cost</Label>
-                <ToggleGroupPreview
-                  value="cost"
-                  options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
-                />
-              </div>
-              <div className="mt-3">
-                <ChartSkeleton />
-              </div>
-              <div className="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
-                {[56, 72, 64].map((width) => (
-                  <div key={width} className="flex items-center gap-1.5">
-                    <Shimmer className="size-3.5 shrink-0 rounded-[3px]" />
-                    <Shimmer className="h-3 rounded" style={{ width }} />
-                  </div>
-                ))}
-              </div>
-            </div>
           </div>
 
-          {/* right: chart, wide layouts only */}
-          <div className="hidden min-w-0 flex-col lg:flex">
+          {/* One chart moves from the stacked card to the right column responsively. */}
+          <div className="flex min-w-0 flex-col border-t border-border/60 pt-4 lg:border-0 lg:pt-0">
             <div className="flex items-center justify-between gap-4">
               <Label className="text-sm font-semibold">Daily cost</Label>
               <div className="flex items-center gap-2">
-                <ToggleGroupPreview
-                  value="agent"
-                  options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
-                />
+                <div className="hidden lg:block">
+                  <ToggleGroupPreview
+                    value="agent"
+                    options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
+                  />
+                </div>
                 <ToggleGroupPreview
                   value="cost"
                   options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
@@ -192,8 +174,8 @@ export function UsageDashboardSkeleton() {
               <ChartSkeleton />
             </div>
             <div className="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
-              {[58, 74, 68, 54].map((width) => (
-                <div key={width} className="flex items-center gap-1.5">
+              {[58, 74, 68, 54].map((width, index) => (
+                <div key={width} className={`items-center gap-1.5 ${index === 3 ? "hidden lg:flex" : "flex"}`}>
                   <Shimmer className="size-3.5 shrink-0 rounded-[3px]" />
                   <Shimmer className="h-3 rounded" style={{ width }} />
                 </div>
