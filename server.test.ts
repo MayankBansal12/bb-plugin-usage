@@ -8,7 +8,8 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, openCodeCommand, runHostCommand, syncOpenCode,
+  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
+  openCodeCommand, runHostCommand, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 
 // Same markers host-json-collector.ts's hostJsonCollector() wraps its
@@ -460,5 +461,131 @@ describe("dashboard query", () => {
     const sql = dashboardRecordsSql();
     expect(sql).toContain("day >= date('now', '-89 days')");
     expect(sql).not.toContain("-365 days");
+  });
+});
+
+describe("OpenCode Go limits", () => {
+  const markedOutput = [
+    "__BB_USAGE_BEGIN__",
+    JSON.stringify({ usage: { rolling: { status: "ok", percent: 4, resetsAt: "2026-08-21T22:54:37.384Z" } } }),
+    "__BB_USAGE_END__:0",
+    "",
+  ].join("\n");
+
+  function goLimitsDb() {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE opencode_go_limits (
+      machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, plan_label TEXT NOT NULL DEFAULT 'Go',
+      windows_json TEXT NOT NULL, fetched_at TEXT NOT NULL
+    );
+    CREATE TABLE opencode_go_limit_state (
+      machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, status TEXT NOT NULL,
+      error TEXT, last_attempt_at TEXT NOT NULL, last_success_at TEXT
+    )`);
+    return db;
+  }
+
+  it("persists a parsed snapshot from a successful host query", async () => {
+    const db = goLimitsDb();
+    const info = vi.fn();
+    const bb = { log: { info, warn: vi.fn(), debug: vi.fn() } } as unknown as BbPluginApi;
+
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+
+    const row = db.prepare("SELECT machine_id, machine_name, plan_label, windows_json FROM opencode_go_limits").get() as {
+      machine_id: string; machine_name: string; plan_label: string; windows_json: string;
+    };
+    expect(row).toEqual({
+      machine_id: "host-1",
+      machine_name: "Machine",
+      plan_label: "Go",
+      windows_json: JSON.stringify([{ label: "Rolling (5h)", usedPercent: 4, resetsAt: "2026-08-21T22:54:37.384Z" }]),
+    });
+    expect(info).toHaveBeenCalledWith(expect.stringContaining("1 limit windows"));
+    expect(db.prepare("SELECT status, error, last_success_at IS NOT NULL hasSuccess FROM opencode_go_limit_state").get())
+      .toEqual({ status: "ok", error: null, hasSuccess: 1 });
+  });
+
+  it("retains the previous snapshot when a later fetch fails generically", async () => {
+    const db = goLimitsDb();
+    const warn = vi.fn();
+    const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+      throw new Error("Usage: OpenCode Go limits timed out after 60 seconds.");
+    });
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("retaining previous snapshot"));
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limits").get() as { count: number }).count).toBe(1);
+    expect(db.prepare("SELECT status, error FROM opencode_go_limit_state").get()).toEqual({
+      status: "error",
+      error: "Usage: OpenCode Go limits timed out after 60 seconds.",
+    });
+    expect(loadStoredOpenCodeGoLimits(db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, new Set(["host-1"])))
+      .toEqual([expect.objectContaining({ status: "error", windows: [expect.objectContaining({ label: "Rolling (5h)" })] })]);
+  });
+
+  it("retains the previous snapshot for diagnostics that only contain a sentinel", async () => {
+    const db = goLimitsDb();
+    const warn = vi.fn();
+    const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+
+    for (const diagnostic of [
+      "collector failed near no-opencode-go-credential handling",
+      "no-opencode-go-plan response was malformed",
+    ]) {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+        throw new Error(diagnostic);
+      });
+    }
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("retaining previous snapshot"));
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limits").get() as { count: number }).count).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limit_state").get() as { count: number }).count).toBe(1);
+  });
+
+  it("drops the stored snapshot when the machine has no Go credential or plan", async () => {
+    const db = goLimitsDb();
+    const debug = vi.fn();
+    const bb = { log: { info: vi.fn(), warn: vi.fn(), debug } } as unknown as BbPluginApi;
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+
+    for (const diagnostic of ["no-opencode-go-credential", "no-opencode-go-plan"]) {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+        throw new Error(diagnostic);
+      });
+    }
+
+    expect(debug).toHaveBeenCalledWith(expect.stringContaining("not configured"));
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limits").get() as { count: number }).count).toBe(0);
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limit_state").get() as { count: number }).count).toBe(0);
+  });
+
+  it("serves connected snapshots and surfaces malformed cached data as an error", () => {
+    const db = goLimitsDb();
+    db.prepare("INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at) VALUES (?, ?, 'Go', ?, ?)")
+      .run("host-1", "Machine", JSON.stringify([{ label: "Weekly", usedPercent: 25, resetsAt: null }]), new Date().toISOString());
+    db.prepare("INSERT INTO opencode_go_limit_state (machine_id, machine_name, status, error, last_attempt_at, last_success_at) VALUES (?, ?, 'ok', NULL, ?, ?)")
+      .run("host-1", "Machine", new Date().toISOString(), new Date().toISOString());
+
+    db.prepare("INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at) VALUES (?, ?, 'Go', ?, ?)")
+      .run("host-2", "Broken", "{invalid", new Date().toISOString());
+    db.prepare("INSERT INTO opencode_go_limit_state (machine_id, machine_name, status, error, last_attempt_at, last_success_at) VALUES (?, ?, 'ok', NULL, ?, ?)")
+      .run("host-2", "Broken", new Date().toISOString(), new Date().toISOString());
+
+    const limits = loadStoredOpenCodeGoLimits(db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, new Set(["host-1", "host-2"]));
+    expect(limits.find((limit) => limit.machineId === "host-1")).toEqual(expect.objectContaining({
+      machineId: "host-1",
+      providerId: "opencode-go",
+      providerName: "OpenCode Go",
+      planLabel: "Go",
+      status: "ok",
+      lastUpdatedAt: expect.any(String),
+    }));
+    expect(limits.find((limit) => limit.machineId === "host-2")).toEqual(expect.objectContaining({
+      machineId: "host-2", status: "error", error: "Stored OpenCode Go limits could not be read.",
+    }));
   });
 });
