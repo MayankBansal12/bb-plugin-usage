@@ -199,11 +199,11 @@ function formatDay(day: string, includeYear = false) {
 
 function rangeDays(range: Range) {
   const today = new Date();
-  const end = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+  const end = new Date(today.getFullYear(), today.getMonth(), today.getDate());
   return Array.from({ length: range }, (_, index) => {
     const day = new Date(end);
-    day.setUTCDate(end.getUTCDate() - range + index + 1);
-    return day.toISOString().slice(0, 10);
+    day.setDate(end.getDate() - range + index + 1);
+    return `${day.getFullYear()}-${String(day.getMonth() + 1).padStart(2, "0")}-${String(day.getDate()).padStart(2, "0")}`;
   });
 }
 
@@ -961,9 +961,13 @@ function UsageDashboard() {
   const rows = useMemo(() => {
     if (!data) return [];
     const days = rangeDays(range);
-    const cutoffDay = days[0];
+    // Bound both ends. Rows are bucketed in each host's local timezone, so a
+    // host ahead of the viewer can emit a day beyond today; without the upper
+    // bound those rows land in the headline totals while the chart -- which
+    // only has buckets for `days` -- silently drops them.
+    const [cutoffDay, latestDay] = [days[0], days[days.length - 1]];
     return data.records.filter((row) =>
-      row.day >= cutoffDay
+      row.day >= cutoffDay && row.day <= latestDay
       && (machine === "all" || row.machineId === machine));
   }, [data, machine, range]);
 

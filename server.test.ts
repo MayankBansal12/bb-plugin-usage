@@ -9,8 +9,13 @@ vi.mock("@bb/plugin-sdk", () => ({
 
 import plugin, {
   dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  openCodeCommand, runHostCommand, syncOpenCode, syncOpenCodeGo,
+  openCodeCommand, openCodeSql, runHostCommand, syncOpenCode, syncOpenCodeGo,
 } from "./server";
+
+function localDay(ts: number): string {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 // Same markers host-json-collector.ts's hostJsonCollector() wraps its
 // gzipped result in; not exported (they're a private wire format between
@@ -424,7 +429,8 @@ describe("OpenCode query", () => {
       INSERT INTO usage_event_sources (event_key, source_id) VALUES ('existing-event', 'existing-source');
     `);
     const warn = vi.fn();
-    const bb = { log: { warn } } as unknown as BbPluginApi;
+    const info = vi.fn();
+    const bb = { log: { warn, info } } as unknown as BbPluginApi;
 
     await expect(syncOpenCode(
       bb,
@@ -445,6 +451,21 @@ describe("OpenCode query", () => {
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
       new AbortController().signal,
+      async () => { throw new Error("OpenCode CLI is required to collect OpenCode usage."); },
+    )).resolves.toBeUndefined();
+
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get()).toEqual({
+      status: "skipped",
+      recordCount: 1,
+      error: "OpenCode CLI is not installed; hosted OpenCode Go usage is already collected via Prime Agent sessions.",
+    });
+    expect(info).toHaveBeenCalledWith("Machine/opencode: skipped (no local OpenCode CLI)");
+
+    await expect(syncOpenCode(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      new AbortController().signal,
       async () => "__BB_USAGE_BEGIN__\n[{}]\n__BB_USAGE_END__:0\n__BB_HOST_COMMAND_DONE__:0\n",
     )).resolves.toBeUndefined();
 
@@ -454,12 +475,65 @@ describe("OpenCode query", () => {
     });
     db.close();
   });
+
+  it("buckets OpenCode usage by the enrolled host's local day, not UTC", () => {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+      CREATE TABLE message (session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+    `);
+    const seed = (localHour: number, localMinute: number, id: string) => {
+      const d = new Date();
+      d.setHours(localHour, localMinute, 0, 0);
+      const t = d.getTime();
+      db.prepare("INSERT INTO session (id, time_updated) VALUES (?, ?)").run(id, t);
+      db.prepare("INSERT INTO message (session_id, time_created, data) VALUES (?, ?, ?)").run(
+        id,
+        t,
+        JSON.stringify({
+          role: "assistant",
+          providerID: "anthropic",
+          modelID: "claude-sonnet-5",
+          cost: 0.02,
+          tokens: { input: 100, "cache.read": 60, "cache.write": 5, output: 15, reasoning: 5 },
+        }),
+      );
+      return t;
+    };
+    // Local 00:30 exercises positive offsets (UTC day is the previous day);
+    // local 17:30 exercises negative offsets (UTC day is the next day).
+    const tA = seed(0, 30, "sA");
+    const tB = seed(17, 30, "sB");
+    const rows = db.prepare(openCodeSql()).all() as Array<{ day: string }>;
+    const days = new Set(rows.map((r) => r.day));
+    expect(days.has(localDay(tA))).toBe(true);
+    expect(days.has(localDay(tB))).toBe(true);
+    db.close();
+  });
+
+  it("cuts off at real local midnight, not a mis-converted epoch", () => {
+    // 'localtime' shifts the value into local time but '%s' still formats it
+    // as UTC, so the cutoff needs a trailing 'utc' to become a real epoch.
+    // Without it the boundary drifts by the host's offset (7h in Los Angeles,
+    // 12h in Auckland), dropping or admitting hours of the oldest day.
+    const db = new Database(":memory:");
+    const cutoff = db.prepare(
+      "SELECT CAST(strftime('%s','now','localtime','start of day','-89 days','utc') AS INTEGER) c",
+    ).get() as { c: number };
+    const asLocal = new Date(cutoff.c * 1000);
+    expect(asLocal.getHours()).toBe(0);
+    expect(asLocal.getMinutes()).toBe(0);
+    expect(openCodeSql()).not.toContain("'start of day', '-89 days')");
+    db.close();
+  });
 });
 
 describe("dashboard query", () => {
-  it("returns only the 90 calendar days supported by the UI", () => {
+  it("fetches one buffer day beyond the 90 the UI shows", () => {
+    // The server timezone must not clip a host that is already on the next
+    // local day; the dashboard applies the exact 90-day range itself.
     const sql = dashboardRecordsSql();
-    expect(sql).toContain("day >= date('now', '-89 days')");
+    expect(sql).toContain("day >= date('now', 'localtime', '-90 days')");
     expect(sql).not.toContain("-365 days");
   });
 });

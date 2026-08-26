@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -9,6 +9,11 @@ import {
   extractHostJsonScan,
   type HostJsonAgentId,
 } from "./host-json-collector";
+
+function localDay(timestamp: string): string {
+  const d = new Date(timestamp);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
 
 const execFileAsync = promisify(execFile);
 const temporaryDirectories: string[] = [];
@@ -42,15 +47,15 @@ describe("host JSON usage collector", () => {
     const cachePath = join(directory, "cache", "codex.json");
     await mkdir(root, { recursive: true });
     await writeFile(join(root, "rollout-test.jsonl"), [
-      { timestamp: "2026-08-09T00:00:00Z", type: "session_meta", payload: { id: "session-1", prompt: "must not be cached" } },
-      { timestamp: "2026-08-09T00:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
-      { timestamp: "2026-08-09T00:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1", prompt: "must not be cached" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
     ].map((value) => JSON.stringify(value)).join("\n"));
 
     const first = await scan("codex", root, cachePath);
     expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T12:00:00Z"),
       modelProviderId: "openai",
       model: "gpt-5.6-sol",
       uncachedInputTokens: 40,
@@ -128,7 +133,7 @@ describe("host JSON usage collector", () => {
     const first = await scan("fx", root, cachePath);
     expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T00:00:00Z"),
       modelProviderId: "zai",
       model: "zai/glm-5.2",
       uncachedInputTokens: 35,
@@ -167,7 +172,7 @@ describe("host JSON usage collector", () => {
     const first = await scan("antigravity", root, cachePath);
     expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T00:00:00Z"),
       modelProviderId: "google",
       model: "gemini-4-ultra-preview",
       uncachedInputTokens: 2302,
@@ -205,7 +210,7 @@ describe("host JSON usage collector", () => {
     const first = await scan("claude", root, cachePath);
     expect(first).toMatchObject({ fileCount: 2, changedFileCount: 2, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual([expect.objectContaining({
-      day: "2026-08-09",
+      day: localDay("2026-08-09T00:00:00Z"),
       modelProviderId: "anthropic",
       model: "claude-sonnet-5",
       uncachedInputTokens: 50,
@@ -283,5 +288,49 @@ describe("host JSON usage collector", () => {
     const cache = await readFile(cachePath, "utf8");
     expect(cache).not.toContain("private parent content");
     expect(cache).not.toContain("private child content");
+  });
+
+  it("discards a v3 cache so UTC-bucketed rows cannot survive the upgrade", async () => {
+    // v3 stored a precomputed UTC `day`. v4 buckets in host-local time, so a
+    // reused v3 entry would mix the two silently and forever.
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+    await mkdir(join(directory, "cache"), { recursive: true });
+    await writeFile(join(root, "rollout-test.jsonl"), [
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    await writeFile(cachePath, JSON.stringify({
+      version: 3,
+      agentId: "codex",
+      files: { stale: { signature: "stale", rows: [{ day: "1999-01-01", modelProviderId: "openai", model: "poisoned", uncachedInputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, loggedCostUsd: null }] } },
+    }));
+
+    const result = await scan("codex", root, cachePath);
+    expect(result.reusedFileCount).toBe(0);
+    expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(4);
+  });
+
+  it("keeps host filesystem paths out of failure diagnostics", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+    // Discoverable and stat-able, but unreadable -- so parseFile throws and the
+    // failure path runs with a real filePath in scope.
+    const secret = join(root, "rollout-secret.jsonl");
+    await writeFile(secret, "{}\n");
+    await chmod(secret, 0o000);
+
+    const result = await scan("codex", root, cachePath);
+    expect(result.failureCount).toBeGreaterThan(0);
+    // `error` carries the first failure string off the host verbatim.
+    expect(result.error).toBe("A usage log could not be read.");
+    await chmod(secret, 0o600);
   });
 });

@@ -344,8 +344,8 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
 
 function historyStartDay() {
   const start = new Date();
-  start.setUTCDate(start.getUTCDate() - HISTORY_DAYS);
-  return start.toISOString().slice(0, 10);
+  start.setDate(start.getDate() - HISTORY_DAYS);
+  return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
 }
 
 function jsonAgentCommand(input: Parameters<typeof compressedHostJsonCollectorScript>[0]) {
@@ -475,16 +475,24 @@ export async function runHostCommand(
   }
 }
 
-export function openCodeCommand() {
+// OpenCode usage is collected on the enrolled HOST (via `opencode db`), so the
+// day bucket and the 90-day cutoff MUST use the host's local timezone, not
+// UTC. Otherwise machines in a positive/negative offset see "today"'s usage
+// land in the previous/next UTC day.
+//
+// The trailing 'utc' modifier is required: 'localtime' shifts the stored value
+// into local time, but '%s' formats it as if it were still UTC, so without the
+// conversion back the cutoff is wrong by the host's offset.
+export function openCodeSql(): string {
   const oldestDayOffset = OPENCODE_HISTORY_DAYS - 1;
-  const sql = `
+  return `
 WITH recent_sessions AS MATERIALIZED (
   SELECT id
   FROM session
-  WHERE time_updated >= CAST(strftime('%s', 'now', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  WHERE time_updated >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
 )
 SELECT
-  date(m.time_created / 1000, 'unixepoch') AS day,
+  date(m.time_created / 1000, 'unixepoch', 'localtime') AS day,
   COALESCE(json_extract(m.data, '$.providerID'), 'unknown') AS modelProviderId,
   COALESCE(json_extract(m.data, '$.modelID'), 'unknown') AS model,
   ROUND(SUM(COALESCE(json_extract(m.data, '$.cost'), 0)), 9) AS loggedCostUsd,
@@ -496,9 +504,13 @@ SELECT
 FROM recent_sessions rs
 JOIN message m ON m.session_id = rs.id
 WHERE json_extract(m.data, '$.role') = 'assistant'
-  AND m.time_created >= CAST(strftime('%s', 'now', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
 GROUP BY day, modelProviderId, model
 ORDER BY day, modelProviderId, model;`.trim();
+}
+
+export function openCodeCommand() {
+  const sql = openCodeSql();
   return [
     `if ! command -v opencode >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:OpenCode CLI is required to collect OpenCode usage.'; exit 127; fi`,
     `result=$(opencode db ${shellQuote(sql)} --format json 2>&1)`,
@@ -550,9 +562,14 @@ export async function syncOpenCode(
   } catch (error) {
     const recordCount = countForMachine(db, machine.id, agentId);
     const message = errorMessage(error);
-    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
-    bb.log.warn(`${machine.name}/opencode: ${message}`);
-
+    if (message.includes("OpenCode CLI is required")) {
+      upsertState(db, machine.id, agentId, "skipped", recordCount,
+        "OpenCode CLI is not installed; hosted OpenCode Go usage is already collected via Prime Agent sessions.", false);
+      bb.log.info(`${machine.name}/opencode: skipped (no local OpenCode CLI)`);
+    } else {
+      upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+      bb.log.warn(`${machine.name}/opencode: ${message}`);
+    }
   }
 }
 export async function syncOpenCodeGo(
@@ -656,6 +673,10 @@ export function loadStoredOpenCodeGoLimits(
   });
 }
 
+// Rows are bucketed by each host's local day, so the plugin server's timezone
+// cannot decide the exact visible window without clipping a host that is ahead
+// of it. This query only bounds retention -- it fetches one extra day of slack
+// and the dashboard applies the exact range in the viewer's timezone.
 export function dashboardRecordsSql() {
   return `WITH canonical AS (
       SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
@@ -674,7 +695,7 @@ export function dashboardRecordsSql() {
     SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
     SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-    FROM canonical WHERE day >= date('now', '-${DASHBOARD_HISTORY_DAYS - 1} days')
+    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
     GROUP BY day, provider_id, model_provider_id, machine_id, model, project ORDER BY day`;
 }

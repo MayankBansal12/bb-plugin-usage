@@ -5,7 +5,9 @@
   "scripts": {
     "build": "bb plugin build",
     "check": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:tz:la": "TZ=America/Los_Angeles vitest run",
+    "test:tz:akl": "TZ=Pacific/Auckland vitest run"
   },
   "engines": {
     "bb": ">=0.36",
