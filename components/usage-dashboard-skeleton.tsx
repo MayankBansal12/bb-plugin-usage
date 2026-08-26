@@ -1,4 +1,4 @@
-import type { CSSProperties, ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { ToggleGroupPreview } from "@/components/ui/toggle-group";
 
 // The theme exposes its colors as complete color-mix() values rather than HSL
@@ -52,9 +52,9 @@ function Label({ children, className }: { children: ReactNode; className?: strin
 
 const CARD_CLASSES = "rounded-xl border border-border/70 bg-muted/[0.08]";
 
-function ChartSkeleton() {
+function ChartSkeleton({ compactView }: { compactView: boolean }) {
   return (
-    <div className="relative h-[250px] w-full overflow-hidden md:h-[322px]">
+    <div className="relative w-full overflow-hidden" style={{ height: compactView ? 250 : 322 }}>
       {/* real gridlines with real-looking axis positions; values stay blank */}
       {[0, 25, 50, 75, 100].map((step) => (
         <div
@@ -116,54 +116,123 @@ function SparklineSkeleton({ seed }: { seed: number }) {
 
 const METRIC_LABELS = ["Processed tokens", "Cached input", "Output", "Cache savings"];
 
+function ProviderRowsSkeleton({ separated = false }: { separated?: boolean }) {
+  return (
+    <div className={separated ? `overflow-hidden ${CARD_CLASSES}` : "space-y-6"}>
+      {[88, 66, 42].map((width, index) => (
+        <div
+          key={width}
+          className={`min-w-0 ${separated ? "border-t border-border/60 px-4 py-3.5 first:border-t-0" : ""}`}
+        >
+          <div className="flex items-center justify-between gap-4 text-sm">
+            <div className="flex min-w-0 items-center gap-2.5 font-medium">
+              <Shimmer className="size-5 shrink-0 rounded-[5px]" />
+              <Shimmer className="h-3.5 rounded" style={{ width: 96 - index * 12 }} />
+            </div>
+            <Shimmer className="h-3.5 w-16 shrink-0 rounded" />
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
+            <Shimmer
+              className="h-full rounded-full"
+              style={{ width: `${width}%`, animationDelay: `${-index * 0.35}s` }}
+            />
+          </div>
+          <Shimmer className="mt-2 h-3 w-40 rounded" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function UsageDashboardSkeleton() {
+  const mainRef = useRef<HTMLElement>(null);
+  const [contentWidth, setContentWidth] = useState(0);
+
+  useLayoutEffect(() => {
+    const element = mainRef.current;
+    if (!element) return;
+    const updateWidth = () => setContentWidth(element.clientWidth);
+    updateWidth();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(updateWidth);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
+  const compactView = contentWidth < 640;
+  const stackedView = contentWidth < 900;
+
   return (
     <div role="status" aria-label="Loading usage from all machines" className="h-full overflow-y-auto bg-background">
       <style>{SHIMMER_STYLE}</style>
       <span className="sr-only">Loading usage…</span>
-      <main className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col gap-4 px-4 py-3 sm:gap-5 sm:px-5 sm:py-5 md:px-6 lg:gap-8">
-        <section className="grid items-stretch gap-4 sm:gap-5 lg:grid-cols-[minmax(330px,0.92fr)_minmax(0,1.65fr)] lg:gap-14">
-          {/* left: headline cost + per-agent rows */}
-          <div className={`flex min-w-0 flex-col p-4 sm:p-5 lg:border-0 lg:bg-transparent lg:p-0 ${CARD_CLASSES} lg:rounded-none`}>
-            <Label className="text-xs font-medium text-muted-foreground">Raw token cost</Label>
-            <Shimmer className="mt-2 h-[42px] w-[190px] rounded-lg" />
-            <Label className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</Label>
+      <main
+        ref={mainRef}
+        className="mx-auto flex min-h-full w-full max-w-[1440px] flex-col gap-4 px-4 py-3 sm:gap-5 sm:px-5 sm:py-5 md:px-6 lg:gap-8"
+      >
+        <section
+          className={`grid items-stretch ${stackedView ? "gap-4 sm:gap-5" : "gap-10 lg:gap-14"}`}
+          style={stackedView ? undefined : { gridTemplateColumns: "minmax(330px, 0.92fr) minmax(0, 1.65fr)" }}
+        >
+          <div className={stackedView ? `flex min-w-0 flex-col p-4 sm:p-5 ${CARD_CLASSES}` : "relative flex min-w-0 flex-col"}>
+            <div className={stackedView ? "flex min-w-0 flex-col" : "absolute inset-0 flex min-w-0 flex-col"}>
+              <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+                <Label className="text-xs font-medium text-muted-foreground">Raw token cost</Label>
+              </div>
+              <Shimmer className="mt-2 w-[190px] rounded-lg" style={{ height: compactView ? 40 : 46 }} />
+              <Label className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</Label>
 
-            <div className="mt-7 hidden space-y-6 lg:block">
-              {[88, 66, 42].map((width, index) => (
-                <div key={width} className="min-w-0">
-                  <div className="flex items-center justify-between gap-4">
-                    <div className="flex min-w-0 items-center gap-2.5">
-                      <Shimmer className="size-5 shrink-0 rounded-[5px]" />
-                      <Shimmer className="h-3.5 rounded" style={{ width: 96 - index * 12 }} />
-                    </div>
-                    <Shimmer className="h-3.5 w-16 shrink-0 rounded" />
-                  </div>
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
-                    <Shimmer
-                      className="h-full rounded-full"
-                      style={{ width: `${width}%`, animationDelay: `${-index * 0.35}s` }}
+              {!stackedView && (
+                <div className="mt-7 min-h-0 flex-1 overflow-y-auto pr-3">
+                  <ProviderRowsSkeleton />
+                </div>
+              )}
+
+              {stackedView && (
+                <div className="mt-5 min-w-0 border-t border-border/60 pt-4">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
+                    <Label className="mr-auto text-sm font-semibold">Daily cost</Label>
+                    <ToggleGroupPreview
+                      value="cost"
+                      options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
                     />
                   </div>
-                  <Shimmer className="mt-2 h-3 w-40 rounded" />
+                  <div className="mt-3">
+                    <ChartSkeleton compactView={compactView} />
+                  </div>
+                  <div className="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
+                    {[58, 74, 68].map((width) => (
+                      <div key={width} className="flex items-center gap-1.5">
+                        <Shimmer className="size-3.5 shrink-0 rounded-[3px]" />
+                        <Shimmer className="h-3 rounded" style={{ width }} />
+                      </div>
+                    ))}
+                  </div>
                 </div>
-              ))}
+              )}
             </div>
+          </div>
 
-            {/* stacked layouts show the chart inside this card */}
-            <div className="mt-5 border-t border-border/60 pt-4 lg:hidden">
-              <div className="flex items-center justify-between gap-2">
-                <Label className="text-sm font-semibold">Daily cost</Label>
-                <ToggleGroupPreview
-                  value="cost"
-                  options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
-                />
+          {!stackedView && (
+            <div className="flex min-w-0 flex-col">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                <Label className="mr-auto text-sm font-semibold">Daily cost</Label>
+                <div className="flex flex-wrap items-center gap-2">
+                  <ToggleGroupPreview
+                    value="agent"
+                    options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
+                  />
+                  <ToggleGroupPreview
+                    value="cost"
+                    options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+                  />
+                </div>
               </div>
-              <div className="mt-3">
-                <ChartSkeleton />
+              <div className="mt-4">
+                <ChartSkeleton compactView={false} />
               </div>
               <div className="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
-                {[56, 72, 64].map((width) => (
+                {[58, 74, 68, 54].map((width) => (
                   <div key={width} className="flex items-center gap-1.5">
                     <Shimmer className="size-3.5 shrink-0 rounded-[3px]" />
                     <Shimmer className="h-3 rounded" style={{ width }} />
@@ -171,35 +240,14 @@ export function UsageDashboardSkeleton() {
                 ))}
               </div>
             </div>
-          </div>
+          )}
 
-          {/* right: chart, wide layouts only */}
-          <div className="hidden min-w-0 flex-col lg:flex">
-            <div className="flex items-center justify-between gap-4">
-              <Label className="text-sm font-semibold">Daily cost</Label>
-              <div className="flex items-center gap-2">
-                <ToggleGroupPreview
-                  value="agent"
-                  options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
-                />
-                <ToggleGroupPreview
-                  value="cost"
-                  options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
-                />
-              </div>
+          {stackedView && (
+            <div>
+              <Label className="mb-2.5 text-sm font-medium text-muted-foreground">Agents</Label>
+              <ProviderRowsSkeleton separated />
             </div>
-            <div className="mt-4">
-              <ChartSkeleton />
-            </div>
-            <div className="mt-2 flex flex-wrap items-center justify-center gap-x-4 gap-y-2">
-              {[58, 74, 68, 54].map((width) => (
-                <div key={width} className="flex items-center gap-1.5">
-                  <Shimmer className="size-3.5 shrink-0 rounded-[3px]" />
-                  <Shimmer className="h-3 rounded" style={{ width }} />
-                </div>
-              ))}
-            </div>
-          </div>
+          )}
         </section>
 
         {/* metric cards: real labels, shimmering values */}
