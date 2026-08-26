@@ -478,16 +478,18 @@ export async function runHostCommand(
 // OpenCode usage is collected on the enrolled HOST (via `opencode db`), so the
 // day bucket and the 90-day cutoff MUST use the host's local timezone, not
 // UTC. Otherwise machines in a positive/negative offset see "today"'s usage
-// land in the previous/next UTC day. The plugin server owns the rolling window
-// (dashboardRecordsSql uses `localtime` too); in a single-machine deployment
-// the BB server runs in the same timezone as the enrolled host.
+// land in the previous/next UTC day.
+//
+// The trailing 'utc' modifier is required: 'localtime' shifts the stored value
+// into local time, but '%s' formats it as if it were still UTC, so without the
+// conversion back the cutoff is wrong by the host's offset.
 export function openCodeSql(): string {
   const oldestDayOffset = OPENCODE_HISTORY_DAYS - 1;
   return `
 WITH recent_sessions AS MATERIALIZED (
   SELECT id
   FROM session
-  WHERE time_updated >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  WHERE time_updated >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
 )
 SELECT
   date(m.time_created / 1000, 'unixepoch', 'localtime') AS day,
@@ -502,7 +504,7 @@ SELECT
 FROM recent_sessions rs
 JOIN message m ON m.session_id = rs.id
 WHERE json_extract(m.data, '$.role') = 'assistant'
-  AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days') AS INTEGER) * 1000
+  AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
 GROUP BY day, modelProviderId, model
 ORDER BY day, modelProviderId, model;`.trim();
 }
@@ -671,6 +673,10 @@ export function loadStoredOpenCodeGoLimits(
   });
 }
 
+// Rows are bucketed by each host's local day, so the plugin server's timezone
+// cannot decide the exact visible window without clipping a host that is ahead
+// of it. This query only bounds retention -- it fetches one extra day of slack
+// and the dashboard applies the exact range in the viewer's timezone.
 export function dashboardRecordsSql() {
   return `WITH canonical AS (
       SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
@@ -689,7 +695,7 @@ export function dashboardRecordsSql() {
     SUM(cache_savings_usd) cacheSavingsUsd, SUM(processed_tokens) processedTokens,
     SUM(cached_input_tokens) cachedInputTokens, SUM(cache_write_tokens) cacheWriteTokens,
     SUM(uncached_input_tokens) uncachedInputTokens, SUM(output_tokens) outputTokens
-    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS - 1} days')
+    FROM canonical WHERE day >= date('now', 'localtime', '-${DASHBOARD_HISTORY_DAYS} days')
     AND NOT (provider_id='claude' AND model='<synthetic>' AND processed_tokens=0)
     GROUP BY day, provider_id, model_provider_id, machine_id, model, project ORDER BY day`;
 }

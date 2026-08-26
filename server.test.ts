@@ -510,12 +510,30 @@ describe("OpenCode query", () => {
     expect(days.has(localDay(tB))).toBe(true);
     db.close();
   });
+
+  it("cuts off at real local midnight, not a mis-converted epoch", () => {
+    // 'localtime' shifts the value into local time but '%s' still formats it
+    // as UTC, so the cutoff needs a trailing 'utc' to become a real epoch.
+    // Without it the boundary drifts by the host's offset (7h in Los Angeles,
+    // 12h in Auckland), dropping or admitting hours of the oldest day.
+    const db = new Database(":memory:");
+    const cutoff = db.prepare(
+      "SELECT CAST(strftime('%s','now','localtime','start of day','-89 days','utc') AS INTEGER) c",
+    ).get() as { c: number };
+    const asLocal = new Date(cutoff.c * 1000);
+    expect(asLocal.getHours()).toBe(0);
+    expect(asLocal.getMinutes()).toBe(0);
+    expect(openCodeSql()).not.toContain("'start of day', '-89 days')");
+    db.close();
+  });
 });
 
 describe("dashboard query", () => {
-  it("returns only the 90 calendar days supported by the UI", () => {
+  it("fetches one buffer day beyond the 90 the UI shows", () => {
+    // The server timezone must not clip a host that is already on the next
+    // local day; the dashboard applies the exact 90-day range itself.
     const sql = dashboardRecordsSql();
-    expect(sql).toContain("day >= date('now', 'localtime', '-89 days')");
+    expect(sql).toContain("day >= date('now', 'localtime', '-90 days')");
     expect(sql).not.toContain("-365 days");
   });
 });

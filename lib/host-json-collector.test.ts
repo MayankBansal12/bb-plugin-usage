@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -288,5 +288,49 @@ describe("host JSON usage collector", () => {
     const cache = await readFile(cachePath, "utf8");
     expect(cache).not.toContain("private parent content");
     expect(cache).not.toContain("private child content");
+  });
+
+  it("discards a v3 cache so UTC-bucketed rows cannot survive the upgrade", async () => {
+    // v3 stored a precomputed UTC `day`. v4 buckets in host-local time, so a
+    // reused v3 entry would mix the two silently and forever.
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+    await mkdir(join(directory, "cache"), { recursive: true });
+    await writeFile(join(root, "rollout-test.jsonl"), [
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    await writeFile(cachePath, JSON.stringify({
+      version: 3,
+      agentId: "codex",
+      files: { stale: { signature: "stale", rows: [{ day: "1999-01-01", modelProviderId: "openai", model: "poisoned", uncachedInputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0, loggedCostUsd: null }] } },
+    }));
+
+    const result = await scan("codex", root, cachePath);
+    expect(result.reusedFileCount).toBe(0);
+    expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(4);
+  });
+
+  it("keeps host filesystem paths out of failure diagnostics", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+    // Discoverable and stat-able, but unreadable -- so parseFile throws and the
+    // failure path runs with a real filePath in scope.
+    const secret = join(root, "rollout-secret.jsonl");
+    await writeFile(secret, "{}\n");
+    await chmod(secret, 0o000);
+
+    const result = await scan("codex", root, cachePath);
+    expect(result.failureCount).toBeGreaterThan(0);
+    // `error` carries the first failure string off the host verbatim.
+    expect(result.error).toBe("A usage log could not be read.");
+    await chmod(secret, 0o600);
   });
 });

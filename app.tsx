@@ -961,9 +961,13 @@ function UsageDashboard() {
   const rows = useMemo(() => {
     if (!data) return [];
     const days = rangeDays(range);
-    const cutoffDay = days[0];
+    // Bound both ends. Rows are bucketed in each host's local timezone, so a
+    // host ahead of the viewer can emit a day beyond today; without the upper
+    // bound those rows land in the headline totals while the chart -- which
+    // only has buckets for `days` -- silently drops them.
+    const [cutoffDay, latestDay] = [days[0], days[days.length - 1]];
     return data.records.filter((row) =>
-      row.day >= cutoffDay
+      row.day >= cutoffDay && row.day <= latestDay
       && (machine === "all" || row.machineId === machine));
   }, [data, machine, range]);
 
