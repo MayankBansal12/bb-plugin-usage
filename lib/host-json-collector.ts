@@ -58,7 +58,7 @@ const scanResultSchema = z.object({
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
-// v2: retained hashed Claude response identities so repeated transcript rows
+  // v2: retained hashed Claude response identities so repeated transcript rows
   // and copied/forked transcripts can be deduplicated before aggregation.
   // v3: bucket days in the host's local timezone, drop cached zero-token /
   // zero-cost rows (every file re-parses with the token guard), and add the
@@ -357,7 +357,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           day: usageDay,
           modelProviderId: text(message.provider, "unknown"),
           model: text(message.responseModel, text(message.model, "unknown")),
-project: sessionProject,
+          project: sessionProject,
           loggedCostUsd,
           uncachedInputTokens: count(usage.input), cachedInputTokens: count(usage.cacheRead),
           cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),

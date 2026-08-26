@@ -330,6 +330,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     return [usageRecord({
       eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}`,
       timestamp,
+      day,
       agentId,
       agentName,
       modelProviderId,

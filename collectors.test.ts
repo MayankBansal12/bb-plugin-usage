@@ -159,6 +159,7 @@ describe("usage collectors", () => {
     }]);
     expect(parseHostUsageAggregates(content, "codex", machine)[0]).toMatchObject({
       eventKey: "codex:machine-a:2026-08-09:openai:gpt-5.6-sol:Unknown",
+      day: "2026-08-09",
       agentId: "codex",
       modelProviderId: "openai",
       processedTokens: 125,
