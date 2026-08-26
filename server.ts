@@ -83,6 +83,7 @@ const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
+const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
 const DASHBOARD_HISTORY_DAYS = 90;
 const OPENCODE_HISTORY_DAYS = DASHBOARD_HISTORY_DAYS;
 const HISTORY_DAYS = 365;
@@ -585,7 +586,7 @@ export async function syncOpenCodeGo(
     bb.log.info(`${machine.name}/opencode-go: ${windows.length} limit windows`);
   } catch (error) {
     const message = errorMessage(error);
-    if (/no-opencode-go-(credential|plan)/.test(message)) {
+    if (OPENCODE_GO_ABSENCE_ERRORS.has(message)) {
       db.transaction(() => {
         db.prepare("DELETE FROM opencode_go_limits WHERE machine_id=?").run(machine.id);
         db.prepare("DELETE FROM opencode_go_limit_state WHERE machine_id=?").run(machine.id);

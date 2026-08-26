@@ -526,6 +526,26 @@ describe("OpenCode Go limits", () => {
       .toEqual([expect.objectContaining({ status: "error", windows: [expect.objectContaining({ label: "Rolling (5h)" })] })]);
   });
 
+  it("retains the previous snapshot for diagnostics that only contain a sentinel", async () => {
+    const db = goLimitsDb();
+    const warn = vi.fn();
+    const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+
+    for (const diagnostic of [
+      "collector failed near no-opencode-go-credential handling",
+      "no-opencode-go-plan response was malformed",
+    ]) {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+        throw new Error(diagnostic);
+      });
+    }
+
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("retaining previous snapshot"));
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limits").get() as { count: number }).count).toBe(1);
+    expect((db.prepare("SELECT COUNT(*) count FROM opencode_go_limit_state").get() as { count: number }).count).toBe(1);
+  });
+
   it("drops the stored snapshot when the machine has no Go credential or plan", async () => {
     const db = goLimitsDb();
     const debug = vi.fn();

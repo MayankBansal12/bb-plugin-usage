@@ -112,7 +112,7 @@ describe("OpenCode Go command", () => {
     expect(command).toContain("Authorization: Bearer %s");
     expect(command).toContain("-H @-");
     expect(command).not.toContain("Authorization: Bearer $bb_usage_go_key");
-    expect(command).toContain('."opencode-go"? | type == "object"');
+    expect(command).toContain('has("opencode-go")');
     expect(command).toContain("no-opencode-go-credential");
     expect(command).toContain("__BB_USAGE_BEGIN__");
     expect(command).toContain("__BB_USAGE_END__:0");
@@ -156,15 +156,36 @@ describe("OpenCode Go command", () => {
     expect(result.tempFiles).toEqual([]);
   });
 
-  it("distinguishes a missing credential from malformed auth", () => {
-    const missing = runUsageCommand({ auth: null });
-    expect(missing.status).not.toBe(0);
-    expect(missing.output).toContain("no-opencode-go-credential");
+  it("distinguishes an absent credential from malformed auth", () => {
+    const missingFile = runUsageCommand({ auth: null });
+    expect(missingFile.status).not.toBe(0);
+    expect(missingFile.output).toContain("no-opencode-go-credential");
+
+    for (const nodeOnly of [false, true]) {
+      const missingEntry = runUsageCommand({ auth: {}, nodeOnly });
+      expect(missingEntry.status).not.toBe(0);
+      expect(missingEntry.output).toContain("no-opencode-go-credential");
+    }
 
     const malformed = runUsageCommand({ auth: "{" });
     expect(malformed.status).not.toBe(0);
     expect(malformed.output).toContain("auth file was not valid JSON");
     expect(malformed.output).not.toContain("no-opencode-go-credential");
+  });
+
+  it.each([
+    ["array", []],
+    ["primitive", "token"],
+    ["null", null],
+    ["wrong type", { type: "oauth", key: "go-test-secret-do-not-log" }],
+  ])("treats a present %s entry as invalid in both parser paths", (_label, entry) => {
+    for (const nodeOnly of [false, true]) {
+      const result = runUsageCommand({ auth: { "opencode-go": entry }, nodeOnly });
+      expect(result.status).not.toBe(0);
+      expect(result.output).toContain("invalid");
+      expect(result.output).not.toContain("no-opencode-go-credential");
+      expect(result.output).not.toContain("go-test-secret-do-not-log");
+    }
   });
 
   it("rejects invalid credential values without exposing them", () => {
