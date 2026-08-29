@@ -262,6 +262,12 @@ describe("provider limit loading", () => {
         accountEmail: null,
         windows: [{ label: "5 hours", usedPercent: 30, resetsAt: null }],
       },
+      "acp-cursor": {
+        status: "ok",
+        planLabel: "Pro",
+        accountEmail: null,
+        windows: [{ label: "Monthly", usedPercent: 40, resetsAt: null }],
+      },
     }));
     const bb = {
       sdk: { system: { usageLimits } },
@@ -273,6 +279,7 @@ describe("provider limit loading", () => {
     ], emptyDb(), 1_000)).resolves.toEqual([
       expect.objectContaining({ providerId: "codex", status: "ok" }),
       expect.objectContaining({ providerId: "claude", status: "ok" }),
+      expect.objectContaining({ providerId: "cursor", status: "ok" }),
     ]);
   });
 

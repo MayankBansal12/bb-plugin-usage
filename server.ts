@@ -74,7 +74,7 @@ const AGENTS = [
 const LIMIT_PROVIDERS = [
   { keys: ["codex"], id: "codex", name: "Codex" },
   { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
-  { keys: ["cursor"], id: "cursor", name: "Cursor" },
+  { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
 ] as const;
 const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
