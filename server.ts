@@ -72,9 +72,9 @@ const AGENTS = [
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
 
 const LIMIT_PROVIDERS = [
-  { key: "codex", id: "codex", name: "Codex" },
-  { key: "claudeCode", id: "claude", name: "Claude Code" },
-  { key: "cursor", id: "cursor", name: "Cursor" },
+  { keys: ["codex"], id: "codex", name: "Codex" },
+  { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
+  { keys: ["cursor"], id: "cursor", name: "Cursor" },
 ] as const;
 const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
@@ -110,7 +110,8 @@ export async function loadProviderLimits(
       try {
         const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
         return LIMIT_PROVIDERS.flatMap((provider): Array<z.infer<typeof providerLimitSchema>> => {
-          const limit = usage[provider.key];
+          const limit = provider.keys.map((key) => usage[key]).find((candidate) => candidate !== undefined);
+          if (!limit) return [];
           if (limit.status === "ok") {
             if (limit.windows.length === 0) return [];
             return [{

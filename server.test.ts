@@ -248,6 +248,34 @@ describe("provider limit loading", () => {
     })]);
   });
 
+  it("uses current provider ids and ignores providers omitted from the response", async () => {
+    const usageLimits = vi.fn(async () => ({
+      codex: {
+        status: "ok",
+        planLabel: "Plus",
+        accountEmail: null,
+        windows: [{ label: "5 hours", usedPercent: 20, resetsAt: null }],
+      },
+      "claude-code": {
+        status: "ok",
+        planLabel: "Max",
+        accountEmail: null,
+        windows: [{ label: "5 hours", usedPercent: 30, resetsAt: null }],
+      },
+    }));
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Current machine", status: "connected" },
+    ], emptyDb(), 1_000)).resolves.toEqual([
+      expect.objectContaining({ providerId: "codex", status: "ok" }),
+      expect.objectContaining({ providerId: "claude", status: "ok" }),
+    ]);
+  });
+
   it("surfaces a provider error (e.g. rate limited) instead of hiding the provider", async () => {
     const usageLimits = vi.fn(async () => ({
       codex: { status: "ok", planLabel: "Pro", windows: [{ label: "5 hours", usedPercent: 10, resetsAt: null }] },
