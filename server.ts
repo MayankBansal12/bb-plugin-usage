@@ -39,7 +39,8 @@ const providerLimitWindowSchema = z.object({
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
-  machineId: z.string(), machineName: z.string(), providerId: z.string(), providerName: z.string(),
+  machineId: z.string(), machineName: z.string(), agentId: z.string(), agentName: z.string(),
+  providerId: z.string(), providerName: z.string(), accountEmail: z.string().nullable(),
   planLabel: z.string().nullable(), windows: z.array(providerLimitWindowSchema),
   status: z.enum(["ok", "error"]), error: z.string().nullable(), lastUpdatedAt: z.string().nullable(),
 });
@@ -72,10 +73,31 @@ const AGENTS = [
 ] as const satisfies ReadonlyArray<{ id: AgentId; name: string }>;
 
 const LIMIT_PROVIDERS = [
-  { keys: ["codex"], id: "codex", name: "Codex" },
-  { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
-  { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
+  { id: "codex", name: "Codex" },
+  { id: "claude", name: "Claude Code" },
+  { id: "cursor", name: "Cursor" },
 ] as const;
+const LIMIT_PROVIDER_ALIASES: Record<string, string> = {
+  "claude-code": "claude",
+  claudeCode: "claude",
+  "acp-cursor": "cursor",
+};
+const LIMIT_PROVIDER_NAMES: Record<string, string> = {
+  codex: "Codex",
+  claude: "Claude Code",
+  cursor: "Cursor",
+  "opencode-go": "OpenCode Go",
+};
+
+function normalizeLimitProviderId(providerId: string) {
+  return LIMIT_PROVIDER_ALIASES[providerId] ?? providerId;
+}
+
+function limitProviderName(providerId: string) {
+  return LIMIT_PROVIDER_NAMES[providerId]
+    ?? providerId.split(/[-_]/).filter(Boolean).map((part) => part[0]?.toUpperCase() + part.slice(1)).join(" ")
+    ?? providerId;
+}
 const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
@@ -107,18 +129,71 @@ export async function loadProviderLimits(
         WHERE s.machine_id = ? AND s.provider_id IN (?, ?, ?)`)
         .all(machine.id, "codex", "claude", "cursor") as Array<{ agentId: string }>;
       const present = new Set(presentRows.map((row) => row.agentId));
+
+      let agents: Array<{ id: string; name: string }> = [];
       try {
-        const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
-        return LIMIT_PROVIDERS.flatMap((provider): Array<z.infer<typeof providerLimitSchema>> => {
-          const limit = provider.keys.map((key) => usage[key]).find((candidate) => candidate !== undefined);
-          if (!limit) return [];
+        const states = await bb.sdk.system.providerStates({
+          hostId: machine.id,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        agents = states.providers
+          .filter((provider) => provider.status === "ready")
+          .map((provider) => ({ id: provider.providerId, name: provider.displayName }));
+      } catch (error) {
+        bb.log.debug(`Provider discovery unavailable for ${machine.name}: ${errorMessage(error)}`);
+      }
+      if (agents.length === 0) agents = [{ id: "", name: "BB" }];
+
+      const results = await Promise.all(agents.map(async (agent) => {
+        try {
+          const usage = await bb.sdk.system.usageLimits({
+            hostId: machine.id,
+            ...(agent.id ? { providerId: agent.id } : {}),
+            signal: AbortSignal.timeout(timeoutMs),
+          });
+          return { agent, usage, error: null };
+        } catch (error) {
+          const message = errorMessage(error);
+          bb.log.debug(`Provider limits unavailable through ${agent.name} on ${machine.name}: ${message}`);
+          return { agent, usage: null, error: message };
+        }
+      }));
+
+      const available = results.filter((result) => result.usage !== null);
+      if (available.length === 0) {
+        const message = `Provider limits unavailable: ${results.map((result) => result.error).filter(Boolean).join("; ") || "Unknown error."}`;
+        return LIMIT_PROVIDERS
+          .filter((provider) => present.has(provider.id))
+          .map((provider): z.infer<typeof providerLimitSchema> => ({
+            machineId: machine.id,
+            machineName: machine.name,
+            agentId: "unknown",
+            agentName: "Unknown agent",
+            providerId: provider.id,
+            providerName: provider.name,
+            accountEmail: null,
+            planLabel: null,
+            windows: [],
+            status: "error",
+            error: message,
+            lastUpdatedAt: null,
+          }));
+      }
+
+      return available.flatMap(({ agent, usage }): Array<z.infer<typeof providerLimitSchema>> => (
+        Object.entries(usage!).flatMap(([rawProviderId, limit]): Array<z.infer<typeof providerLimitSchema>> => {
+          const providerId = normalizeLimitProviderId(rawProviderId);
+          const providerName = limitProviderName(providerId);
           if (limit.status === "ok") {
             if (limit.windows.length === 0) return [];
             return [{
               machineId: machine.id,
               machineName: machine.name,
-              providerId: provider.id,
-              providerName: provider.name,
+              agentId: agent.id || "aggregate",
+              agentName: agent.name,
+              providerId,
+              providerName,
+              accountEmail: limit.accountEmail,
               planLabel: limit.planLabel,
               windows: limit.windows,
               status: "ok",
@@ -127,12 +202,15 @@ export async function loadProviderLimits(
             }];
           }
           if (limit.status === "error") {
-            bb.log.debug(`Provider limits unavailable for ${provider.name} on ${machine.name}: ${limit.message}`);
+            bb.log.debug(`Provider limits unavailable for ${providerName} through ${agent.name} on ${machine.name}: ${limit.message}`);
             return [{
               machineId: machine.id,
               machineName: machine.name,
-              providerId: provider.id,
-              providerName: provider.name,
+              agentId: agent.id || "aggregate",
+              agentName: agent.name,
+              providerId,
+              providerName,
+              accountEmail: limit.accountEmail,
               planLabel: limit.planLabel,
               windows: [],
               status: "error",
@@ -141,24 +219,8 @@ export async function loadProviderLimits(
             }];
           }
           return [];
-        });
-      } catch (error) {
-        const message = `Provider limits unavailable: ${errorMessage(error)}`;
-        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
-        return LIMIT_PROVIDERS
-          .filter((provider) => present.has(provider.id))
-          .map((provider): z.infer<typeof providerLimitSchema> => ({
-            machineId: machine.id,
-            machineName: machine.name,
-            providerId: provider.id,
-            providerName: provider.name,
-            planLabel: null,
-            windows: [],
-            status: "error",
-            error: message,
-            lastUpdatedAt: null,
-          }));
-      }
+        })
+      ));
     }))).flat();
 }
 
@@ -650,8 +712,11 @@ export function loadStoredOpenCodeGoLimits(
       return [{
         machineId: row.machineId,
         machineName: row.machineName,
+        agentId: "opencode",
+        agentName: "OpenCode",
         providerId: "opencode-go",
         providerName: "OpenCode Go",
+        accountEmail: null,
         planLabel: row.planLabel ?? "Go",
         windows,
         status: row.status,
@@ -662,8 +727,11 @@ export function loadStoredOpenCodeGoLimits(
       return [{
         machineId: row.machineId,
         machineName: row.machineName,
+        agentId: "opencode",
+        agentName: "OpenCode",
         providerId: "opencode-go",
         providerName: "OpenCode Go",
+        accountEmail: null,
         planLabel: row.planLabel ?? "Go",
         windows: [],
         status: "error",

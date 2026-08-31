@@ -14,7 +14,7 @@ import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
-import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWindow } from "@/lib/provider-limits";
+import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits, type ProviderLimitSource } from "@/lib/provider-limits";
 import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
 
 type Range = 7 | 30 | 90;
@@ -109,17 +109,7 @@ type DashboardData = {
     recordCount: number;
     error: string | null;
   }>;
-  providerLimits: Array<{
-    machineId: string;
-    machineName: string;
-    providerId: string;
-    providerName: string;
-    planLabel: string | null;
-    windows: ProviderLimitWindow[];
-    status: "ok" | "error";
-    error: string | null;
-    lastUpdatedAt: string | null;
-  }>;
+  providerLimits: ProviderLimitSource[];
   sync: UsageSyncSnapshot;
   notice: string;
 };
@@ -670,17 +660,7 @@ function ProviderLimits({
   limits: DashboardData["providerLimits"];
   contentWidth: number;
 }) {
-  const machineMap = new Map<string, DashboardData["providerLimits"]>();
-  for (const limit of limits) {
-    const providers = machineMap.get(limit.machineId) ?? [];
-    providers.push(limit);
-    machineMap.set(limit.machineId, providers);
-  }
-  const machines = Array.from(machineMap, ([machineId, providers]) => ({
-    machineId,
-    machineName: providers[0]?.machineName ?? "Unknown machine",
-    providers,
-  }));
+  const subscriptions = groupProviderLimits(limits);
   const columnCount = contentWidth < 640 ? 1 : contentWidth < 1080 ? 2 : 3;
   const constrainHeight = contentWidth >= 1024;
 
@@ -688,78 +668,104 @@ function ProviderLimits({
     <section className="rounded-xl border border-border/70 bg-muted/[0.08] p-4 sm:p-5" aria-labelledby="provider-limits-title">
       <div className="flex items-baseline justify-between gap-3">
         <h2 id="provider-limits-title" className="text-sm font-medium">Usage limits</h2>
-        <span className="text-xs text-muted-foreground">Current plan windows</span>
+        <span className="text-xs text-muted-foreground">Unified by subscription</span>
       </div>
-      {machines.length === 0 ? (
+      {subscriptions.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
       ) : (
         <div
-          className={`mt-4 grid gap-3 ${constrainHeight ? "max-h-60 overflow-y-auto pr-1" : ""}`}
+          className={`mt-4 grid gap-3 ${constrainHeight ? "max-h-80 overflow-y-auto pr-1" : ""}`}
           style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
         >
-          {machines.map((machine) => (
+          {subscriptions.map((subscription) => (
             <div
-              key={machine.machineId}
-              className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
+              key={subscription.id}
+              className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-3"
             >
-              <div className="truncate text-[11px] font-medium leading-4 text-muted-foreground" title={machine.machineName}>
-                {machine.machineName}
+              <div className="flex min-w-0 items-start justify-between gap-3">
+                <span className="flex min-w-0 items-center gap-2">
+                  <ProviderLogo id={subscription.providerId} name={subscription.providerName} size="sm" />
+                  <span className="truncate text-xs font-medium">{subscription.providerName}</span>
+                </span>
+                <span className="min-w-0 max-w-[52%] text-right text-[10px] leading-4 text-muted-foreground">
+                  {subscription.planLabel && <span className="block truncate" title={subscription.planLabel}>{subscription.planLabel}</span>}
+                  {subscription.accountEmail && <span className="block truncate" title={subscription.accountEmail}>{subscription.accountEmail}</span>}
+                </span>
               </div>
-              <div className="mt-2 divide-y divide-border/50 border-t border-border/50">
-                {machine.providers.map((limit) => (
-                  <div key={limit.providerId} className="py-2.5 first:pt-2 last:pb-0.5">
-                    <div className="flex min-w-0 items-center justify-between gap-3">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
-                        <span className="truncate text-xs font-medium">{limit.providerName}</span>
-                      </span>
-                      {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
+
+              {subscription.status === "error" && (
+                <div className="mt-2 flex items-start gap-1.5">
+                  <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+                  <p className="text-[10px] leading-4 text-destructive/90">
+                    {subscription.error ? `Couldn’t load ${subscription.providerName} limits: ${subscription.error}` : `${subscription.providerName} limits unavailable`}
+                    {subscription.windows.length > 0
+                      ? ` Showing cached values${subscription.lastUpdatedAt ? ` from ${new Date(subscription.lastUpdatedAt).toLocaleString()}` : ""}.`
+                      : ""}
+                  </p>
+                </div>
+              )}
+
+              {subscription.windows.length > 0 && (
+                <div className="mt-2 space-y-2">
+                  {subscription.windows.map((window, index) => {
+                    const reset = formatLimitReset(window.resetsAt);
+                    const usedPercent = clampPercent(window.usedPercent);
+                    return (
+                      <div key={`${window.label}:${index}`}>
+                        <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
+                          <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
+                          <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
+                        </div>
+                        <div
+                          className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
+                          role="progressbar"
+                          aria-label={`${subscription.providerName} ${window.label}`}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={Math.round(usedPercent)}
+                        >
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: `${usedPercent}%`,
+                              backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(subscription.providerId),
+                            }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="mt-3 border-t border-border/50 pt-2">
+                <div className="mb-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  {subscription.machines.length === 1 ? "Machine" : "Machines"}
+                </div>
+                <div className="space-y-2">
+                  {subscription.machines.map((machine) => (
+                    <div key={machine.machineId} className="min-w-0 text-[10px] leading-4">
+                      <div className="flex min-w-0 items-baseline justify-between gap-2">
+                        <span className="truncate font-medium text-foreground/80" title={machine.machineName}>{machine.machineName}</span>
+                        <span className="shrink-0 truncate text-muted-foreground" title={machine.agents.map((agent) => agent.name).join(", ")}>
+                          via {machine.agents.map((agent) => agent.name).join(", ")}
+                        </span>
+                      </div>
+                      {machine.windows.length > 0 && (
+                        <div className="mt-0.5 flex flex-wrap gap-x-2 text-muted-foreground">
+                          {machine.windows.map((window, index) => (
+                            <span key={`${window.label}:${index}`}>
+                              {window.label} <span className="tabular-nums text-foreground/70">{formatLimitValue(window)}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                      {machine.status === "error" && machine.error && (
+                        <div className="mt-0.5 truncate text-destructive/90" title={machine.error}>{machine.error}</div>
+                      )}
                     </div>
-                    {limit.status === "error" && (
-                      <div className="mt-2 flex items-start gap-1.5">
-                        <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-                        <p className="text-[10px] leading-4 text-destructive/90">
-                          {limit.error ? `Couldn’t load ${limit.providerName} limits: ${limit.error}` : `${limit.providerName} limits unavailable`}
-                          {limit.windows.length > 0
-                            ? ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
-                            : ""}
-                        </p>
-                      </div>
-                    )}
-                    {limit.windows.length > 0 && (
-                      <div className="mt-1.5 space-y-1.5">
-                      {limit.windows.map((window, index) => {
-                        const reset = formatLimitReset(window.resetsAt);
-                        const usedPercent = clampPercent(window.usedPercent);
-                        return (
-                          <div key={`${window.label}:${index}`}>
-                            <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
-                              <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
-                              <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
-                            </div>
-                            <div
-                              className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
-                              role="progressbar"
-                              aria-label={`${machine.machineName} ${limit.providerName} ${window.label}`}
-                              aria-valuemin={0}
-                              aria-valuemax={100}
-                              aria-valuenow={Math.round(usedPercent)}
-                            >
-                              <div
-                                className="h-full rounded-full"
-                                style={{
-                                  width: `${usedPercent}%`,
-                                  backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(limit.providerId),
-                                }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-                      </div>
-                    )}
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             </div>
           ))}

@@ -248,6 +248,45 @@ describe("provider limit loading", () => {
     })]);
   });
 
+  it("queries each ready agent bridge and preserves the subscription account", async () => {
+    const providerStates = vi.fn(async () => ({
+      providers: [{
+        providerId: "pi",
+        displayName: "Pi",
+        status: "ready",
+      }],
+    }));
+    const usageLimits = vi.fn(async () => ({
+      codex: {
+        status: "ok",
+        planLabel: "Pro",
+        accountEmail: "dev@example.com",
+        windows: [{ label: "5 hours", usedPercent: 42, resetsAt: null }],
+      },
+    }));
+    const bb = {
+      sdk: { system: { providerStates, usageLimits } },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Machine", status: "connected" },
+    ], emptyDb(), 1_000)).resolves.toEqual([expect.objectContaining({
+      machineId: "host_1",
+      agentId: "pi",
+      agentName: "Pi",
+      providerId: "codex",
+      accountEmail: "dev@example.com",
+      status: "ok",
+    })]);
+    expect(providerStates).toHaveBeenCalledWith({ hostId: "host_1", signal: expect.any(AbortSignal) });
+    expect(usageLimits).toHaveBeenCalledWith({
+      hostId: "host_1",
+      providerId: "pi",
+      signal: expect.any(AbortSignal),
+    });
+  });
+
   it("uses current provider ids and ignores providers omitted from the response", async () => {
     const usageLimits = vi.fn(async () => ({
       codex: {
