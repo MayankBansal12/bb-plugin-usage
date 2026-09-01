@@ -419,6 +419,13 @@ function delay(ms: number) {
 
 type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number };
 
+const HOST_COMMAND_DONE = "__BB_HOST_COMMAND_DONE__";
+const HOST_COMMAND_RELEASE_TIMEOUT_SECONDS = 30;
+
+function releasableHostCommand(command: string) {
+  return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '${HOST_COMMAND_DONE}' "$bb_usage_status"; read -r -t ${HOST_COMMAND_RELEASE_TIMEOUT_SECONDS} bb_usage_release || true; exit "$bb_usage_status"`;
+}
+
 function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["terminals"]["output"]>>) {
   return output.chunks.sort((a, b) => a.seq - b.seq)
     .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
@@ -450,15 +457,15 @@ export async function runHostCommand(
     cols: 120,
     rows: 24,
     title: options.title,
-    start: { mode: "command", command },
+    start: { mode: "command", command: releasableHostCommand(command) },
   });
   let exited = false;
+  let completion: { text: string; exitCode: number } | null = null;
   try {
     const deadline = Date.now() + options.timeoutMs;
     while (Date.now() < deadline) {
       const state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
-      if (state.status === "exited") {
-        exited = true;
+      if (state.status === "running") {
         const output = await bb.sdk.terminals.output({
           terminalId: terminal.id,
           tailBytes: 900_000,
@@ -467,10 +474,23 @@ export async function runHostCommand(
         });
         if (output.truncated) throw new Error(`${options.title} exceeded the 900 KB output limit.`);
         const text = terminalOutputText(output);
-        const exitCode = state.exitCode ?? 1;
+        const match = text.match(new RegExp(`${HOST_COMMAND_DONE}:(\\d+)`));
+        if (match && !completion) {
+          completion = { text, exitCode: Number(match[1]) };
+          await bb.sdk.terminals.input({
+            terminalId: terminal.id,
+            dataBase64: Buffer.from("\n").toString("base64"),
+          }).catch((error) => {
+            bb.log.debug(`${options.title} terminal release signal failed: ${errorMessage(error)}`);
+          });
+        }
+      } else if (state.status === "exited") {
+        exited = true;
+        if (!completion) throw new Error(`${options.title} stopped before its output could be collected.`);
+        const { text, exitCode } = completion;
         if (exitCode !== 0) {
           const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
-            ?? text.trim().slice(-300);
+            ?? text.replace(new RegExp(`${HOST_COMMAND_DONE}:\\d+`, "g"), "").trim().slice(-300);
           throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
         }
         return text;
