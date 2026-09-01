@@ -419,13 +419,23 @@ function delay(ms: number) {
 
 type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number };
 
-function heldHostCommand(command: string) {
-  return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '__BB_HOST_COMMAND_DONE__' "$bb_usage_status"; while :; do sleep 3600; done`;
-}
-
 function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["terminals"]["output"]>>) {
   return output.chunks.sort((a, b) => a.seq - b.seq)
     .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
+}
+
+export async function runWithConcurrency<T>(tasks: readonly (() => Promise<T>)[], limit: number): Promise<T[]> {
+  if (!Number.isInteger(limit) || limit < 1) throw new Error("Concurrency limit must be a positive integer.");
+  const results = new Array<T>(tasks.length);
+  let nextTask = 0;
+  async function worker() {
+    while (nextTask < tasks.length) {
+      const index = nextTask++;
+      results[index] = await tasks[index]!();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, () => worker()));
+  return results;
 }
 
 export async function runHostCommand(
@@ -440,13 +450,15 @@ export async function runHostCommand(
     cols: 120,
     rows: 24,
     title: options.title,
-    start: { mode: "command", command: heldHostCommand(command) },
+    start: { mode: "command", command },
   });
+  let exited = false;
   try {
     const deadline = Date.now() + options.timeoutMs;
     while (Date.now() < deadline) {
       const state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
-      if (state.status === "running") {
+      if (state.status === "exited") {
+        exited = true;
         const output = await bb.sdk.terminals.output({
           terminalId: terminal.id,
           tailBytes: 900_000,
@@ -455,24 +467,21 @@ export async function runHostCommand(
         });
         if (output.truncated) throw new Error(`${options.title} exceeded the 900 KB output limit.`);
         const text = terminalOutputText(output);
-        const completion = text.match(/__BB_HOST_COMMAND_DONE__:(\d+)/);
-        if (completion) {
-          const exitCode = Number(completion[1]);
-          if (exitCode !== 0) {
-            const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
-              ?? text.replace(/__BB_HOST_COMMAND_DONE__:\d+/g, "").trim().slice(-300);
-            throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
-          }
-          return text;
+        const exitCode = state.exitCode ?? 1;
+        if (exitCode !== 0) {
+          const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
+            ?? text.trim().slice(-300);
+          throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
         }
-      } else if (state.status !== "starting" && state.status !== "disconnected") {
-        throw new Error(`${options.title} stopped before its output could be collected.`);
+        return text;
       }
       await delay(options.pollMs ?? 200);
     }
     throw new Error(`${options.title} timed out after ${Math.ceil(options.timeoutMs / 1000)} seconds.`);
   } finally {
-    await bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => { /* already closed by the host */ });
+    await bb.sdk.terminals.close({ terminalId: terminal.id, mode: exited ? "if-clean" : "force" }).catch((error) => {
+      bb.log.warn(`${options.title} terminal cleanup failed: ${errorMessage(error)}`);
+    });
   }
 }
 
@@ -757,17 +766,17 @@ export default async function plugin(bb: BbPluginApi) {
           for (const agent of AGENTS) upsertState(db, machine.id, agent.id, "unavailable", countForMachine(db, machine.id, agent.id), message, false);
           continue;
         }
-        await Promise.all([
-          syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
-        ]);
+        await runWithConcurrency([
+          () => syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
+          () => syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
+        ], 3);
       }
       return new Date().toISOString();
     });
