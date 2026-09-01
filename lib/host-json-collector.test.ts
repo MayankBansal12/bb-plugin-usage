@@ -79,6 +79,79 @@ describe("host JSON usage collector", () => {
     expect(partial.rows).toEqual(first.rows);
   });
 
+  it("counts a Codex call once when it is re-materialized into other rollout files", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "logs");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+
+    // One API call. `last_token_usage` is the call; `total_token_usage` is the
+    // session's running total, which is what pins this call to a position in
+    // history and makes the identity safe.
+    const call = (running: number) => ({
+      type: "token_count",
+      info: {
+        last_token_usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 5, output_tokens: 20, reasoning_output_tokens: 7 },
+        total_token_usage: { total_tokens: running, input_tokens: running - 20 },
+      },
+    });
+
+    await writeFile(join(root, "rollout-origin.jsonl"), [
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id: "session-1" } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: call(5_000) },
+      // A second, genuinely distinct call: same usage tuple, later running total.
+      { timestamp: "2026-08-09T12:00:02Z", type: "event_msg", payload: call(9_000) },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    // The copy: identical payload, re-stamped a DAY later, in a file that never
+    // names a model (so it parses as "codex-unknown", which has no catalog price).
+    await writeFile(join(root, "rollout-copy.jsonl"), [
+      { timestamp: "2026-08-11T09:00:00Z", type: "session_meta", payload: { id: "session-2" } },
+      { timestamp: "2026-08-11T09:00:01Z", type: "event_msg", payload: call(5_000) },
+      { timestamp: "2026-08-11T09:00:02Z", type: "event_msg", payload: call(9_000) },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const result = await scan("codex", root, cachePath);
+    expect(result).toMatchObject({ fileCount: 2, failureCount: 0 });
+
+    // Two calls, counted once each -- not four. Before this dedupe the scan
+    // returned 240 cached tokens across two days, inflating the bill 2x.
+    expect(result.rows).toEqual([expect.objectContaining({
+      day: localDay("2026-08-09T12:00:01Z"),
+      modelProviderId: "openai",
+      model: "gpt-5.6-sol",
+      uncachedInputTokens: 80,
+      cachedInputTokens: 120,
+      cacheWriteTokens: 10,
+      outputTokens: 40,
+    })]);
+    // The copy must not strand the call on the write day, nor under an unknown model.
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows.some((row) => row.model === "codex-unknown")).toBe(false);
+    expect(result.rows.some((row) => row.day === localDay("2026-08-11T09:00:01Z"))).toBe(false);
+  });
+
+  it("falls back to summing Codex records that carry no running totals", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "logs");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+    // Without `total_token_usage` the identity loses what makes it discriminating,
+    // so these must still be summed -- collapsing them would erase real calls.
+    const bare = { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20 } } };
+    await writeFile(join(root, "rollout-bare.jsonl"), [
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: bare },
+      { timestamp: "2026-08-09T12:00:02Z", type: "event_msg", payload: bare },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const result = await scan("codex", root, cachePath);
+    expect(result.rows).toEqual([expect.objectContaining({
+      model: "gpt-5.6-sol", uncachedInputTokens: 80, cachedInputTokens: 120, outputTokens: 40,
+    })]);
+  });
+
   it.each([
     ["claude", "session.jsonl", {
       type: "assistant", timestamp: "2026-08-09T00:00:00Z",
@@ -347,7 +420,7 @@ describe("host JSON usage collector", () => {
     expect(cache).not.toContain("private child content");
   });
 
-  it("discards a v3 cache so UTC-bucketed rows cannot survive the upgrade", async () => {
+  it("discards an older cache so pre-upgrade rows cannot survive the upgrade", async () => {
     // v3 stored a precomputed UTC `day`. v4 buckets in host-local time, so a
     // reused v3 entry would mix the two silently and forever.
     const directory = await temporaryDirectory();
@@ -370,7 +443,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(5);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
   });
 
   it("keeps host filesystem paths out of failure diagnostics", async () => {

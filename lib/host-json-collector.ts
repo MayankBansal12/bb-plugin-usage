@@ -66,7 +66,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // version MUST rise or upgraded hosts keep serving UTC buckets forever,
   // silently mixed with newly parsed local ones.
   // v5: keep recorded and unpriced Pi/Prime usage in separate buckets.
-  const cacheVersion = 5;
+  // v6: deduplicate re-materialized Codex usage across rollout files.
+  const cacheVersion = 6;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
@@ -181,6 +182,16 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     prior.cacheWriteTokens = Math.max(prior.cacheWriteTokens, raw.cacheWriteTokens);
     prior.outputTokens = Math.max(prior.outputTokens, raw.outputTokens);
     if (raw.loggedCostUsd !== null) prior.loggedCostUsd = Math.max(prior.loggedCostUsd ?? 0, raw.loggedCostUsd);
+    // A copy can land in a file whose turn_context has not named the model yet,
+    // arriving as "<agent>-unknown". Measured over 45 days of local rollouts:
+    // 7,958 duplicate groups disagree on the model and every one is an
+    // unknown-vs-real disagreement, never two real models. Prefer the real id --
+    // otherwise whichever copy is scanned first decides, and an unknown model has
+    // no catalog price and bills as $0.
+    if (prior.model.endsWith("-unknown") && !raw.model.endsWith("-unknown")) prior.model = raw.model;
+    // Copies are re-stamped at write time, so the earliest day seen is the day the
+    // call actually happened.
+    if (raw.day < prior.day) prior.day = raw.day;
   }
 
   function matches(filePath: string) {
@@ -249,11 +260,35 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         if (!usage || !usageDay) continue;
         const inputTokens = count(usage.input_tokens);
         const cached = Math.min(inputTokens, count(usage.cached_input_tokens));
-        add(rows, {
+        // Codex re-materializes token_count records into OTHER rollout files: one
+        // call reappears verbatim in many sessions, re-stamped with the write time
+        // and at a different line, so session/timestamp/line cannot identify it,
+        // and the records carry no request id. The stable identity is the usage
+        // tuple plus the two RUNNING totals, which pin a call to its position in
+        // the session's history -- two distinct calls in a session cannot share
+        // them, because the totals strictly increase.
+        const totals = object(object(payload.info)?.total_token_usage);
+        const runningTotal = finite(totals?.total_tokens);
+        const runningInput = finite(totals?.input_tokens);
+        const row: CachedUsageRow = {
           day: usageDay, modelProviderId: "openai", model: codexModel, project: sessionProject, loggedCostUsd: null,
           uncachedInputTokens: inputTokens - cached, cachedInputTokens: cached,
           cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
-        });
+        };
+        // The model is deliberately NOT part of the identity: it comes from
+        // file-level turn_context state rather than the record, so a copy landing
+        // in a file that has not named a model yet reads as "codex-unknown".
+        // Without the running totals the fingerprint loses what makes it
+        // discriminating, so fall back to summing rather than risk collapsing two
+        // genuinely distinct calls.
+        if (runningTotal !== null && runningInput !== null) {
+          const identity = [
+            "codex", inputTokens, count(usage.cached_input_tokens), count(usage.output_tokens),
+            count(usage.reasoning_output_tokens), runningTotal, runningInput,
+          ].join(":");
+          row.eventKey = crypto.createHash("sha256").update(identity).digest("hex");
+          mergeEvent(events, row);
+        } else add(rows, row);
         continue;
       }
 
@@ -393,7 +428,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         });
       }
     }
-    return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
+    // Not gated on the agent id: any parser that assigns an eventKey routes
+    // through `events`, and gating this on one agent silently discarded the
+    // deduped rows of every other one.
+    return [...events.values(), ...rows.values()];
   }
 
   let cache: Cache = { version: cacheVersion, agentId: input.agentId, files: {} };
