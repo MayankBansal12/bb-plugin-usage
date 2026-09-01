@@ -1,9 +1,9 @@
 import Database from "better-sqlite3";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 
-vi.mock("@bb/plugin-sdk", () => ({
+vi.mock("@get-bb/plugin-sdk", () => ({
   defineRpcContract: <T>(contract: T) => contract,
 }));
 
@@ -27,7 +27,7 @@ const SCAN_END = "__BB_USAGE_SCAN_END__";
 function fakeHostScanOutput(agentId: string, rows: Array<Record<string, unknown>>) {
   const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0, error: null, rows };
   const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
-  return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+  return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n`;
 }
 
 describe("JSON agent roots", () => {
@@ -76,6 +76,7 @@ describe("sync RPC", () => {
     const db = { prepare: vi.fn(() => ({ get: vi.fn() })) };
     const bb = {
       settings: { define: vi.fn() },
+      hosts: { experimental_client: vi.fn(() => ({ call: vi.fn() })) },
       storage: { database: vi.fn(() => db), migrate: vi.fn() },
       rpc: {
         register: vi.fn((_contract: unknown, registered: unknown) => {
@@ -109,7 +110,7 @@ describe("sync RPC", () => {
     // The command runs `node -e eval(gunzip(base64(...)))` through the host shell
     // where the gzipped payload is the generated collector script with
     // agentId/roots baked in as a literal object — decode it the same way
-    // to tell which JSON-agent sync this particular terminal is for.
+    // to tell which JSON-agent sync this host-worker call is for.
     function agentIdFromCommand(command: string): string | null {
       // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
       // the closing quote of the base64 argument — the rest of the call
@@ -129,11 +130,26 @@ describe("sync RPC", () => {
       return input.agentId ?? null;
     }
 
-    const commandsByTerminalId = new Map<string, string>();
-    const runningTerminalIds = new Set<string>();
+    const hostCall = vi.fn(async (_method: string, input: { command: string }) => {
+      const agentId = agentIdFromCommand(input.command);
+      const stdout = agentId === "antigravity"
+        ? fakeHostScanOutput("antigravity", [{
+          day: new Date().toISOString().slice(0, 10),
+          modelProviderId: "google",
+          model: "gemini-4-ultra-preview",
+          loggedCostUsd: null,
+          uncachedInputTokens: 13814,
+          cachedInputTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 53,
+        }])
+        : fakeHostScanOutput(agentId ?? "codex", []);
+      return { stdout, stderr: "", exitCode: 0 };
+    });
 
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      hosts: { experimental_client: vi.fn(() => ({ call: hostCall })) },
       storage: {
         database: vi.fn(() => db),
         migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
@@ -147,37 +163,6 @@ describe("sync RPC", () => {
         hosts: {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
-        },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => {
-            if (runningTerminalIds.has(args.terminalId)) return { id: args.terminalId, status: "exited", exitCode: 0 };
-            runningTerminalIds.add(args.terminalId);
-            return { id: args.terminalId, status: "running", exitCode: null };
-          }),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandsByTerminalId.get(args.terminalId) ?? "";
-            const agentId = agentIdFromCommand(command);
-            const text = agentId === "antigravity"
-              ? fakeHostScanOutput("antigravity", [{
-                day: new Date().toISOString().slice(0, 10),
-                modelProviderId: "google",
-                model: "gemini-4-ultra-preview",
-                loggedCostUsd: null,
-                uncachedInputTokens: 13814,
-                cachedInputTokens: 0,
-                cacheWriteTokens: 0,
-                outputTokens: 53,
-              }])
-              : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          input: vi.fn(async () => undefined),
-          close: vi.fn(async () => undefined),
         },
       },
       realtime: { publish: vi.fn() },
@@ -335,144 +320,62 @@ describe("provider limit loading", () => {
 });
 
 describe("host command output", () => {
-  it("collects output while running, releases the bounded handshake, and closes cleanly", async () => {
-    const text = "query result\n__BB_HOST_COMMAND_DONE__:0\n";
-    const create = vi.fn(async (input: unknown) => ({ id: "terminal-1", status: "starting", input }));
-    const get = vi.fn()
-      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
-      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 0 });
-    const output = vi.fn(async () => ({
-      chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
-      truncated: false,
-    }));
-    const input = vi.fn(async () => undefined);
-    const close = vi.fn(async () => undefined);
-    const bb = { sdk: { terminals: { create, get, output, input, close } } } as unknown as BbPluginApi;
+  it("runs the command through the host worker without creating a terminal", async () => {
+    const signal = new AbortController().signal;
+    const call = vi.fn(async () => ({ stdout: "query result", stderr: "", exitCode: 0 }));
+    const client = { call } as unknown as Parameters<typeof runHostCommand>[0];
 
     await expect(runHostCommand(
-      bb,
+      client,
       { id: "host-1", name: "Machine" },
       "printf result",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
-    )).resolves.toBe(text);
+      signal,
+      { title: "Usage test", timeoutMs: 1_000 },
+    )).resolves.toBe("query result");
 
-    expect(output).toHaveBeenCalledOnce();
-    expect(input).toHaveBeenCalledWith({ terminalId: "terminal-1", dataBase64: "Cg==" });
-    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "if-clean" });
-    expect(create.mock.calls[0]?.[0]).toMatchObject({
-      start: { mode: "command", command: expect.stringContaining("__BB_HOST_COMMAND_DONE__") },
-    });
-    expect(create.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
-      start: expect.objectContaining({ command: expect.stringContaining("read -r -t 30") }),
-    }));
-    expect(create.mock.calls[0]?.[0]).not.toEqual(expect.objectContaining({
-      start: expect.objectContaining({ command: expect.stringContaining("while :") }),
-    }));
+    expect(call).toHaveBeenCalledWith(
+      "run",
+      { command: "printf result", timeoutMs: 1_000 },
+      { hostId: "host-1", signal },
+    );
   });
 
-  it("surfaces a command diagnostic after releasing a normal non-zero exit", async () => {
-    const text = "__BB_USAGE_ERROR__:OpenCode query failed\n__BB_HOST_COMMAND_DONE__:127\n";
-    const close = vi.fn(async () => undefined);
-    const input = vi.fn(async () => undefined);
-    const get = vi.fn()
-      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
-      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 127 });
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get,
-        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
-        input,
-        close,
-      } },
-    } as unknown as BbPluginApi;
+  it("surfaces a structured diagnostic from a non-zero command", async () => {
+    const client = {
+      call: vi.fn(async () => ({
+        stdout: "__BB_USAGE_ERROR__:OpenCode query failed\n",
+        stderr: "",
+        exitCode: 127,
+      })),
+    } as unknown as Parameters<typeof runHostCommand>[0];
 
     await expect(runHostCommand(
-      bb,
+      client,
       { id: "host-1", name: "Machine" },
       "exit 127",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1_000 },
     )).rejects.toThrow("OpenCode query failed");
-    expect(input).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "if-clean" });
   });
 
-  it("surfaces bounded terminal output when a command has no structured diagnostic", async () => {
-    const text = "CLI compatibility error\n__BB_HOST_COMMAND_DONE__:1\n";
-    const get = vi.fn()
-      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
-      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 1 });
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get,
-        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
-        input: vi.fn(async () => undefined),
-        close: vi.fn(async () => undefined),
-      } },
-    } as unknown as BbPluginApi;
+  it("uses bounded stderr as the fallback diagnostic", async () => {
+    const client = {
+      call: vi.fn(async () => ({
+        stdout: "",
+        stderr: "CLI compatibility error",
+        exitCode: 1,
+      })),
+    } as unknown as Parameters<typeof runHostCommand>[0];
 
     await expect(runHostCommand(
-      bb,
+      client,
       { id: "host-1", name: "Machine" },
       "exit 1",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1_000 },
     )).rejects.toThrow("CLI compatibility error");
   });
-
-  it("times out and force-closes a stalled machine terminal", async () => {
-    const close = vi.fn(async () => undefined);
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running", exitCode: null })),
-        output: vi.fn(async () => ({ chunks: [], truncated: false })),
-        input: vi.fn(async () => undefined),
-        close,
-      } },
-    } as unknown as BbPluginApi;
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Stalled machine" },
-      "opencode db query",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1, pollMs: 1 },
-    )).rejects.toThrow("timed out");
-    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
-  });
-
-  it("logs terminal cleanup failures", async () => {
-    const warn = vi.fn();
-    const text = "__BB_HOST_COMMAND_DONE__:0\n";
-    const get = vi.fn()
-      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
-      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 0 });
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get,
-        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
-        input: vi.fn(async () => undefined),
-        close: vi.fn(async () => { throw new Error("close failed"); }),
-      } },
-      log: { warn },
-    } as unknown as BbPluginApi;
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      "true",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
-    )).resolves.toBe(text);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("terminal cleanup failed: close failed"));
-  });
 });
-
 describe("collector concurrency", () => {
   it("runs no more than the configured number of tasks at once", async () => {
     let active = 0;
