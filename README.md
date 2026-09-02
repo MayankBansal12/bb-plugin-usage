@@ -12,7 +12,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Break usage down by model, project, or day.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
-- Show OpenCode Go plan windows (rolling 5-hour, weekly, and monthly) in the usage-limits section.
+- Show OpenCode Go, Claude Code, and Codex plan windows in the usage-limits section. The same subscription on several machines is one card with machine tags; different accounts stay separate cards in a horizontal grid.
 - Resolve model prices from [models.dev](https://models.dev), refreshed daily at runtime with the bundled snapshot as fallback, without inventing prices for ambiguous models.
 - Sync automatically every 15 minutes or manually from the dashboard.
 
