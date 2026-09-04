@@ -1,6 +1,5 @@
-import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi, type ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   parseHostUsageAggregates, parseOpenCode,
@@ -13,6 +12,7 @@ import {
   extractHostJsonScan,
   type HostJsonAgentId,
 } from "./lib/host-json-collector";
+import { hostCommandContract } from "./host-contract";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
@@ -371,12 +371,13 @@ async function syncJsonAgent(
   agentId: HostJsonAgentId,
   settings: CollectorSettings,
   signal: AbortSignal,
+  executeHostCommand: HostCommandExecutor,
 ) {
   const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   try {
     const roots = [...new Set(jsonAgentRoots(home, agentId, settings))];
     const cachePath = `${home}/.cache/bb-plugin-usage/json-log-scan-v1/${agentId}.json`;
-    const output = await runHostCommand(bb, machine, jsonAgentCommand({
+    const output = await executeHostCommand(machine, jsonAgentCommand({
       agentId,
       roots,
       cachePath,
@@ -417,67 +418,50 @@ async function syncJsonAgent(
   }
 }
 
-function delay(ms: number) {
-  return new Promise<void>((resolve) => setTimeout(resolve, ms));
-}
+type HostCommandOptions = { title: string; timeoutMs: number };
+type HostCommandClient = ExperimentalHostClient<typeof hostCommandContract>;
+type HostCommandExecutor = (
+  machine: Machine,
+  command: string,
+  signal: AbortSignal,
+  options: HostCommandOptions,
+) => Promise<string>;
 
-type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number };
-
-function heldHostCommand(command: string) {
-  return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '__BB_HOST_COMMAND_DONE__' "$bb_usage_status"; while :; do sleep 3600; done`;
-}
-
-function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["terminals"]["output"]>>) {
-  return output.chunks.sort((a, b) => a.seq - b.seq)
-    .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
+export async function runWithConcurrency<T>(tasks: readonly (() => Promise<T>)[], limit: number): Promise<T[]> {
+  if (!Number.isInteger(limit) || limit < 1) throw new Error("Concurrency limit must be a positive integer.");
+  const results = new Array<T>(tasks.length);
+  let nextTask = 0;
+  async function worker() {
+    while (nextTask < tasks.length) {
+      const index = nextTask++;
+      results[index] = await tasks[index]!();
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, tasks.length) }, () => worker()));
+  return results;
 }
 
 export async function runHostCommand(
-  bb: BbPluginApi,
+  client: HostCommandClient,
   machine: Machine,
   command: string,
   signal: AbortSignal,
   options: HostCommandOptions,
 ) {
-  const terminal = await bb.sdk.terminals.create({
-    scope: { kind: "host_path", hostId: machine.id, cwd: null },
-    cols: 120,
-    rows: 24,
-    title: options.title,
-    start: { mode: "command", command: heldHostCommand(command) },
+  const result = await client.call("run", {
+    command,
+    timeoutMs: options.timeoutMs,
+  }, {
+    hostId: machine.id,
+    signal,
   });
-  try {
-    const deadline = Date.now() + options.timeoutMs;
-    while (Date.now() < deadline) {
-      const state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
-      if (state.status === "running") {
-        const output = await bb.sdk.terminals.output({
-          terminalId: terminal.id,
-          tailBytes: 900_000,
-          limitChunks: 4000,
-          signal,
-        });
-        if (output.truncated) throw new Error(`${options.title} exceeded the 900 KB output limit.`);
-        const text = terminalOutputText(output);
-        const completion = text.match(/__BB_HOST_COMMAND_DONE__:(\d+)/);
-        if (completion) {
-          const exitCode = Number(completion[1]);
-          if (exitCode !== 0) {
-            const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
-              ?? text.replace(/__BB_HOST_COMMAND_DONE__:\d+/g, "").trim().slice(-300);
-            throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
-          }
-          return text;
-        }
-      } else if (state.status !== "starting" && state.status !== "disconnected") {
-        throw new Error(`${options.title} stopped before its output could be collected.`);
-      }
-      await delay(options.pollMs ?? 200);
-    }
-    throw new Error(`${options.title} timed out after ${Math.ceil(options.timeoutMs / 1000)} seconds.`);
-  } finally {
-    await bb.sdk.terminals.close({ terminalId: terminal.id, mode: "force" }).catch(() => { /* already closed by the host */ });
+  const text = `${result.stdout}${result.stderr ? `${result.stdout ? "\n" : ""}${result.stderr}` : ""}`;
+  if (result.exitCode !== 0) {
+    const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
+      ?? text.trim().slice(-300);
+    throw new Error(diagnostic || `${options.title} exited with code ${result.exitCode}.`);
   }
+  return text;
 }
 
 // OpenCode usage is collected on the enrolled HOST (via `opencode db`), so the
@@ -541,13 +525,13 @@ export async function syncOpenCode(
   db: Database,
   machine: Machine,
   signal: AbortSignal,
-  executeHostCommand = runHostCommand,
+  executeHostCommand: HostCommandExecutor,
 ) {
   const agentId: AgentId = "opencode";
   const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const sourceId = opaqueId(machine.id, agentId, "opencode-cli-db-v1");
   try {
-    const output = await executeHostCommand(bb, machine, openCodeCommand(), signal, {
+    const output = await executeHostCommand(machine, openCodeCommand(), signal, {
       title: "Usage: OpenCode scan",
       timeoutMs: OPENCODE_SYNC_TIMEOUT_MS,
     });
@@ -582,11 +566,11 @@ export async function syncOpenCodeGo(
   db: Database,
   machine: Machine,
   signal: AbortSignal,
-  executeHostCommand = runHostCommand,
+  executeHostCommand: HostCommandExecutor,
 ) {
   const attemptedAt = new Date().toISOString();
   try {
-    const output = await executeHostCommand(bb, machine, openCodeGoUsageCommand(), signal, {
+    const output = await executeHostCommand(machine, openCodeGoUsageCommand(), signal, {
       title: "Usage: OpenCode Go limits",
       timeoutMs: OPENCODE_GO_SYNC_TIMEOUT_MS,
     });
@@ -723,6 +707,10 @@ export default async function plugin(bb: BbPluginApi) {
       default: "",
     },
   });
+  const hostCommandClient = bb.hosts.experimental_client({ contract: hostCommandContract });
+  const executeHostCommand: HostCommandExecutor = (machine, command, signal, options) => (
+    runHostCommand(hostCommandClient, machine, command, signal, options)
+  );
   const db = bb.storage.database();
   bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration]);
   activateCachedCatalog(db);
@@ -757,17 +745,17 @@ export default async function plugin(bb: BbPluginApi) {
           for (const agent of AGENTS) upsertState(db, machine.id, agent.id, "unavailable", countForMachine(db, machine.id, agent.id), message, false);
           continue;
         }
-        await Promise.all([
-          syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
-        ]);
+        await runWithConcurrency([
+          () => syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+          () => syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal), executeHostCommand),
+        ], 3);
       }
       return new Date().toISOString();
     });
