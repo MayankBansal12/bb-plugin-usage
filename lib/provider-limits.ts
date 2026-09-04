@@ -8,6 +8,153 @@ export type ProviderLimitWindow = {
   };
 };
 
+export type ProviderLimitSource = {
+  machineId: string;
+  machineName: string;
+  agentId: string;
+  agentName: string;
+  providerId: string;
+  providerName: string;
+  accountEmail: string | null;
+  planLabel: string | null;
+  windows: ProviderLimitWindow[];
+  status: "ok" | "error";
+  error: string | null;
+  lastUpdatedAt: string | null;
+};
+
+export type UnifiedProviderLimit = {
+  id: string;
+  providerId: string;
+  providerName: string;
+  accountEmail: string | null;
+  planLabel: string | null;
+  windows: ProviderLimitWindow[];
+  status: "ok" | "error";
+  error: string | null;
+  lastUpdatedAt: string | null;
+  machines: Array<{
+    machineId: string;
+    machineName: string;
+    agents: Array<{ id: string; name: string }>;
+    windows: ProviderLimitWindow[];
+    status: "ok" | "error";
+    error: string | null;
+    lastUpdatedAt: string | null;
+  }>;
+};
+
+function normalizedIdentity(value: string | null) {
+  return value?.trim().toLocaleLowerCase() || null;
+}
+
+function subscriptionId(source: ProviderLimitSource, knownAccounts: Map<string, Set<string>>) {
+  const account = normalizedIdentity(source.accountEmail);
+  const providerAccounts = knownAccounts.get(source.providerId);
+  const inferredAccount = !account && providerAccounts?.size === 1 ? [...providerAccounts][0] : null;
+  const fallbackPlan = normalizedIdentity(source.planLabel) ?? "unknown-plan";
+  return `${source.providerId}\0${account || inferredAccount ? `account:${account ?? inferredAccount}` : `plan:${fallbackPlan}`}`;
+}
+
+function latestTimestamp(values: Array<string | null>) {
+  return values.filter((value): value is string => value !== null)
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0] ?? null;
+}
+
+function combinedError(sources: ProviderLimitSource[]) {
+  const errors = [...new Set(sources.map((source) => source.error).filter((error): error is string => Boolean(error)))];
+  return errors.length > 0 ? errors.join("; ") : null;
+}
+
+export function mergeLimitWindows(sources: ProviderLimitSource[]) {
+  const order: string[] = [];
+  const windows = new Map<string, ProviderLimitWindow>();
+  for (const source of sources) {
+    for (const window of source.windows) {
+      const key = window.label.trim().toLocaleLowerCase();
+      const current = windows.get(key);
+      if (!current) {
+        order.push(key);
+        windows.set(key, window.cost
+          ? { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt, cost: { ...window.cost } }
+          : { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt });
+        continue;
+      }
+      const currentReset = current.resetsAt ? Date.parse(current.resetsAt) : Number.NaN;
+      const nextReset = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
+      const resetsAt = Number.isFinite(nextReset) && (!Number.isFinite(currentReset) || nextReset > currentReset)
+        ? window.resetsAt
+        : current.resetsAt;
+      const cost = current.cost || window.cost
+        ? {
+            usedUsdCents: Math.max(current.cost?.usedUsdCents ?? 0, window.cost?.usedUsdCents ?? 0),
+            limitUsdCents: Math.max(current.cost?.limitUsdCents ?? 0, window.cost?.limitUsdCents ?? 0),
+          }
+        : undefined;
+      windows.set(key, {
+        label: current.label,
+        usedPercent: Math.max(current.usedPercent, window.usedPercent),
+        resetsAt,
+        ...(cost ? { cost } : {}),
+      });
+    }
+  }
+  return order.map((key) => windows.get(key)!);
+}
+
+export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProviderLimit[] {
+  const knownAccounts = new Map<string, Set<string>>();
+  for (const source of sources) {
+    const account = normalizedIdentity(source.accountEmail);
+    if (!account) continue;
+    const accounts = knownAccounts.get(source.providerId) ?? new Set<string>();
+    accounts.add(account);
+    knownAccounts.set(source.providerId, accounts);
+  }
+
+  const subscriptions = new Map<string, ProviderLimitSource[]>();
+  for (const source of sources) {
+    const id = subscriptionId(source, knownAccounts);
+    const group = subscriptions.get(id) ?? [];
+    group.push(source);
+    subscriptions.set(id, group);
+  }
+
+  return Array.from(subscriptions, ([id, group]) => {
+    const machineGroups = new Map<string, ProviderLimitSource[]>();
+    for (const source of group) {
+      const machineGroup = machineGroups.get(source.machineId) ?? [];
+      machineGroup.push(source);
+      machineGroups.set(source.machineId, machineGroup);
+    }
+    const machines = Array.from(machineGroups, ([machineId, machineSources]) => ({
+      machineId,
+      machineName: machineSources[0]?.machineName ?? "Unknown machine",
+      agents: Array.from(
+        new Map(machineSources.map((source) => [source.agentId, { id: source.agentId, name: source.agentName }])).values(),
+      ),
+      windows: mergeLimitWindows(machineSources),
+      status: machineSources.some((source) => source.status === "ok") ? "ok" as const : "error" as const,
+      error: combinedError(machineSources),
+      lastUpdatedAt: latestTimestamp(machineSources.map((source) => source.lastUpdatedAt)),
+    })).sort((left, right) => left.machineName.localeCompare(right.machineName));
+    const status = group.some((source) => source.status === "ok") ? "ok" as const : "error" as const;
+    return {
+      id,
+      providerId: group[0]!.providerId,
+      providerName: group[0]!.providerName,
+      accountEmail: group.find((source) => source.accountEmail)?.accountEmail ?? null,
+      planLabel: group.find((source) => source.planLabel)?.planLabel ?? null,
+      windows: mergeLimitWindows(group),
+      status,
+      error: status === "error" ? combinedError(group) : null,
+      lastUpdatedAt: latestTimestamp(group.map((source) => source.lastUpdatedAt)),
+      machines,
+    };
+  }).sort((left, right) => left.providerName.localeCompare(right.providerName)
+    || (left.accountEmail ?? left.planLabel ?? "").localeCompare(right.accountEmail ?? right.planLabel ?? ""));
+}
+
 export function clampPercent(value: number) {
   return Math.min(100, Math.max(0, value));
 }

@@ -326,6 +326,28 @@ describe("provider limit loading", () => {
     })]);
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
+
+  it("queries connected machines one after another", async () => {
+    const usageLimits = vi.fn(async ({ hostId }: { hostId: string }) => ({
+      "claude-code": {
+        status: "ok",
+        planLabel: "Max",
+        accountEmail: "dev@example.com",
+        windows: [{ label: "5 hours", usedPercent: hostId === "host_1" ? 30 : 32, resetsAt: null }],
+      },
+    }));
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    const sources = await loadProviderLimits(bb, [
+      { id: "host_1", name: "Studio", status: "connected" },
+      { id: "host_2", name: "Air", status: "connected" },
+    ], emptyDb(), 1_000);
+    expect(sources).toHaveLength(2);
+    expect(usageLimits.mock.calls.map((call) => call[0].hostId)).toEqual(["host_1", "host_2"]);
+  });
 });
 
 describe("host command output", () => {

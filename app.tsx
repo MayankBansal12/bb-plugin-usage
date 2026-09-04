@@ -110,15 +110,16 @@ type DashboardData = {
     error: string | null;
   }>;
   providerLimits: Array<{
-    machineId: string;
-    machineName: string;
+    id: string;
     providerId: string;
     providerName: string;
+    accountEmail: string | null;
     planLabel: string | null;
     windows: ProviderLimitWindow[];
     status: "ok" | "error";
     error: string | null;
     lastUpdatedAt: string | null;
+    machines: Array<{ machineId: string; machineName: string }>;
   }>;
   sync: UsageSyncSnapshot;
   notice: string;
@@ -670,19 +671,11 @@ function ProviderLimits({
   limits: DashboardData["providerLimits"];
   contentWidth: number;
 }) {
-  const machineMap = new Map<string, DashboardData["providerLimits"]>();
-  for (const limit of limits) {
-    const providers = machineMap.get(limit.machineId) ?? [];
-    providers.push(limit);
-    machineMap.set(limit.machineId, providers);
-  }
-  const machines = Array.from(machineMap, ([machineId, providers]) => ({
-    machineId,
-    machineName: providers[0]?.machineName ?? "Unknown machine",
-    providers,
-  }));
-  const columnCount = contentWidth < 640 ? 1 : contentWidth < 1080 ? 2 : 3;
-  const constrainHeight = contentWidth >= 1024;
+  const showMachineTags = limits.some((limit) => limit.machines.length > 1)
+    || new Set(limits.flatMap((limit) => limit.machines.map((machine) => machine.machineId))).size > 1;
+  const availableColumns =
+    contentWidth > 0 && contentWidth < 640 ? 1 : contentWidth > 0 && contentWidth < 900 ? 2 : 3;
+  const columnCount = Math.max(1, Math.min(availableColumns, limits.length || 1));
 
   return (
     <section className="rounded-xl border border-border/70 bg-muted/[0.08] p-4 sm:p-5" aria-labelledby="provider-limits-title">
@@ -690,77 +683,81 @@ function ProviderLimits({
         <h2 id="provider-limits-title" className="text-sm font-medium">Usage limits</h2>
         <span className="text-xs text-muted-foreground">Current plan windows</span>
       </div>
-      {machines.length === 0 ? (
+      {limits.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
       ) : (
         <div
-          className={`mt-4 grid gap-3 ${constrainHeight ? "max-h-60 overflow-y-auto pr-1" : ""}`}
+          className="mt-4 grid gap-3"
           style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
         >
-          {machines.map((machine) => (
+          {limits.map((limit) => (
             <div
-              key={machine.machineId}
+              key={limit.id}
               className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
             >
-              <div className="truncate text-[11px] font-medium leading-4 text-muted-foreground" title={machine.machineName}>
-                {machine.machineName}
+              <div className="flex min-w-0 items-center justify-between gap-3">
+                <span className="flex min-w-0 items-center gap-2">
+                  <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
+                  <span className="truncate text-xs font-medium">{limit.providerName}</span>
+                </span>
+                {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
               </div>
-              <div className="mt-2 divide-y divide-border/50 border-t border-border/50">
-                {machine.providers.map((limit) => (
-                  <div key={limit.providerId} className="py-2.5 first:pt-2 last:pb-0.5">
-                    <div className="flex min-w-0 items-center justify-between gap-3">
-                      <span className="flex min-w-0 items-center gap-2">
-                        <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
-                        <span className="truncate text-xs font-medium">{limit.providerName}</span>
-                      </span>
-                      {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
-                    </div>
-                    {limit.status === "error" && (
-                      <div className="mt-2 flex items-start gap-1.5">
-                        <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-                        <p className="text-[10px] leading-4 text-destructive/90">
-                          {limit.error ? `Couldn’t load ${limit.providerName} limits: ${limit.error}` : `${limit.providerName} limits unavailable`}
-                          {limit.windows.length > 0
-                            ? ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
-                            : ""}
-                        </p>
+              {showMachineTags ? (
+                <div className="mt-1.5 flex flex-wrap gap-1">
+                  {limit.machines.map((machine) => (
+                    <span
+                      key={machine.machineId}
+                      className="inline-flex max-w-full truncate rounded-md border border-border/50 bg-muted/40 px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground"
+                      title={machine.machineName}
+                    >
+                      {machine.machineName}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {limit.status === "error" && (
+                <div className="mt-2 flex items-start gap-1.5">
+                  <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+                  <p className="text-[10px] leading-4 text-destructive/90">
+                    {limit.error ? `Couldn’t load ${limit.providerName} limits: ${limit.error}` : `${limit.providerName} limits unavailable`}
+                    {limit.windows.length > 0
+                      ? ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
+                      : ""}
+                  </p>
+                </div>
+              )}
+              {limit.windows.length > 0 && (
+                <div className="mt-1.5 space-y-1.5">
+                  {limit.windows.map((window, index) => {
+                    const reset = formatLimitReset(window.resetsAt);
+                    const usedPercent = clampPercent(window.usedPercent);
+                    return (
+                      <div key={`${window.label}:${index}`}>
+                        <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
+                          <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
+                          <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
+                        </div>
+                        <div
+                          className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
+                          role="progressbar"
+                          aria-label={`${limit.providerName} ${window.label}`}
+                          aria-valuemin={0}
+                          aria-valuemax={100}
+                          aria-valuenow={Math.round(usedPercent)}
+                        >
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              width: `${usedPercent}%`,
+                              backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(limit.providerId),
+                            }}
+                          />
+                        </div>
                       </div>
-                    )}
-                    {limit.windows.length > 0 && (
-                      <div className="mt-1.5 space-y-1.5">
-                      {limit.windows.map((window, index) => {
-                        const reset = formatLimitReset(window.resetsAt);
-                        const usedPercent = clampPercent(window.usedPercent);
-                        return (
-                          <div key={`${window.label}:${index}`}>
-                            <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
-                              <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
-                              <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
-                            </div>
-                            <div
-                              className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
-                              role="progressbar"
-                              aria-label={`${machine.machineName} ${limit.providerName} ${window.label}`}
-                              aria-valuemin={0}
-                              aria-valuemax={100}
-                              aria-valuenow={Math.round(usedPercent)}
-                            >
-                              <div
-                                className="h-full rounded-full"
-                                style={{
-                                  width: `${usedPercent}%`,
-                                  backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(limit.providerId),
-                                }}
-                              />
-                            </div>
-                          </div>
-                        );
-                      })}
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ))}
         </div>
@@ -1141,7 +1138,9 @@ function UsageDashboard() {
     : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
-  const visibleProviderLimits = data.providerLimits.filter((limit) => machine === "all" || limit.machineId === machine);
+  const visibleProviderLimits = data.providerLimits.filter((limit) =>
+    machine === "all" || limit.machines.some((item) => item.machineId === machine)
+  );
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day`, values: dailySeries.processed, color: FALLBACK_PROVIDER_COLORS[0] },
