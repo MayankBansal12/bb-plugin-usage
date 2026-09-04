@@ -327,15 +327,23 @@ describe("provider limit loading", () => {
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
 
-  it("queries connected machines one after another", async () => {
-    const usageLimits = vi.fn(async ({ hostId }: { hostId: string }) => ({
-      "claude-code": {
-        status: "ok",
-        planLabel: "Max",
-        accountEmail: "dev@example.com",
-        windows: [{ label: "5 hours", usedPercent: hostId === "host_1" ? 30 : 32, resetsAt: null }],
-      },
-    }));
+  it("queries connected machines concurrently", async () => {
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    const usageLimits = vi.fn(async ({ hostId }: { hostId: string }) => {
+      activeCalls += 1;
+      maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      activeCalls -= 1;
+      return {
+        "claude-code": {
+          status: "ok",
+          planLabel: "Max",
+          accountEmail: "dev@example.com",
+          windows: [{ label: "5 hours", usedPercent: hostId === "host_1" ? 30 : 32, resetsAt: null }],
+        },
+      };
+    });
     const bb = {
       sdk: { system: { usageLimits } },
       log: { debug: vi.fn() },
@@ -346,6 +354,7 @@ describe("provider limit loading", () => {
       { id: "host_2", name: "Air", status: "connected" },
     ], emptyDb(), 1_000);
     expect(sources).toHaveLength(2);
+    expect(maxActiveCalls).toBe(2);
     expect(usageLimits.mock.calls.map((call) => call[0].hostId)).toEqual(["host_1", "host_2"]);
   });
 });

@@ -59,9 +59,10 @@ export const rpcContract = defineRpcContract({
   dashboard: { input: z.null(), output: z.object({
     mode: z.literal("live"), generatedAt: z.string(), lastSyncedAt: z.string().nullable(), pricingVersion: z.string(),
     machines: z.array(filterOptionSchema), agents: z.array(filterOptionSchema), modelProviders: z.array(filterOptionSchema),
-    records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), providerLimits: z.array(providerLimitSchema),
+    records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema),
     sync: syncStateSchema, notice: z.string(),
   }) },
+  providerLimits: { input: z.null(), output: z.array(providerLimitSchema) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
 
@@ -85,7 +86,7 @@ const LIMIT_PROVIDERS = [
   { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
   { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
 ] as const;
-const PROVIDER_LIMITS_TIMEOUT_MS = 180_000;
+const PROVIDER_LIMITS_TIMEOUT_MS = 5_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
@@ -108,8 +109,8 @@ export async function loadProviderLimits(
   db: Database,
   timeoutMs = PROVIDER_LIMITS_TIMEOUT_MS,
 ): Promise<ProviderLimitSource[]> {
-  const rows: ProviderLimitSource[] = [];
-  for (const machine of machines.filter((candidate) => candidate.status === "connected")) {
+  const machineRows = await Promise.all(machines.filter((candidate) => candidate.status === "connected").map(async (machine) => {
+    const rows: ProviderLimitSource[] = [];
     const presentRows = db.prepare(`SELECT DISTINCT s.provider_id agentId FROM usage_sources s
       JOIN usage_event_sources es ON es.source_id = s.source_id
       WHERE s.machine_id = ? AND s.provider_id IN (?, ?, ?)`)
@@ -160,8 +161,9 @@ export async function loadProviderLimits(
           lastUpdatedAt: null,
         })));
     }
-  }
-  return rows;
+    return rows;
+  }));
+  return machineRows.flat();
 }
 
 const migration = `
@@ -781,23 +783,42 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   };
 
-  bb.rpc.register(rpcContract, {
-    async dashboard() {
-      let machines: Array<Machine & { status: string }>;
-      try {
-        machines = (await bb.sdk.hosts.list({ signal: AbortSignal.timeout(DASHBOARD_HOSTS_TIMEOUT_MS) }))
-          .map((host) => ({ id: host.id, name: host.name, status: host.status }));
-      } catch (error) {
-        bb.log.warn(`Machine list unavailable: ${errorMessage(error)}`);
-        machines = db.prepare(`SELECT machine_id id, MAX(machine_name) name, 'unavailable' status
-          FROM usage_sources GROUP BY machine_id ORDER BY name`).all() as typeof machines;
-      }
-      const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
-      const connectedMachineIds = new Set(machines.filter((machine) => machine.status === "connected").map((machine) => machine.id));
-      const providerLimits = groupProviderLimits([
+  const loadMachines = async (): Promise<Array<Machine & { status: string }>> => {
+    try {
+      return (await bb.sdk.hosts.list({ signal: AbortSignal.timeout(DASHBOARD_HOSTS_TIMEOUT_MS) }))
+        .map((host) => ({ id: host.id, name: host.name, status: host.status }));
+    } catch (error) {
+      bb.log.warn(`Machine list unavailable: ${errorMessage(error)}`);
+      return db.prepare(`SELECT machine_id id, MAX(machine_name) name, 'unavailable' status
+        FROM usage_sources GROUP BY machine_id ORDER BY name`)
+        .all() as Array<Machine & { status: string }>;
+    }
+  };
+
+  let providerLimitsRequest: Promise<Array<z.infer<typeof providerLimitSchema>>> | null = null;
+  const readProviderLimits = async () => {
+    if (providerLimitsRequest) return providerLimitsRequest;
+    providerLimitsRequest = (async () => {
+      const machines = await loadMachines();
+      const connectedMachineIds = new Set(
+        machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
+      );
+      return groupProviderLimits([
         ...await loadProviderLimits(bb, machines, db),
         ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
       ]);
+    })();
+    try {
+      return await providerLimitsRequest;
+    } finally {
+      providerLimitsRequest = null;
+    }
+  };
+
+  bb.rpc.register(rpcContract, {
+    async dashboard() {
+      const machines = await loadMachines();
+      const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
@@ -815,11 +836,11 @@ export default async function plugin(bb: BbPluginApi) {
         modelProviders,
         records,
         sources,
-        providerLimits,
         sync,
         notice: "Prompts and message content are never stored.",
       };
     },
+    providerLimits: readProviderLimits,
     sync() {
       void syncAll().catch((error) => bb.log.error(`Usage sync failed: ${errorMessage(error)}`));
       return { ok: true as const };

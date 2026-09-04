@@ -46,7 +46,7 @@ describe("provider limit presentation", () => {
     expect(grouped[0]?.machines.map((machine) => machine.machineName).sort()).toEqual(["Air", "Studio"]);
   });
 
-  it("keeps different accounts and unlabeled different plans on separate cards", () => {
+  it("keeps different accounts and unidentified subscriptions on separate cards", () => {
     const base = {
       machineId: "one", machineName: "Studio", agentId: "claude", agentName: "Claude Code",
       providerId: "claude", providerName: "Claude Code", windows: [{ label: "5 hours", usedPercent: 10, resetsAt: null }],
@@ -58,7 +58,48 @@ describe("provider limit presentation", () => {
     ])).toHaveLength(2);
     expect(groupProviderLimits([
       { ...base, accountEmail: null, planLabel: "Max" },
-      { ...base, machineId: "two", machineName: "Air", accountEmail: null, planLabel: "Pro" },
+      { ...base, machineId: "two", machineName: "Air", accountEmail: null, planLabel: "Max" },
     ])).toHaveLength(2);
+    expect(groupProviderLimits([
+      { ...base, accountEmail: "first@example.com", planLabel: "Max" },
+      { ...base, machineId: "two", machineName: "Air", accountEmail: null, planLabel: "Max" },
+    ])).toHaveLength(2);
+  });
+
+  it("uses one coherent observation from the newest reset cycle", () => {
+    const shared = {
+      providerId: "claude", providerName: "Claude Code", accountEmail: "dev@example.com", planLabel: "Max",
+      agentId: "claude", agentName: "Claude Code", status: "ok" as const, error: null, lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      { ...shared, machineId: "one", machineName: "Studio", windows: [{
+        label: "5 hours", usedPercent: 95, resetsAt: "2026-08-11T12:00:00.000Z",
+        cost: { usedUsdCents: 9500, limitUsdCents: 10000 },
+      }] },
+      { ...shared, machineId: "two", machineName: "Air", windows: [{
+        label: "5 hours", usedPercent: 5, resetsAt: "2026-08-11T17:00:00.000Z",
+        cost: { usedUsdCents: 500, limitUsdCents: 10000 },
+      }] },
+    ]);
+    expect(grouped[0]?.windows[0]).toEqual({
+      label: "5 hours", usedPercent: 5, resetsAt: "2026-08-11T17:00:00.000Z",
+      cost: { usedUsdCents: 500, limitUsdCents: 10000 },
+    });
+  });
+
+  it("retains a machine error when another machine has usable limits", () => {
+    const shared = {
+      providerId: "claude", providerName: "Claude Code", accountEmail: "dev@example.com", planLabel: "Max",
+      agentId: "claude", agentName: "Claude Code", lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      { ...shared, machineId: "one", machineName: "Studio", status: "ok" as const, error: null,
+        windows: [{ label: "5 hours", usedPercent: 30, resetsAt: null }] },
+      { ...shared, machineId: "two", machineName: "Air", status: "error" as const, error: "rate limited", windows: [] },
+    ]);
+    expect(grouped[0]).toMatchObject({ status: "ok", error: "rate limited" });
+    expect(grouped[0]?.machines.find((machine) => machine.machineId === "two")).toMatchObject({
+      status: "error", error: "rate limited",
+    });
   });
 });

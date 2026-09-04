@@ -91,6 +91,27 @@ type UsageRecord = {
   outputTokens: number;
 };
 
+type ProviderLimitData = Array<{
+  id: string;
+  providerId: string;
+  providerName: string;
+  accountEmail: string | null;
+  planLabel: string | null;
+  windows: ProviderLimitWindow[];
+  status: "ok" | "error";
+  error: string | null;
+  lastUpdatedAt: string | null;
+  machines: Array<{
+    machineId: string;
+    machineName: string;
+    agents: Array<{ id: string; name: string }>;
+    windows: ProviderLimitWindow[];
+    status: "ok" | "error";
+    error: string | null;
+    lastUpdatedAt: string | null;
+  }>;
+}>;
+
 type DashboardData = {
   mode: "live";
   generatedAt: string;
@@ -108,18 +129,6 @@ type DashboardData = {
     lastSuccessAt: string | null;
     recordCount: number;
     error: string | null;
-  }>;
-  providerLimits: Array<{
-    id: string;
-    providerId: string;
-    providerName: string;
-    accountEmail: string | null;
-    planLabel: string | null;
-    windows: ProviderLimitWindow[];
-    status: "ok" | "error";
-    error: string | null;
-    lastUpdatedAt: string | null;
-    machines: Array<{ machineId: string; machineName: string }>;
   }>;
   sync: UsageSyncSnapshot;
   notice: string;
@@ -667,9 +676,13 @@ function RowBadge({ children }: { children: ReactNode }) {
 function ProviderLimits({
   limits,
   contentWidth,
+  loading,
+  error,
 }: {
-  limits: DashboardData["providerLimits"];
+  limits: ProviderLimitData;
   contentWidth: number;
+  loading: boolean;
+  error: string | null;
 }) {
   const showMachineTags = limits.some((limit) => limit.machines.length > 1)
     || new Set(limits.flatMap((limit) => limit.machines.map((machine) => machine.machineId))).size > 1;
@@ -683,7 +696,12 @@ function ProviderLimits({
         <h2 id="provider-limits-title" className="text-sm font-medium">Usage limits</h2>
         <span className="text-xs text-muted-foreground">Current plan windows</span>
       </div>
-      {limits.length === 0 ? (
+      {error && (
+        <p className="mt-2 text-xs text-destructive" role="alert">Couldn’t refresh usage limits: {error}</p>
+      )}
+      {loading && limits.length === 0 ? (
+        <p className="mt-2 text-xs text-muted-foreground">Loading provider limits…</p>
+      ) : limits.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
       ) : (
         <div
@@ -708,19 +726,23 @@ function ProviderLimits({
                     <span
                       key={machine.machineId}
                       className="inline-flex max-w-full truncate rounded-md border border-border/50 bg-muted/40 px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground"
-                      title={machine.machineName}
+                      title={machine.error ? `${machine.machineName}: ${machine.error}` : machine.machineName}
                     >
                       {machine.machineName}
                     </span>
                   ))}
                 </div>
               ) : null}
-              {limit.status === "error" && (
+              {limit.error && (
                 <div className="mt-2 flex items-start gap-1.5">
                   <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
                   <p className="text-[10px] leading-4 text-destructive/90">
-                    {limit.error ? `Couldn’t load ${limit.providerName} limits: ${limit.error}` : `${limit.providerName} limits unavailable`}
-                    {limit.windows.length > 0
+                    {limit.status === "error"
+                      ? `Couldn’t load ${limit.providerName} limits: ${limit.error}`
+                      : `Some machines couldn’t refresh ${limit.providerName}: ${limit.machines
+                        .filter((machine) => machine.status === "error")
+                        .map((machine) => machine.machineName).join(", ")}. ${limit.error}`}
+                    {limit.status === "error" && limit.windows.length > 0
                       ? ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
                       : ""}
                   </p>
@@ -740,7 +762,7 @@ function ProviderLimits({
                         <div
                           className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
                           role="progressbar"
-                          aria-label={`${limit.providerName} ${window.label}`}
+                          aria-label={`${limit.providerName} ${limit.accountEmail ?? limit.planLabel ?? limit.machines.map((machine) => machine.machineName).join(", ")} ${window.label}`}
                           aria-valuemin={0}
                           aria-valuemax={100}
                           aria-valuenow={Math.round(usedPercent)}
@@ -884,6 +906,10 @@ function UsageDashboard() {
   const hasConnected = useRef(false);
   const [data, setData] = useState<DashboardData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [providerLimits, setProviderLimits] = useState<ProviderLimitData>([]);
+  const [providerLimitsError, setProviderLimitsError] = useState<string | null>(null);
+  const [providerLimitsLoading, setProviderLimitsLoading] = useState(false);
+  const providerLimitsRequestId = useRef(0);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
   const [chartMode, setChartMode] = useState<ChartMode>("cost");
@@ -906,6 +932,22 @@ function UsageDashboard() {
     } catch (reason) {
       setSyncRequested(false);
       setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [rpc]);
+
+  const loadProviderLimits = useCallback(async () => {
+    const requestId = ++providerLimitsRequestId.current;
+    setProviderLimitsLoading(true);
+    setProviderLimitsError(null);
+    try {
+      const nextLimits = await rpc.call("providerLimits");
+      if (providerLimitsRequestId.current !== requestId) return;
+      setProviderLimits(nextLimits);
+    } catch (reason) {
+      if (providerLimitsRequestId.current !== requestId) return;
+      setProviderLimitsError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (providerLimitsRequestId.current === requestId) setProviderLimitsLoading(false);
     }
   }, [rpc]);
 
@@ -941,13 +983,27 @@ function UsageDashboard() {
     }
   }, [data, machine]);
 
+  useEffect(() => {
+    if (!showUsageLimits) {
+      providerLimitsRequestId.current += 1;
+      setProviderLimitsLoading(false);
+      return;
+    }
+    void loadProviderLimits();
+  }, [loadProviderLimits, showUsageLimits]);
+
   useEffect(() => { void load(); }, [load]);
-  useRealtime("usage-updated", () => { void load(); });
+  useRealtime("usage-updated", () => {
+    void load();
+    if (showUsageLimits) void loadProviderLimits();
+  });
   useEffect(() => {
     if (realtimeState !== "connected") return;
-    if (hasConnected.current) void load();
-    else hasConnected.current = true;
-  }, [load, realtimeState]);
+    if (hasConnected.current) {
+      void load();
+      if (showUsageLimits) void loadProviderLimits();
+    } else hasConnected.current = true;
+  }, [load, loadProviderLimits, realtimeState, showUsageLimits]);
 
   useEffect(() => {
     if (!data || !shouldPollUsage(data.sync)) return;
@@ -1138,7 +1194,7 @@ function UsageDashboard() {
     : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
-  const visibleProviderLimits = data.providerLimits.filter((limit) =>
+  const visibleProviderLimits = providerLimits.filter((limit) =>
     machine === "all" || limit.machines.some((item) => item.machineId === machine)
   );
 
@@ -1158,7 +1214,12 @@ function UsageDashboard() {
         <UsageResponsiveControls />
 
         {showUsageLimits && (
-          <ProviderLimits limits={visibleProviderLimits} contentWidth={contentWidth} />
+          <ProviderLimits
+            limits={visibleProviderLimits}
+            contentWidth={contentWidth}
+            loading={providerLimitsLoading}
+            error={providerLimitsError}
+          />
         )}
 
         {rows.length === 0 ? (

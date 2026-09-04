@@ -48,12 +48,9 @@ function normalizedIdentity(value: string | null) {
   return value?.trim().toLocaleLowerCase() || null;
 }
 
-function subscriptionId(source: ProviderLimitSource, knownAccounts: Map<string, Set<string>>) {
+function subscriptionId(source: ProviderLimitSource) {
   const account = normalizedIdentity(source.accountEmail);
-  const providerAccounts = knownAccounts.get(source.providerId);
-  const inferredAccount = !account && providerAccounts?.size === 1 ? [...providerAccounts][0] : null;
-  const fallbackPlan = normalizedIdentity(source.planLabel) ?? "unknown-plan";
-  return `${source.providerId}\0${account || inferredAccount ? `account:${account ?? inferredAccount}` : `plan:${fallbackPlan}`}`;
+  return `${source.providerId}\0${account ? `account:${account}` : `machine:${source.machineId}`}`;
 }
 
 function latestTimestamp(values: Array<string | null>) {
@@ -82,39 +79,24 @@ export function mergeLimitWindows(sources: ProviderLimitSource[]) {
       }
       const currentReset = current.resetsAt ? Date.parse(current.resetsAt) : Number.NaN;
       const nextReset = window.resetsAt ? Date.parse(window.resetsAt) : Number.NaN;
-      const resetsAt = Number.isFinite(nextReset) && (!Number.isFinite(currentReset) || nextReset > currentReset)
-        ? window.resetsAt
-        : current.resetsAt;
-      const cost = current.cost || window.cost
-        ? {
-            usedUsdCents: Math.max(current.cost?.usedUsdCents ?? 0, window.cost?.usedUsdCents ?? 0),
-            limitUsdCents: Math.max(current.cost?.limitUsdCents ?? 0, window.cost?.limitUsdCents ?? 0),
-          }
-        : undefined;
-      windows.set(key, {
-        label: current.label,
-        usedPercent: Math.max(current.usedPercent, window.usedPercent),
-        resetsAt,
-        ...(cost ? { cost } : {}),
-      });
+      const nextIsNewerCycle = Number.isFinite(nextReset)
+        && (!Number.isFinite(currentReset) || nextReset > currentReset);
+      const sameCycle = current.resetsAt === window.resetsAt
+        || (!Number.isFinite(currentReset) && !Number.isFinite(nextReset));
+      if (nextIsNewerCycle || (sameCycle && window.usedPercent > current.usedPercent)) {
+        windows.set(key, window.cost
+          ? { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt, cost: { ...window.cost } }
+          : { label: window.label, usedPercent: window.usedPercent, resetsAt: window.resetsAt });
+      }
     }
   }
   return order.map((key) => windows.get(key)!);
 }
 
 export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProviderLimit[] {
-  const knownAccounts = new Map<string, Set<string>>();
-  for (const source of sources) {
-    const account = normalizedIdentity(source.accountEmail);
-    if (!account) continue;
-    const accounts = knownAccounts.get(source.providerId) ?? new Set<string>();
-    accounts.add(account);
-    knownAccounts.set(source.providerId, accounts);
-  }
-
   const subscriptions = new Map<string, ProviderLimitSource[]>();
   for (const source of sources) {
-    const id = subscriptionId(source, knownAccounts);
+    const id = subscriptionId(source);
     const group = subscriptions.get(id) ?? [];
     group.push(source);
     subscriptions.set(id, group);
@@ -147,7 +129,7 @@ export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProv
       planLabel: group.find((source) => source.planLabel)?.planLabel ?? null,
       windows: mergeLimitWindows(group),
       status,
-      error: status === "error" ? combinedError(group) : null,
+      error: combinedError(group),
       lastUpdatedAt: latestTimestamp(group.map((source) => source.lastUpdatedAt)),
       machines,
     };
