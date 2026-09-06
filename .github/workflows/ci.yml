@@ -30,7 +30,7 @@ jobs:
         run: npm ci
 
       - name: Install pinned BB build tool
-        run: npm install --global bb-app@0.42.0
+        run: npm install --global bb-app@0.39.0
 
       - name: Type check
         run: npm run check
