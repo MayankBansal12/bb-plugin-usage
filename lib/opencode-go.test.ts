@@ -73,11 +73,10 @@ printf '%s' "$FAKE_HTTP"
 
   let path = `${binDir}:${process.env.PATH ?? ""}`;
   if (nodeOnly) {
-    for (const [name, target] of [
-      ["cat", "/usr/bin/cat"],
-      ["mktemp", "/usr/bin/mktemp"],
-      ["rm", "/usr/bin/rm"],
-    ] as const) {
+    for (const name of ["cat", "mktemp", "rm"] as const) {
+      const resolved = spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf8" });
+      const target = resolved.stdout.trim();
+      if (resolved.status !== 0 || !target) throw new Error(`could not locate ${name} on PATH`);
       symlinkSync(target, join(binDir, name));
     }
     const nodePath = join(binDir, "node");

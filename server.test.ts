@@ -9,7 +9,7 @@ vi.mock("@bb/plugin-sdk", () => ({
 
 import plugin, {
   dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  openCodeCommand, openCodeSql, runHostCommand, syncOpenCode, syncOpenCodeGo,
+  openCodeCommand, openCodeSql, runHostCommand, runWithConcurrency, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 
 function localDay(ts: number): string {
@@ -97,7 +97,7 @@ describe("sync RPC", () => {
   it("actually dispatches an Antigravity scan through syncAll, not just through direct scan() calls", async () => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
-    // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
+    // jsonAgentRoots knew about "antigravity", but syncAll()'s collector list
     // never called syncJsonAgent(..., "antigravity", ...), so no scan ever
     // ran for it in production even though the unit tests (which call
     // scan()/parseHostUsageAggregates directly) all passed. This drives the
@@ -106,7 +106,7 @@ describe("sync RPC", () => {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
 
-    // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
+    // The command runs `node -e eval(gunzip(base64(...)))` through the host shell
     // where the gzipped payload is the generated collector script with
     // agentId/roots baked in as a literal object — decode it the same way
     // to tell which JSON-agent sync this particular terminal is for.
@@ -130,6 +130,7 @@ describe("sync RPC", () => {
     }
 
     const commandsByTerminalId = new Map<string, string>();
+    const runningTerminalIds = new Set<string>();
 
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
@@ -153,7 +154,11 @@ describe("sync RPC", () => {
             commandsByTerminalId.set(id, input.start.command);
             return { id, status: "starting" };
           }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          get: vi.fn(async (args: { terminalId: string }) => {
+            if (runningTerminalIds.has(args.terminalId)) return { id: args.terminalId, status: "exited", exitCode: 0 };
+            runningTerminalIds.add(args.terminalId);
+            return { id: args.terminalId, status: "running", exitCode: null };
+          }),
           output: vi.fn(async (args: { terminalId: string }) => {
             const command = commandsByTerminalId.get(args.terminalId) ?? "";
             const agentId = agentIdFromCommand(command);
@@ -171,6 +176,7 @@ describe("sync RPC", () => {
               : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
             return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
           }),
+          input: vi.fn(async () => undefined),
           close: vi.fn(async () => undefined),
         },
       },
@@ -360,16 +366,19 @@ describe("provider limit loading", () => {
 });
 
 describe("host command output", () => {
-  it("collects output while the terminal is still running, then closes it", async () => {
+  it("collects output while running, releases the bounded handshake, and closes cleanly", async () => {
     const text = "query result\n__BB_HOST_COMMAND_DONE__:0\n";
     const create = vi.fn(async (input: unknown) => ({ id: "terminal-1", status: "starting", input }));
-    const get = vi.fn(async () => ({ id: "terminal-1", status: "running" }));
+    const get = vi.fn()
+      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
+      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 0 });
     const output = vi.fn(async () => ({
       chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
       truncated: false,
     }));
+    const input = vi.fn(async () => undefined);
     const close = vi.fn(async () => undefined);
-    const bb = { sdk: { terminals: { create, get, output, close } } } as unknown as BbPluginApi;
+    const bb = { sdk: { terminals: { create, get, output, input, close } } } as unknown as BbPluginApi;
 
     await expect(runHostCommand(
       bb,
@@ -379,22 +388,33 @@ describe("host command output", () => {
       { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
     )).resolves.toBe(text);
 
-    expect(get).toHaveBeenCalledOnce();
     expect(output).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
+    expect(input).toHaveBeenCalledWith({ terminalId: "terminal-1", dataBase64: "Cg==" });
+    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "if-clean" });
     expect(create.mock.calls[0]?.[0]).toMatchObject({
       start: { mode: "command", command: expect.stringContaining("__BB_HOST_COMMAND_DONE__") },
     });
+    expect(create.mock.calls[0]?.[0]).toEqual(expect.objectContaining({
+      start: expect.objectContaining({ command: expect.stringContaining("read -r -t 30") }),
+    }));
+    expect(create.mock.calls[0]?.[0]).not.toEqual(expect.objectContaining({
+      start: expect.objectContaining({ command: expect.stringContaining("while :") }),
+    }));
   });
 
-  it("surfaces a command diagnostic before closing the held terminal", async () => {
-    const text = "__BB_USAGE_ERROR__:OpenCode query failed\n__BB_HOST_COMMAND_DONE__:1\n";
+  it("surfaces a command diagnostic after releasing a normal non-zero exit", async () => {
+    const text = "__BB_USAGE_ERROR__:OpenCode query failed\n__BB_HOST_COMMAND_DONE__:127\n";
     const close = vi.fn(async () => undefined);
+    const input = vi.fn(async () => undefined);
+    const get = vi.fn()
+      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
+      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 127 });
     const bb = {
       sdk: { terminals: {
         create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+        get,
         output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
+        input,
         close,
       } },
     } as unknown as BbPluginApi;
@@ -406,16 +426,21 @@ describe("host command output", () => {
       new AbortController().signal,
       { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
     )).rejects.toThrow("OpenCode query failed");
-    expect(close).toHaveBeenCalledOnce();
+    expect(input).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "if-clean" });
   });
 
   it("surfaces bounded terminal output when a command has no structured diagnostic", async () => {
     const text = "CLI compatibility error\n__BB_HOST_COMMAND_DONE__:1\n";
+    const get = vi.fn()
+      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
+      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 1 });
     const bb = {
       sdk: { terminals: {
         create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+        get,
         output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
+        input: vi.fn(async () => undefined),
         close: vi.fn(async () => undefined),
       } },
     } as unknown as BbPluginApi;
@@ -429,13 +454,14 @@ describe("host command output", () => {
     )).rejects.toThrow("CLI compatibility error");
   });
 
-  it("times out and closes a stalled machine terminal", async () => {
+  it("times out and force-closes a stalled machine terminal", async () => {
     const close = vi.fn(async () => undefined);
     const bb = {
       sdk: { terminals: {
         create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+        get: vi.fn(async () => ({ id: "terminal-1", status: "running", exitCode: null })),
         output: vi.fn(async () => ({ chunks: [], truncated: false })),
+        input: vi.fn(async () => undefined),
         close,
       } },
     } as unknown as BbPluginApi;
@@ -448,6 +474,50 @@ describe("host command output", () => {
       { title: "Usage test", timeoutMs: 1, pollMs: 1 },
     )).rejects.toThrow("timed out");
     expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
+  });
+
+  it("logs terminal cleanup failures", async () => {
+    const warn = vi.fn();
+    const text = "__BB_HOST_COMMAND_DONE__:0\n";
+    const get = vi.fn()
+      .mockResolvedValueOnce({ id: "terminal-1", status: "running", exitCode: null })
+      .mockResolvedValueOnce({ id: "terminal-1", status: "exited", exitCode: 0 });
+    const bb = {
+      sdk: { terminals: {
+        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
+        get,
+        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
+        input: vi.fn(async () => undefined),
+        close: vi.fn(async () => { throw new Error("close failed"); }),
+      } },
+      log: { warn },
+    } as unknown as BbPluginApi;
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      "true",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).resolves.toBe(text);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("terminal cleanup failed: close failed"));
+  });
+});
+
+describe("collector concurrency", () => {
+  it("runs no more than the configured number of tasks at once", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const tasks = Array.from({ length: 9 }, (_, index) => async () => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await Promise.resolve();
+      active -= 1;
+      return index;
+    });
+
+    await expect(runWithConcurrency(tasks, 3)).resolves.toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(maximumActive).toBe(3);
   });
 });
 
@@ -532,7 +602,7 @@ describe("OpenCode query", () => {
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
       new AbortController().signal,
-      async () => "__BB_USAGE_BEGIN__\n[{}]\n__BB_USAGE_END__:0\n__BB_HOST_COMMAND_DONE__:0\n",
+      async () => "__BB_USAGE_BEGIN__\n[{}]\n__BB_USAGE_END__:0\n",
     )).resolves.toBeUndefined();
 
     expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 1 });
