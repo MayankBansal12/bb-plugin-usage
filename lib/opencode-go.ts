@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { z } from "zod";
 import { clampPercent } from "./provider-limits";
 
@@ -45,6 +46,15 @@ export function openCodeGoUsageCommand() {
     `bb_usage_go_body=$(mktemp)`,
     `trap 'rm -f "$bb_usage_go_body"' EXIT`,
     `trap 'exit 130' HUP INT TERM`,
+    // One-way SHA-256 of the API key so the server can group machines sharing
+    // one Go subscription. The key itself is never printed.
+    `bb_usage_go_fp=''`,
+    `if command -v sha256sum >/dev/null 2>&1; then bb_usage_go_fp=$(printf '%s' "$bb_usage_go_key" | sha256sum 2>/dev/null | cut -d' ' -f1)`,
+    `elif command -v shasum >/dev/null 2>&1; then bb_usage_go_fp=$(printf '%s' "$bb_usage_go_key" | shasum -a 256 2>/dev/null | cut -d' ' -f1)`,
+    `elif command -v openssl >/dev/null 2>&1; then bb_usage_go_fp=$(printf '%s' "$bb_usage_go_key" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')`,
+    `elif command -v node >/dev/null 2>&1; then bb_usage_go_fp=$(printf '%s' "$bb_usage_go_key" | node -e 'process.stdout.write(require("crypto").createHash("sha256").update(require("fs").readFileSync(0)).digest("hex"))' 2>/dev/null)`,
+    `fi`,
+    `if [ -n "$bb_usage_go_fp" ]; then printf '%s\\n' '__BB_GO_FINGERPRINT__:'"$bb_usage_go_fp"; fi`,
     `bb_usage_go_http=$(printf 'Authorization: Bearer %s\\n' "$bb_usage_go_key" | curl -q -sS -m 20 --proto '=https' -H @- -o "$bb_usage_go_body" -w '%{http_code}' '${OPENCODE_GO_USAGE_URL}')`,
     `bb_usage_go_status=$?`,
     `if [ "$bb_usage_go_status" -ne 0 ]; then printf '%s\\n' '__BB_USAGE_ERROR__:OpenCode Go usage request failed.'; exit "$bb_usage_go_status"; fi`,
@@ -54,6 +64,15 @@ export function openCodeGoUsageCommand() {
     `cat "$bb_usage_go_body"`,
     `printf '\\n%s\\n' '__BB_USAGE_END__:0'`,
   ].join("; ");
+}
+
+export function hashOpenCodeGoCredential(key: string): string {
+  return createHash("sha256").update(key, "utf8").digest("hex");
+}
+
+export function extractOpenCodeGoFingerprint(output: string): string | null {
+  const fingerprint = output.match(/__BB_GO_FINGERPRINT__:([0-9a-fA-F]{16,256})/)?.[1]?.toLowerCase() ?? "";
+  return /^[0-9a-f]{16,256}$/.test(fingerprint) ? fingerprint : null;
 }
 
 export function parseOpenCodeGoUsage(json: string): OpenCodeGoLimitWindow[] {

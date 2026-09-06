@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { clampPercent, formatLimitReset, formatLimitValue } from "./provider-limits";
+import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits } from "./provider-limits";
 
 describe("provider limit presentation", () => {
   it("clamps percentages to the progress range", () => {
@@ -24,5 +24,132 @@ describe("provider limit presentation", () => {
       cost: { usedUsdCents: 1250, limitUsdCents: 5000 },
     })).toBe("$12.50 of $50.00");
     expect(formatLimitValue({ label: "Weekly", usedPercent: 47.6, resetsAt: null })).toBe("48% used");
+  });
+
+  it("unifies one subscription across machines without double-counting account-wide windows", () => {
+    const shared = {
+      providerId: "claude",
+      providerName: "Claude Code",
+      accountEmail: "dev@example.com",
+      accountIdentity: null,
+      planLabel: "Max",
+      status: "ok" as const,
+      error: null,
+      lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      { ...shared, machineId: "one", machineName: "Studio", agentId: "claude", agentName: "Claude Code", windows: [{ label: "5 hours", usedPercent: 30, resetsAt: null }] },
+      { ...shared, machineId: "two", machineName: "Air", agentId: "claude", agentName: "Claude Code", windows: [{ label: "5 hours", usedPercent: 32, resetsAt: null }] },
+    ]);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0]?.windows[0]?.usedPercent).toBe(32);
+    expect(grouped[0]?.windows[0]).toEqual({ label: "5 hours", usedPercent: 32, resetsAt: null });
+    expect(grouped[0]?.machines.map((machine) => machine.machineName).sort()).toEqual(["Air", "Studio"]);
+  });
+
+  it("keeps different accounts and unidentified subscriptions on separate cards", () => {
+    const base = {
+      machineId: "one", machineName: "Studio", agentId: "claude", agentName: "Claude Code",
+      providerId: "claude", providerName: "Claude Code", windows: [{ label: "5 hours", usedPercent: 10, resetsAt: null }],
+      status: "ok" as const, error: null, lastUpdatedAt: null, accountIdentity: null,
+    };
+    expect(groupProviderLimits([
+      { ...base, accountEmail: "first@example.com", planLabel: "Max" },
+      { ...base, accountEmail: "second@example.com", planLabel: "Max" },
+    ])).toHaveLength(2);
+    expect(groupProviderLimits([
+      { ...base, accountEmail: null, planLabel: "Max" },
+      { ...base, machineId: "two", machineName: "Air", accountEmail: null, planLabel: "Pro" },
+    ])).toHaveLength(2);
+    for (const planLabel of ["Max", "Pro", null]) {
+      const grouped = groupProviderLimits([
+        { ...base, accountEmail: "first@example.com", planLabel: "Max" },
+        { ...base, machineId: "two", machineName: "Air", accountEmail: null, planLabel,
+          windows: [{ label: "5 hours", usedPercent: 90, resetsAt: null }] },
+      ]);
+      expect(grouped).toHaveLength(2);
+      expect(grouped.find((entry) => entry.accountEmail)?.windows[0]?.usedPercent).toBe(10);
+    }
+    for (const planLabel of ["Max", null]) {
+      expect(groupProviderLimits([
+        { ...base, accountEmail: null, planLabel },
+        { ...base, machineId: "two", machineName: "Air", accountEmail: null, planLabel },
+      ])).toHaveLength(2);
+    }
+  });
+
+  it("prefers normalized email over fingerprints without inferring missing emails", () => {
+    const base = {
+      machineId: "one", machineName: "One", agentId: "claude", agentName: "Claude Code",
+      providerId: "claude", providerName: "Claude Code", accountEmail: "dev@example.com",
+      accountIdentity: "a".repeat(64), planLabel: "Max", windows: [],
+      status: "ok" as const, error: null, lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      base,
+      { ...base, machineId: "two", accountEmail: " DEV@EXAMPLE.COM ", accountIdentity: "b".repeat(64) },
+      { ...base, machineId: "three", accountEmail: null },
+      { ...base, machineId: "four", accountEmail: null, accountIdentity: "b".repeat(64) },
+    ]);
+    expect(grouped).toHaveLength(3);
+    expect(grouped.find((entry) => entry.accountEmail)?.machines.map((m) => m.machineId).sort())
+      .toEqual(["one", "two"]);
+  });
+
+  it("uses one coherent observation from the newest reset cycle", () => {
+    const shared = {
+      providerId: "claude", providerName: "Claude Code", accountEmail: "dev@example.com", accountIdentity: null, planLabel: "Max",
+      agentId: "claude", agentName: "Claude Code", status: "ok" as const, error: null, lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      { ...shared, machineId: "one", machineName: "Studio", windows: [{
+        label: "5 hours", usedPercent: 95, resetsAt: "2026-08-11T12:00:00.000Z",
+        cost: { usedUsdCents: 9500, limitUsdCents: 10000 },
+      }] },
+      { ...shared, machineId: "two", machineName: "Air", windows: [{
+        label: "5 hours", usedPercent: 5, resetsAt: "2026-08-11T17:00:00.000Z",
+        cost: { usedUsdCents: 500, limitUsdCents: 10000 },
+      }] },
+    ]);
+    expect(grouped[0]?.windows[0]).toEqual({
+      label: "5 hours", usedPercent: 5, resetsAt: "2026-08-11T17:00:00.000Z",
+      cost: { usedUsdCents: 500, limitUsdCents: 10000 },
+    });
+  });
+
+  it("retains a machine error when another machine has usable limits", () => {
+    const shared = {
+      providerId: "claude", providerName: "Claude Code", accountEmail: "dev@example.com", accountIdentity: null, planLabel: "Max",
+      agentId: "claude", agentName: "Claude Code", lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      { ...shared, machineId: "one", machineName: "Studio", status: "ok" as const, error: null,
+        windows: [{ label: "5 hours", usedPercent: 30, resetsAt: null }] },
+      { ...shared, machineId: "two", machineName: "Air", status: "error" as const, error: "rate limited", windows: [] },
+    ]);
+    expect(grouped[0]).toMatchObject({ status: "ok", error: "rate limited" });
+    expect(grouped[0]?.machines.find((machine) => machine.machineId === "two")).toMatchObject({
+      status: "error", error: "rate limited",
+    });
+  });
+
+  it("groups Go machines by credential fingerprint, keeping other accounts separate", () => {
+    const base = {
+      machineId: "adfasf", machineName: "adfasf", agentId: "opencode-go", agentName: "OpenCode Go",
+      providerId: "opencode-go", providerName: "OpenCode Go",
+      accountEmail: null, planLabel: "Go",
+      windows: [{ label: "Weekly", usedPercent: 25, resetsAt: null }],
+      status: "ok" as const, error: null, lastUpdatedAt: null,
+    };
+    const grouped = groupProviderLimits([
+      { ...base, accountIdentity: "a".repeat(64) },
+      { ...base, machineId: "echio-staging", machineName: "echio-staging", accountIdentity: "a".repeat(64) },
+      { ...base, machineId: "fedora", machineName: "fedora", accountIdentity: "b".repeat(64) },
+      { ...base, machineId: "missing-one", accountIdentity: null },
+      { ...base, machineId: "missing-two", accountIdentity: null },
+    ]);
+    expect(grouped).toHaveLength(4);
+    expect(grouped.find((entry) => entry.machines.some((m) => m.machineId === "adfasf"))
+      ?.machines.map((m) => m.machineId).sort()).toEqual(["adfasf", "echio-staging"]);
   });
 });

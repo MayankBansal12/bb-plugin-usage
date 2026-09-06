@@ -130,7 +130,8 @@ describe("sync RPC", () => {
       return input.agentId ?? null;
     }
 
-    const hostCall = vi.fn(async (_method: string, input: { command: string }) => {
+    const hostCall = vi.fn(async (method: string, input: { command: string }) => {
+      if (method === "cancel") return {};
       const agentId = agentIdFromCommand(input.command);
       const stdout = agentId === "antigravity"
         ? fakeHostScanOutput("antigravity", [{
@@ -144,7 +145,7 @@ describe("sync RPC", () => {
           outputTokens: 53,
         }])
         : fakeHostScanOutput(agentId ?? "codex", []);
-      return { stdout, stderr: "", exitCode: 0 };
+      return { state: "done", result: { stdout, stderr: "", exitCode: 0 } };
     });
 
     const bb = {
@@ -317,12 +318,43 @@ describe("provider limit loading", () => {
     })]);
     expect(debug).toHaveBeenCalledWith(expect.stringContaining("Provider limits unavailable"));
   });
+
+  it("queries connected machines concurrently", async () => {
+    let activeCalls = 0;
+    let maxActiveCalls = 0;
+    const usageLimits = vi.fn(async ({ hostId }: { hostId: string }) => {
+      activeCalls += 1;
+      maxActiveCalls = Math.max(maxActiveCalls, activeCalls);
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      activeCalls -= 1;
+      return {
+        "claude-code": {
+          status: "ok",
+          planLabel: "Max",
+          accountEmail: "dev@example.com",
+          windows: [{ label: "5 hours", usedPercent: hostId === "host_1" ? 30 : 32, resetsAt: null }],
+        },
+      };
+    });
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    const sources = await loadProviderLimits(bb, [
+      { id: "host_1", name: "Studio", status: "connected" },
+      { id: "host_2", name: "Air", status: "connected" },
+    ], emptyDb(), 1_000);
+    expect(sources).toHaveLength(2);
+    expect(maxActiveCalls).toBe(2);
+    expect(usageLimits.mock.calls.map((call) => call[0].hostId)).toEqual(["host_1", "host_2"]);
+  });
 });
 
 describe("host command output", () => {
-  it("runs the command through the host worker without creating a terminal", async () => {
+  it.each([1_000, 60_000, 600_000])("passes the %i ms command budget to the host RPC", async (timeoutMs) => {
     const signal = new AbortController().signal;
-    const call = vi.fn(async () => ({ stdout: "query result", stderr: "", exitCode: 0 }));
+    const call = vi.fn(async () => ({ state: "done", result: { stdout: "query result", stderr: "", exitCode: 0 } }));
     const client = { call } as unknown as Parameters<typeof runHostCommand>[0];
 
     await expect(runHostCommand(
@@ -330,23 +362,49 @@ describe("host command output", () => {
       { id: "host-1", name: "Machine" },
       "printf result",
       signal,
-      { title: "Usage test", timeoutMs: 1_000 },
+      { title: "Usage test", timeoutMs },
     )).resolves.toBe("query result");
 
     expect(call).toHaveBeenCalledWith(
       "run",
-      { command: "printf result", timeoutMs: 1_000 },
-      { hostId: "host-1", signal },
+      { id: expect.any(String), command: "printf result", timeoutMs },
+      { hostId: "host-1", signal: expect.any(AbortSignal) },
     );
+  });
+
+  it("polls the same job and cancels it after collecting its output", async () => {
+    const call = vi.fn()
+      .mockResolvedValueOnce({ state: "running" })
+      .mockResolvedValueOnce({ state: "done", result: { stdout: "complete", stderr: "", exitCode: 0 } })
+      .mockResolvedValueOnce({});
+    await expect(runHostCommand({ call } as unknown as Parameters<typeof runHostCommand>[0],
+      { id: "host-1", name: "Machine" }, "long scan", new AbortController().signal,
+      { title: "Scan", timeoutMs: 600_000 })).resolves.toBe("complete");
+    const id = call.mock.calls[0]![1].id;
+    expect(call.mock.calls.map(([method, input]) => [method, input.id]))
+      .toEqual([["run", id], ["run", id], ["cancel", id]]);
+  });
+
+  it("sends cleanup with a fresh signal after the caller cancels", async () => {
+    const controller = new AbortController();
+    const call = vi.fn(async (method: string, _input: unknown, options: { signal: AbortSignal }) => {
+      if (method === "run") { controller.abort(new Error("cancelled by caller")); throw controller.signal.reason; }
+      expect(options.signal.aborted).toBe(false);
+      return {};
+    });
+    await expect(runHostCommand({ call } as unknown as Parameters<typeof runHostCommand>[0],
+      { id: "host-1", name: "Machine" }, "long scan", controller.signal,
+      { title: "Scan", timeoutMs: 600_000 })).rejects.toThrow("cancelled by caller");
+    expect(call.mock.calls.map(([method]) => method)).toEqual(["run", "cancel"]);
   });
 
   it("surfaces a structured diagnostic from a non-zero command", async () => {
     const client = {
-      call: vi.fn(async () => ({
+      call: vi.fn(async () => ({ state: "done", result: {
         stdout: "__BB_USAGE_ERROR__:OpenCode query failed\n",
         stderr: "",
         exitCode: 127,
-      })),
+      } })),
     } as unknown as Parameters<typeof runHostCommand>[0];
 
     await expect(runHostCommand(
@@ -360,11 +418,11 @@ describe("host command output", () => {
 
   it("uses bounded stderr as the fallback diagnostic", async () => {
     const client = {
-      call: vi.fn(async () => ({
+      call: vi.fn(async () => ({ state: "done", result: {
         stdout: "",
         stderr: "CLI compatibility error",
         exitCode: 1,
-      })),
+      } })),
     } as unknown as Parameters<typeof runHostCommand>[0];
 
     await expect(runHostCommand(
@@ -558,7 +616,7 @@ describe("OpenCode Go limits", () => {
     const db = new Database(":memory:");
     db.exec(`CREATE TABLE opencode_go_limits (
       machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, plan_label TEXT NOT NULL DEFAULT 'Go',
-      windows_json TEXT NOT NULL, fetched_at TEXT NOT NULL
+      windows_json TEXT NOT NULL, fetched_at TEXT NOT NULL, account_fingerprint TEXT
     );
     CREATE TABLE opencode_go_limit_state (
       machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, status TEXT NOT NULL,
@@ -586,6 +644,25 @@ describe("OpenCode Go limits", () => {
     expect(info).toHaveBeenCalledWith(expect.stringContaining("1 limit windows"));
     expect(db.prepare("SELECT status, error, last_success_at IS NOT NULL hasSuccess FROM opencode_go_limit_state").get())
       .toEqual({ status: "ok", error: null, hasSuccess: 1 });
+  });
+
+  it("persists the credential fingerprint as the grouping identity", async () => {
+    const db = goLimitsDb();
+    const bb = { log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() } } as unknown as BbPluginApi;
+    const output = [
+      `__BB_GO_FINGERPRINT__:${"a".repeat(64)}`,
+      "__BB_USAGE_BEGIN__",
+      JSON.stringify({ usage: { rolling: { status: "ok", percent: 4, resetsAt: "2026-08-21T22:54:37.384Z" } } }),
+      "__BB_USAGE_END__:0",
+      "",
+    ].join("\n");
+
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, (machine, command, signal, options) => runHostCommand({
+      call: vi.fn(async () => ({ state: "done", result: { stdout: output, stderr: "", exitCode: 0 } })),
+    } as unknown as Parameters<typeof runHostCommand>[0], machine, command, signal, options));
+
+    expect(loadStoredOpenCodeGoLimits(db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, new Set(["host-1"])))
+      .toEqual([expect.objectContaining({ accountIdentity: "a".repeat(64) })]);
   });
 
   it("retains the previous snapshot when a later fetch fails generically", async () => {

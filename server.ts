@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi, type ExperimentalHostClient } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -6,7 +6,7 @@ import {
   type AgentId, type UsageRecord,
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
-import { openCodeGoUsageCommand, parseOpenCodeGoUsage } from "./lib/opencode-go";
+import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
 import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
@@ -16,6 +16,7 @@ import { hostCommandContract } from "./host-contract";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
+import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -39,9 +40,17 @@ const providerLimitWindowSchema = z.object({
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
-  machineId: z.string(), machineName: z.string(), providerId: z.string(), providerName: z.string(),
-  planLabel: z.string().nullable(), windows: z.array(providerLimitWindowSchema),
+  id: z.string(),
+  providerId: z.string(), providerName: z.string(),
+  accountEmail: z.string().nullable(), planLabel: z.string().nullable(),
+  windows: z.array(providerLimitWindowSchema),
   status: z.enum(["ok", "error"]), error: z.string().nullable(), lastUpdatedAt: z.string().nullable(),
+  machines: z.array(z.object({
+    machineId: z.string(), machineName: z.string(),
+    agents: z.array(z.object({ id: z.string(), name: z.string() })),
+    windows: z.array(providerLimitWindowSchema),
+    status: z.enum(["ok", "error"]), error: z.string().nullable(), lastUpdatedAt: z.string().nullable(),
+  })),
 });
 type DashboardRecord = z.infer<typeof usageRecordSchema>;
 type SourceState = z.infer<typeof sourceStateSchema>;
@@ -50,9 +59,10 @@ export const rpcContract = defineRpcContract({
   dashboard: { input: z.null(), output: z.object({
     mode: z.literal("live"), generatedAt: z.string(), lastSyncedAt: z.string().nullable(), pricingVersion: z.string(),
     machines: z.array(filterOptionSchema), agents: z.array(filterOptionSchema), modelProviders: z.array(filterOptionSchema),
-    records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema), providerLimits: z.array(providerLimitSchema),
+    records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema),
     sync: syncStateSchema, notice: z.string(),
   }) },
+  providerLimits: { input: z.null(), output: z.array(providerLimitSchema) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
 
@@ -76,7 +86,7 @@ const LIMIT_PROVIDERS = [
   { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
   { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
 ] as const;
-const PROVIDER_LIMITS_TIMEOUT_MS = 3_000;
+const PROVIDER_LIMITS_TIMEOUT_MS = 5_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
@@ -98,68 +108,64 @@ export async function loadProviderLimits(
   machines: Array<Machine & { status: string }>,
   db: Database,
   timeoutMs = PROVIDER_LIMITS_TIMEOUT_MS,
-): Promise<Array<z.infer<typeof providerLimitSchema>>> {
-  return (await Promise.all(machines
-    .filter((machine) => machine.status === "connected")
-    .map(async (machine) => {
-      const presentRows = db.prepare(`SELECT DISTINCT s.provider_id agentId FROM usage_sources s
-        JOIN usage_event_sources es ON es.source_id = s.source_id
-        WHERE s.machine_id = ? AND s.provider_id IN (?, ?, ?)`)
-        .all(machine.id, "codex", "claude", "cursor") as Array<{ agentId: string }>;
-      const present = new Set(presentRows.map((row) => row.agentId));
-      try {
-        const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
-        return LIMIT_PROVIDERS.flatMap((provider): Array<z.infer<typeof providerLimitSchema>> => {
-          const limit = provider.keys.map((key) => usage[key]).find((candidate) => candidate !== undefined);
-          if (!limit) return [];
-          if (limit.status === "ok") {
-            if (limit.windows.length === 0) return [];
-            return [{
-              machineId: machine.id,
-              machineName: machine.name,
-              providerId: provider.id,
-              providerName: provider.name,
-              planLabel: limit.planLabel,
-              windows: limit.windows,
-              status: "ok",
-              error: null,
-              lastUpdatedAt: null,
-            }];
-          }
-          if (limit.status === "error") {
-            bb.log.debug(`Provider limits unavailable for ${provider.name} on ${machine.name}: ${limit.message}`);
-            return [{
-              machineId: machine.id,
-              machineName: machine.name,
-              providerId: provider.id,
-              providerName: provider.name,
-              planLabel: limit.planLabel,
-              windows: [],
-              status: "error",
-              error: limit.message,
-              lastUpdatedAt: null,
-            }];
-          }
-          return [];
-        });
-      } catch (error) {
-        const message = `Provider limits unavailable: ${errorMessage(error)}`;
-        bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
-        return LIMIT_PROVIDERS
-          .filter((provider) => present.has(provider.id))
-          .map((provider): z.infer<typeof providerLimitSchema> => ({
-            machineId: machine.id,
-            machineName: machine.name,
-            providerId: provider.id,
-            providerName: provider.name,
-            planLabel: null,
-            windows: [],
-            status: "error",
-            error: message,
-            lastUpdatedAt: null,
-          }));
-      }
-    }))).flat();
+): Promise<ProviderLimitSource[]> {
+  const machineRows = await Promise.all(machines.filter((candidate) => candidate.status === "connected").map(async (machine) => {
+    const rows: ProviderLimitSource[] = [];
+    const presentRows = db.prepare(`SELECT DISTINCT s.provider_id agentId FROM usage_sources s
+      JOIN usage_event_sources es ON es.source_id = s.source_id
+      WHERE s.machine_id = ? AND s.provider_id IN (?, ?, ?)`)
+      .all(machine.id, "codex", "claude", "cursor") as Array<{ agentId: string }>;
+    const present = new Set(presentRows.map((row) => row.agentId));
+    try {
+      const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
+      rows.push(...LIMIT_PROVIDERS.flatMap((provider): ProviderLimitSource[] => {
+        const limit = provider.keys.map((key) => usage[key]).find((candidate) => candidate !== undefined);
+        if (!limit) return [];
+        const source = {
+          machineId: machine.id,
+          machineName: machine.name,
+          agentId: provider.id,
+          agentName: provider.name,
+          providerId: provider.id,
+          providerName: provider.name,
+          accountEmail: typeof limit.accountEmail === "string" ? limit.accountEmail : null,
+          accountIdentity: null,
+          planLabel: typeof limit.planLabel === "string" ? limit.planLabel : null,
+        };
+        if (limit.status === "ok") {
+          if (limit.windows.length === 0) return [];
+          return [{ ...source, windows: limit.windows, status: "ok" as const, error: null, lastUpdatedAt: null }];
+        }
+        if (limit.status === "error") {
+          bb.log.debug(`Provider limits unavailable for ${provider.name} on ${machine.name}: ${limit.message}`);
+          return [{ ...source, windows: [], status: "error" as const, error: limit.message, lastUpdatedAt: null }];
+        }
+        return [];
+      }));
+    } catch (error) {
+      const message = `Provider limits unavailable: ${errorMessage(error)}`;
+      bb.log.debug(`Provider limits unavailable for ${machine.name}: ${errorMessage(error)}`);
+      rows.push(...LIMIT_PROVIDERS
+        .filter((provider) => present.has(provider.id))
+        .map((provider): ProviderLimitSource => ({
+          machineId: machine.id,
+          machineName: machine.name,
+          agentId: provider.id,
+          agentName: provider.name,
+          providerId: provider.id,
+          providerName: provider.name,
+          accountEmail: null,
+          accountIdentity: null,
+          planLabel: null,
+          windows: [],
+          status: "error",
+          error: message,
+          lastUpdatedAt: null,
+        })));
+    }
+    return rows;
+  }));
+  return machineRows.flat();
 }
 
 const migration = `
@@ -211,6 +217,8 @@ CREATE TABLE IF NOT EXISTS opencode_go_limit_state (
   machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, status TEXT NOT NULL,
   error TEXT, last_attempt_at TEXT NOT NULL, last_success_at TEXT
 );`;
+const openCodeGoFingerprintMigration = `
+ALTER TABLE opencode_go_limits ADD COLUMN account_fingerprint TEXT;`;
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -444,13 +452,24 @@ export async function runHostCommand(
   signal: AbortSignal,
   options: HostCommandOptions,
 ) {
-  const result = await client.call("run", {
-    command,
-    timeoutMs: options.timeoutMs,
-  }, {
-    hostId: machine.id,
-    signal,
-  });
+  const id = randomUUID();
+  const callSignal = AbortSignal.any([signal, AbortSignal.timeout(options.timeoutMs + 15_000)]);
+  let result: { stdout: string; stderr: string; exitCode: number };
+  try {
+    for (;;) {
+      callSignal.throwIfAborted();
+      const response = await client.call("run", { id, command, timeoutMs: options.timeoutMs }, {
+        hostId: machine.id,
+        signal: callSignal,
+      });
+      if (response.state === "error") throw new Error(response.error);
+      if (response.state === "done") { result = response.result; break; }
+    }
+  } finally {
+    // Cleanup must still reach the host after the scan's own signal is aborted.
+    // If the host is offline, its command timeout and result expiry bound the job.
+    await client.call("cancel", { id }, { hostId: machine.id, signal: AbortSignal.timeout(5_000) });
+  }
   const text = `${result.stdout}${result.stderr ? `${result.stdout ? "\n" : ""}${result.stderr}` : ""}`;
   if (result.exitCode !== 0) {
     const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
@@ -557,6 +576,16 @@ export async function syncOpenCode(
     }
   }
 }
+
+export function goLimitsHasFingerprintColumn(db: Database): boolean {
+  try {
+    const columns = db.prepare("PRAGMA table_info(opencode_go_limits)").all() as Array<{ name: string }>;
+    return columns.some((column) => column.name === "account_fingerprint");
+  } catch {
+    return false;
+  }
+}
+
 export async function syncOpenCodeGo(
   bb: BbPluginApi,
   db: Database,
@@ -572,12 +601,21 @@ export async function syncOpenCodeGo(
     });
     const windows = parseOpenCodeGoUsage(extractOpenCodeJson(output));
     if (windows.length === 0) throw new Error("OpenCode Go usage response contained no limit windows.");
+    const fingerprint = extractOpenCodeGoFingerprint(output);
 
     db.transaction(() => {
-      db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at)
-        VALUES (?, ?, 'Go', ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
-        machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at`)
-        .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt);
+      if (goLimitsHasFingerprintColumn(db)) {
+        db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at, account_fingerprint)
+          VALUES (?, ?, 'Go', ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+          machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at,
+          account_fingerprint=excluded.account_fingerprint`)
+          .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt, fingerprint);
+      } else {
+        db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at)
+          VALUES (?, ?, 'Go', ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+          machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at`)
+          .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt);
+      }
       db.prepare(`INSERT INTO opencode_go_limit_state (
           machine_id, machine_name, status, error, last_attempt_at, last_success_at
         ) VALUES (?, ?, 'ok', NULL, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
@@ -611,19 +649,33 @@ export async function syncOpenCodeGo(
 export function loadStoredOpenCodeGoLimits(
   db: Database,
   connectedMachineIds: Set<string>,
-): Array<z.infer<typeof providerLimitSchema>> {
+): ProviderLimitSource[] {
+  const hasFingerprint = goLimitsHasFingerprintColumn(db);
   const rows = db.prepare(`SELECT
       state.machine_id machineId, state.machine_name machineName, state.status, state.error,
       limits.plan_label planLabel, limits.windows_json windowsJson, limits.fetched_at fetchedAt
+      ${hasFingerprint ? ", limits.account_fingerprint accountFingerprint" : ""}
     FROM opencode_go_limit_state state
     LEFT JOIN opencode_go_limits limits ON limits.machine_id=state.machine_id
     ORDER BY state.machine_name`).all() as Array<{
     machineId: string; machineName: string; status: "ok" | "error"; error: string | null;
     planLabel: string | null; windowsJson: string | null; fetchedAt: string | null;
+    accountFingerprint?: string | null;
   }>;
 
-  return rows.flatMap((row): Array<z.infer<typeof providerLimitSchema>> => {
+  return rows.flatMap((row): ProviderLimitSource[] => {
     if (!connectedMachineIds.has(row.machineId)) return [];
+    const source = {
+      machineId: row.machineId,
+      machineName: row.machineName,
+      agentId: "opencode-go",
+      agentName: "OpenCode Go",
+      providerId: "opencode-go",
+      providerName: "OpenCode Go",
+      accountEmail: null as string | null,
+      accountIdentity: typeof row.accountFingerprint === "string" && row.accountFingerprint ? row.accountFingerprint : null,
+      planLabel: row.planLabel ?? "Go",
+    };
     try {
       const windows = row.windowsJson
         ? providerLimitWindowSchema.array().parse(JSON.parse(row.windowsJson))
@@ -631,24 +683,10 @@ export function loadStoredOpenCodeGoLimits(
       if (row.status === "ok" && windows.length === 0) {
         throw new Error("OpenCode Go has no stored limit windows.");
       }
-      return [{
-        machineId: row.machineId,
-        machineName: row.machineName,
-        providerId: "opencode-go",
-        providerName: "OpenCode Go",
-        planLabel: row.planLabel ?? "Go",
-        windows,
-        status: row.status,
-        error: row.error,
-        lastUpdatedAt: row.fetchedAt,
-      }];
+      return [{ ...source, windows, status: row.status, error: row.error, lastUpdatedAt: row.fetchedAt }];
     } catch {
       return [{
-        machineId: row.machineId,
-        machineName: row.machineName,
-        providerId: "opencode-go",
-        providerName: "OpenCode Go",
-        planLabel: row.planLabel ?? "Go",
+        ...source,
         windows: [],
         status: "error",
         error: "Stored OpenCode Go limits could not be read.",
@@ -712,7 +750,7 @@ export default async function plugin(bb: BbPluginApi) {
     runHostCommand(hostCommandClient, machine, command, signal, options)
   );
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -771,23 +809,42 @@ export default async function plugin(bb: BbPluginApi) {
     return result;
   };
 
-  bb.rpc.register(rpcContract, {
-    async dashboard() {
-      let machines: Array<Machine & { status: string }>;
-      try {
-        machines = (await bb.sdk.hosts.list({ signal: AbortSignal.timeout(DASHBOARD_HOSTS_TIMEOUT_MS) }))
-          .map((host) => ({ id: host.id, name: host.name, status: host.status }));
-      } catch (error) {
-        bb.log.warn(`Machine list unavailable: ${errorMessage(error)}`);
-        machines = db.prepare(`SELECT machine_id id, MAX(machine_name) name, 'unavailable' status
-          FROM usage_sources GROUP BY machine_id ORDER BY name`).all() as typeof machines;
-      }
-      const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
-      const connectedMachineIds = new Set(machines.filter((machine) => machine.status === "connected").map((machine) => machine.id));
-      const providerLimits = [
+  const loadMachines = async (): Promise<Array<Machine & { status: string }>> => {
+    try {
+      return (await bb.sdk.hosts.list({ signal: AbortSignal.timeout(DASHBOARD_HOSTS_TIMEOUT_MS) }))
+        .map((host) => ({ id: host.id, name: host.name, status: host.status }));
+    } catch (error) {
+      bb.log.warn(`Machine list unavailable: ${errorMessage(error)}`);
+      return db.prepare(`SELECT machine_id id, MAX(machine_name) name, 'unavailable' status
+        FROM usage_sources GROUP BY machine_id ORDER BY name`)
+        .all() as Array<Machine & { status: string }>;
+    }
+  };
+
+  let providerLimitsRequest: Promise<Array<z.infer<typeof providerLimitSchema>>> | null = null;
+  const readProviderLimits = async () => {
+    if (providerLimitsRequest) return providerLimitsRequest;
+    providerLimitsRequest = (async () => {
+      const machines = await loadMachines();
+      const connectedMachineIds = new Set(
+        machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
+      );
+      return groupProviderLimits([
         ...await loadProviderLimits(bb, machines, db),
         ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
-      ];
+      ]);
+    })();
+    try {
+      return await providerLimitsRequest;
+    } finally {
+      providerLimitsRequest = null;
+    }
+  };
+
+  bb.rpc.register(rpcContract, {
+    async dashboard() {
+      const machines = await loadMachines();
+      const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
@@ -805,11 +862,11 @@ export default async function plugin(bb: BbPluginApi) {
         modelProviders,
         records,
         sources,
-        providerLimits,
         sync,
         notice: "Prompts and message content are never stored.",
       };
     },
+    providerLimits: readProviderLimits,
     sync() {
       void syncAll().catch((error) => bb.log.error(`Usage sync failed: ${errorMessage(error)}`));
       return { ok: true as const };
