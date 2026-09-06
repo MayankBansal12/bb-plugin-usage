@@ -174,7 +174,7 @@ describe("OpenCode Go command", () => {
       auth: { "opencode-go": { type: "api", api_key: "go-test-secret-do-not-log" } },
       nodeOnly: true,
     });
-    expect(result.status).toBe(0);
+    expect(result.status, `status ${result.status}: ${result.output}`).toBe(0);
     expect(result.output).toContain(samplePayload);
     expect(result.output).not.toContain("go-test-secret-do-not-log");
     expect(extractOpenCodeGoFingerprint(result.output)).toBe(hashOpenCodeGoCredential("go-test-secret-do-not-log"));
