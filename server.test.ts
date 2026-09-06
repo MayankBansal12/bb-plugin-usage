@@ -616,7 +616,7 @@ describe("OpenCode Go limits", () => {
     const db = new Database(":memory:");
     db.exec(`CREATE TABLE opencode_go_limits (
       machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, plan_label TEXT NOT NULL DEFAULT 'Go',
-      windows_json TEXT NOT NULL, fetched_at TEXT NOT NULL
+      windows_json TEXT NOT NULL, fetched_at TEXT NOT NULL, account_fingerprint TEXT
     );
     CREATE TABLE opencode_go_limit_state (
       machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, status TEXT NOT NULL,
@@ -644,6 +644,23 @@ describe("OpenCode Go limits", () => {
     expect(info).toHaveBeenCalledWith(expect.stringContaining("1 limit windows"));
     expect(db.prepare("SELECT status, error, last_success_at IS NOT NULL hasSuccess FROM opencode_go_limit_state").get())
       .toEqual({ status: "ok", error: null, hasSuccess: 1 });
+  });
+
+  it("persists the credential fingerprint as the grouping identity", async () => {
+    const db = goLimitsDb();
+    const bb = { log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn() } } as unknown as BbPluginApi;
+    const output = [
+      `__BB_GO_FINGERPRINT__:${"a".repeat(64)}`,
+      "__BB_USAGE_BEGIN__",
+      JSON.stringify({ usage: { rolling: { status: "ok", percent: 4, resetsAt: "2026-08-21T22:54:37.384Z" } } }),
+      "__BB_USAGE_END__:0",
+      "",
+    ].join("\n");
+
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => output);
+
+    expect(loadStoredOpenCodeGoLimits(db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, new Set(["host-1"])))
+      .toEqual([expect.objectContaining({ accountIdentity: "a".repeat(64) })]);
   });
 
   it("retains the previous snapshot when a later fetch fails generically", async () => {

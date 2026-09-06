@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { OPENCODE_GO_USAGE_URL, openCodeGoUsageCommand, parseOpenCodeGoUsage } from "./opencode-go";
+import { OPENCODE_GO_USAGE_URL, extractOpenCodeGoFingerprint, hashOpenCodeGoCredential, openCodeGoUsageCommand, parseOpenCodeGoUsage } from "./opencode-go";
 
 const samplePayload = JSON.stringify({
   usage: {
@@ -74,13 +74,23 @@ printf '%s' "$FAKE_HTTP"
   let path = `${binDir}:${process.env.PATH ?? ""}`;
   if (nodeOnly) {
     for (const [name, target] of [
-      ["node", process.execPath],
       ["cat", "/usr/bin/cat"],
       ["mktemp", "/usr/bin/mktemp"],
       ["rm", "/usr/bin/rm"],
     ] as const) {
       symlinkSync(target, join(binDir, name));
     }
+    const nodePath = join(binDir, "node");
+    writeFileSync(nodePath, `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "$EXPECTED_KEY" ]; then
+    printf '%s\\n' 'credential exposed in Node.js arguments'
+    exit 9
+  fi
+done
+exec "$TEST_NODE_PATH" "$@"
+`);
+    chmodSync(nodePath, 0o755);
     path = binDir;
   }
 
@@ -89,6 +99,7 @@ printf '%s' "$FAKE_HTTP"
     env: {
       ...process.env,
       EXPECTED_KEY: "go-test-secret-do-not-log",
+      TEST_NODE_PATH: process.execPath,
       FAKE_BODY: body,
       FAKE_CURL_EXIT: curlExit === undefined ? "" : String(curlExit),
       FAKE_HTTP: String(http),
@@ -145,6 +156,19 @@ describe("OpenCode Go command", () => {
     expect(result.tempFiles).toEqual([]);
   });
 
+  it("emits a credential fingerprint without exposing the key", () => {
+    const result = runUsageCommand();
+    expect(result.status).toBe(0);
+    expect(result.output).not.toContain("go-test-secret-do-not-log");
+    expect(extractOpenCodeGoFingerprint(result.output)).toBe(hashOpenCodeGoCredential("go-test-secret-do-not-log"));
+  });
+
+  it("hashes fingerprints with SHA-256 and rejects bad input", () => {
+    expect(hashOpenCodeGoCredential("a")).toMatch(/^[0-9a-f]{64}$/);
+    expect(extractOpenCodeGoFingerprint("__BB_USAGE_BEGIN__\n{}")).toBeNull();
+    expect(extractOpenCodeGoFingerprint("__BB_GO_FINGERPRINT__:nope")).toBeNull();
+  });
+
   it("supports the legacy api_key field through the Node.js fallback", () => {
     const result = runUsageCommand({
       auth: { "opencode-go": { type: "api", api_key: "go-test-secret-do-not-log" } },
@@ -153,6 +177,7 @@ describe("OpenCode Go command", () => {
     expect(result.status).toBe(0);
     expect(result.output).toContain(samplePayload);
     expect(result.output).not.toContain("go-test-secret-do-not-log");
+    expect(extractOpenCodeGoFingerprint(result.output)).toBe(hashOpenCodeGoCredential("go-test-secret-do-not-log"));
     expect(result.tempFiles).toEqual([]);
   });
 

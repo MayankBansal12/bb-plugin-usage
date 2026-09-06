@@ -144,6 +144,68 @@ function ProviderRowsSkeleton({ separated = false }: { separated?: boolean }) {
   );
 }
 
+// Shared shimmer host + keyframes for skeletons rendered outside
+// UsageDashboardSkeleton (which owns the <style> tag for its own tree).
+export function ShimmerStyles() {
+  return <style>{SHIMMER_STYLE}</style>;
+}
+
+// Mirrors the provider-limit card grid in app.tsx: header row, machine tags,
+// then window rows with progress bars. Column count follows the same
+// content-width breakpoints so the skeleton aligns with the loaded cards.
+export function ProviderLimitsSkeleton({ columns }: { columns: number }) {
+  const cards = Array.from({ length: Math.max(1, Math.min(3, columns)) }, (_, index) => index);
+  const nameWidths = [104, 88, 96];
+  const planWidths = [52, 40, 46];
+  const barWidths = [64, 38, 52];
+  return (
+    <div
+      role="status"
+      aria-label="Loading provider limits"
+      className="mt-4 grid gap-3"
+      style={{ gridTemplateColumns: `repeat(${cards.length}, minmax(0, 1fr))` }}
+    >
+      <ShimmerStyles />
+      <span className="sr-only">Loading provider limits…</span>
+      {cards.map((card) => (
+        <div
+          key={card}
+          aria-hidden="true"
+          className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
+        >
+          <div className="flex min-w-0 items-center justify-between gap-3">
+            <span className="flex min-w-0 items-center gap-2">
+              <Shimmer className="size-[15px] shrink-0 rounded-[4px]" />
+              <Shimmer className="h-3 rounded" style={{ width: nameWidths[card % nameWidths.length] }} />
+            </span>
+            <Shimmer className="h-2.5 shrink-0 rounded" style={{ width: planWidths[card % planWidths.length] }} />
+          </div>
+          <div className="mt-1.5 flex flex-wrap gap-1">
+            <Shimmer className="h-[18px] w-20 rounded-md" />
+            <Shimmer className="h-[18px] w-16 rounded-md" style={{ animationDelay: "-0.3s" }} />
+          </div>
+          <div className="mt-1.5 space-y-1.5">
+            {[0, 1].map((row) => (
+              <div key={row}>
+                <div className="flex items-center justify-between gap-3">
+                  <Shimmer className="h-2.5 w-24 rounded" style={{ animationDelay: `${-(card + row) * 0.2}s` }} />
+                  <Shimmer className="h-2.5 w-12 shrink-0 rounded" style={{ animationDelay: `${-(card + row) * 0.2}s` }} />
+                </div>
+                <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted">
+                  <Shimmer
+                    className="h-full rounded-full"
+                    style={{ width: `${barWidths[(card + row) % barWidths.length]}%`, animationDelay: `${-(card + row) * 0.2}s` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function UsageDashboardSkeleton() {
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);

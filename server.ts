@@ -7,7 +7,7 @@ import {
   type AgentId, type UsageRecord,
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
-import { openCodeGoUsageCommand, parseOpenCodeGoUsage } from "./lib/opencode-go";
+import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
 import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
@@ -129,6 +129,7 @@ export async function loadProviderLimits(
           providerId: provider.id,
           providerName: provider.name,
           accountEmail: typeof limit.accountEmail === "string" ? limit.accountEmail : null,
+          accountIdentity: null,
           planLabel: typeof limit.planLabel === "string" ? limit.planLabel : null,
         };
         if (limit.status === "ok") {
@@ -154,6 +155,7 @@ export async function loadProviderLimits(
           providerId: provider.id,
           providerName: provider.name,
           accountEmail: null,
+          accountIdentity: null,
           planLabel: null,
           windows: [],
           status: "error",
@@ -215,6 +217,8 @@ CREATE TABLE IF NOT EXISTS opencode_go_limit_state (
   machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, status TEXT NOT NULL,
   error TEXT, last_attempt_at TEXT NOT NULL, last_success_at TEXT
 );`;
+const openCodeGoFingerprintMigration = `
+ALTER TABLE opencode_go_limits ADD COLUMN account_fingerprint TEXT;`;
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -577,6 +581,16 @@ export async function syncOpenCode(
     }
   }
 }
+
+export function goLimitsHasFingerprintColumn(db: Database): boolean {
+  try {
+    const columns = db.prepare("PRAGMA table_info(opencode_go_limits)").all() as Array<{ name: string }>;
+    return columns.some((column) => column.name === "account_fingerprint");
+  } catch {
+    return false;
+  }
+}
+
 export async function syncOpenCodeGo(
   bb: BbPluginApi,
   db: Database,
@@ -592,12 +606,21 @@ export async function syncOpenCodeGo(
     });
     const windows = parseOpenCodeGoUsage(extractOpenCodeJson(output));
     if (windows.length === 0) throw new Error("OpenCode Go usage response contained no limit windows.");
+    const fingerprint = extractOpenCodeGoFingerprint(output);
 
     db.transaction(() => {
-      db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at)
-        VALUES (?, ?, 'Go', ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
-        machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at`)
-        .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt);
+      if (goLimitsHasFingerprintColumn(db)) {
+        db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at, account_fingerprint)
+          VALUES (?, ?, 'Go', ?, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+          machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at,
+          account_fingerprint=excluded.account_fingerprint`)
+          .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt, fingerprint);
+      } else {
+        db.prepare(`INSERT INTO opencode_go_limits (machine_id, machine_name, plan_label, windows_json, fetched_at)
+          VALUES (?, ?, 'Go', ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
+          machine_name=excluded.machine_name, windows_json=excluded.windows_json, fetched_at=excluded.fetched_at`)
+          .run(machine.id, machine.name, JSON.stringify(windows), attemptedAt);
+      }
       db.prepare(`INSERT INTO opencode_go_limit_state (
           machine_id, machine_name, status, error, last_attempt_at, last_success_at
         ) VALUES (?, ?, 'ok', NULL, ?, ?) ON CONFLICT(machine_id) DO UPDATE SET
@@ -632,14 +655,17 @@ export function loadStoredOpenCodeGoLimits(
   db: Database,
   connectedMachineIds: Set<string>,
 ): ProviderLimitSource[] {
+  const hasFingerprint = goLimitsHasFingerprintColumn(db);
   const rows = db.prepare(`SELECT
       state.machine_id machineId, state.machine_name machineName, state.status, state.error,
       limits.plan_label planLabel, limits.windows_json windowsJson, limits.fetched_at fetchedAt
+      ${hasFingerprint ? ", limits.account_fingerprint accountFingerprint" : ""}
     FROM opencode_go_limit_state state
     LEFT JOIN opencode_go_limits limits ON limits.machine_id=state.machine_id
     ORDER BY state.machine_name`).all() as Array<{
     machineId: string; machineName: string; status: "ok" | "error"; error: string | null;
     planLabel: string | null; windowsJson: string | null; fetchedAt: string | null;
+    accountFingerprint?: string | null;
   }>;
 
   return rows.flatMap((row): ProviderLimitSource[] => {
@@ -652,6 +678,7 @@ export function loadStoredOpenCodeGoLimits(
       providerId: "opencode-go",
       providerName: "OpenCode Go",
       accountEmail: null as string | null,
+      accountIdentity: typeof row.accountFingerprint === "string" && row.accountFingerprint ? row.accountFingerprint : null,
       planLabel: row.planLabel ?? "Go",
     };
     try {
@@ -724,7 +751,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
