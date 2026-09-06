@@ -8,7 +8,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ToggleGroup } from "@/components/ui/toggle-group";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
-import { UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
+import { ProviderLimitsSkeleton, UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
 import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
@@ -700,7 +700,7 @@ function ProviderLimits({
         <p className="mt-2 text-xs text-destructive" role="alert">Couldn’t refresh usage limits: {error}</p>
       )}
       {loading && limits.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">Loading provider limits…</p>
+        <ProviderLimitsSkeleton columns={availableColumns} />
       ) : limits.length === 0 ? (
         <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
       ) : (
