@@ -16,6 +16,7 @@ export type ProviderLimitSource = {
   providerId: string;
   providerName: string;
   accountEmail: string | null;
+  accountIdentity: string | null;
   planLabel: string | null;
   windows: ProviderLimitWindow[];
   status: "ok" | "error";
@@ -50,7 +51,11 @@ function normalizedIdentity(value: string | null) {
 
 function subscriptionId(source: ProviderLimitSource) {
   const account = normalizedIdentity(source.accountEmail);
-  return `${source.providerId}\0${account ? `account:${account}` : `machine:${source.machineId}`}`;
+  const accountIdentity = normalizedIdentity(source.accountIdentity);
+  const key = account ? `account:${account}`
+    : accountIdentity ? `identity:${accountIdentity}`
+    : `machine:${source.machineId}`;
+  return `${source.providerId}\0${key}`;
 }
 
 function latestTimestamp(values: Array<string | null>) {
