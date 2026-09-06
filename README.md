@@ -46,7 +46,7 @@ Missing log roots are treated as normal “no data” results. Offline machines,
 
 ## Install
 
-Requires BB 0.36 or newer.
+Requires BB 0.42.0 or newer on the server and enrolled hosts. Usage scans run in a non-PTY host worker, with at most three scans per machine. Long scans use short polling calls; cancellation and timeouts terminate the command process group.
 
 ```sh
 bb plugin install git:https://github.com/MayankBansal12/bb-plugin-usage.git@main --yes

@@ -11,7 +11,10 @@ permissions:
 
 jobs:
   check-test-build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     steps:
       - name: Check out repository
@@ -27,7 +30,7 @@ jobs:
         run: npm ci
 
       - name: Install pinned BB build tool
-        run: npm install --global bb-app@0.39.0
+        run: npm install --global bb-app@0.42.0
 
       - name: Type check
         run: npm run check
