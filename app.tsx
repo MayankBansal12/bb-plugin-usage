@@ -903,7 +903,7 @@ function UsageSyncButton() {
 }
 
 function UsageHeaderControls() {
-  const compactHeader = useMediaQuery("(max-width: 1279px)");
+  const compactHeader = useMediaQuery("(max-width: 1023px)");
 
   useEffect(() => {
     try {
@@ -925,7 +925,7 @@ function UsageHeaderControls() {
 }
 
 function UsageResponsiveControls() {
-  const compactHeader = useMediaQuery("(max-width: 1279px)");
+  const compactHeader = useMediaQuery("(max-width: 1023px)");
   if (!compactHeader) return null;
   return <UsageToolbarControls placement="body" />;
 }
