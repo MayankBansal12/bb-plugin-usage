@@ -78,4 +78,4 @@ Ideas, fixes, and improvements are welcome.
 
 ### Cost estimates and unknown pricing
 
-Recorded and unpriced requests are kept in separate aggregate buckets so a recorded cost never suppresses estimates for other requests. Known providers use only their own catalog rates; automatic model aliases are limited to date suffixes. Unknown models remain unpriced. When usage has no known price, the headline shows **Known cost** and reports excluded tokens; costs, charts, and shares cover priced usage only. Catalog estimates use current base token rates, without context-tier adjustments or invoice reconciliation.
+Recorded and unpriced requests are kept in separate aggregate buckets so a recorded cost never suppresses estimates for other requests. Known providers use only their own catalog rates; automatic model aliases are limited to date suffixes. Unknown models remain unpriced. When usage has no known price, the headline shows **Known cost**; costs, charts, and shares cover priced usage only. Catalog estimates use current base token rates, without context-tier adjustments or invoice reconciliation.

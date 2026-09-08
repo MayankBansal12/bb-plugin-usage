@@ -1298,7 +1298,6 @@ function UsageDashboard() {
                   *
                 </div>
                 <div className="mt-1 text-sm text-muted-foreground">Estimated at standard API rates</div>
-                {totals.unknownTokens > 0 && <div className="mt-1 text-sm text-muted-foreground">{compact(totals.unknownTokens)} tokens have unknown pricing and are excluded from costs, charts, and shares.</div>}
                 {!stackedView && (
                   <div className="mt-7 min-h-0 flex-1 space-y-6 overflow-y-auto pr-3">
                     {providerTotals.map((item) => (
