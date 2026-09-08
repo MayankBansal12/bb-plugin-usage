@@ -405,7 +405,20 @@ function UsageChart({
     ...provider,
     values: days.map((day) => totalsByKey.get(`${day}:${provider.id}`) ?? 0),
   }));
-  const rawMaximum = Math.max(0, ...series.flatMap((item) => item.values));
+  const dailyTotals = days.map((_, dayIndex) => series.reduce((sum, item) => sum + item.values[dayIndex], 0));
+  const stackOrder = series
+    .map((item) => ({ ...item, total: item.values.reduce((sum, value) => sum + value, 0) }))
+    .sort((left, right) => left.total - right.total || left.name.localeCompare(right.name));
+  const cumulativeValues = days.map(() => 0);
+  const stackedSeries = stackOrder.map((item) => {
+    const lowerValues = [...cumulativeValues];
+    const upperValues = item.values.map((value, dayIndex) => {
+      cumulativeValues[dayIndex] += value;
+      return cumulativeValues[dayIndex];
+    });
+    return { ...item, lowerValues, upperValues };
+  });
+  const rawMaximum = Math.max(0, ...dailyTotals);
   const maximum = niceMaximum(rawMaximum);
   const chartWidth = width - inset.left - inset.right;
   const chartHeight = height - inset.top - inset.bottom;
@@ -430,6 +443,7 @@ function UsageChart({
         .filter((item) => item.value > 0)
         .sort((a, b) => b.value - a.value)
     : [];
+  const hoverTotal = hoverIndex !== null ? dailyTotals[hoverIndex] : 0;
   const tooltipLeft = hoverIndex !== null ? x(hoverIndex) : 0;
   const tooltipOnRight = tooltipLeft < width * 0.6;
 
@@ -478,15 +492,17 @@ function UsageChart({
         })}
 
         <g clipPath="url(#usage-chart-clip)">
-          {series.map((item) => {
-            const points = item.values.map((value, index) => ({ x: x(index), y: y(value) }));
-            const line = smoothPath(points, inset.top, inset.top + chartHeight);
-            const area = `${line} L ${x(days.length - 1)} ${y(0)} L ${x(0)} ${y(0)} Z`;
+          {stackedSeries.map((item) => {
+            const upperPoints = item.upperValues.map((value, index) => ({ x: x(index), y: y(value) }));
+            const lowerPoints = item.lowerValues.map((value, index) => ({ x: x(index), y: y(value) })).reverse();
+            const upperLine = smoothPath(upperPoints, inset.top, inset.top + chartHeight);
+            const lowerLine = smoothPath(lowerPoints, inset.top, inset.top + chartHeight).replace(/^M/, "L");
+            const area = `${upperLine} ${lowerLine} Z`;
             return (
               <g key={item.id}>
                 <path d={area} fill={`url(#usage-area-${item.id})`} />
                 <path
-                  d={line}
+                  d={upperLine}
                   fill="none"
                   stroke={providerColor(item.id)}
                   strokeWidth="2.5"
@@ -497,6 +513,15 @@ function UsageChart({
               </g>
             );
           })}
+          <path
+            d={smoothPath(dailyTotals.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
+            fill="none"
+            className="stroke-foreground/55"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
         </g>
 
         {hoverIndex !== null && (
@@ -510,11 +535,11 @@ function UsageChart({
               strokeWidth="1"
               vectorEffect="non-scaling-stroke"
             />
-            {series.map((item) => (
+            {stackedSeries.map((item) => (
               <circle
                 key={item.id}
                 cx={x(hoverIndex)}
-                cy={y(item.values[hoverIndex])}
+                cy={y(item.upperValues[hoverIndex])}
                 r="3.5"
                 fill={providerColor(item.id)}
                 stroke="var(--background)"
@@ -546,6 +571,10 @@ function UsageChart({
           }}
         >
           <div className="font-medium text-foreground">{formatDay(hoverDay, true)}</div>
+          <div className="mt-1.5 flex items-center justify-between gap-3 border-b border-border/60 pb-1.5 font-medium">
+            <span>Total</span>
+            <span className="tabular-nums">{formatValue(hoverTotal)}</span>
+          </div>
           {hoverSeries.length === 0 ? (
             <div className="mt-1 text-muted-foreground">No usage</div>
           ) : (
@@ -788,7 +817,7 @@ function ProviderLimits({
     </section>
   );
 }
-function UsageLimitsToggle() {
+function UsageLimitsToggle({ compact = false }: { compact?: boolean }) {
   const toolbar = useUsageToolbar();
 
   return (
@@ -796,9 +825,9 @@ function UsageLimitsToggle() {
       <Checkbox
         checked={toolbar.showUsageLimits}
         onCheckedChange={(checked) => rememberShowUsageLimits(checked === true)}
-        aria-label="Show usage limits"
+        aria-label="View usage limits"
       />
-      <span>Usage limits</span>
+      <span>{compact ? "View limits" : "View usage limits"}</span>
     </label>
   );
 }
@@ -847,7 +876,7 @@ function UsageToolbarControls({ placement }: { placement: "header" | "body" }) {
     );
   }
   return (
-    <section aria-label="Usage filters" className="min-w-0 rounded-xl border border-border/60 bg-muted/[0.08] p-2">
+    <section aria-label="Usage filters" className="min-w-0">
       <div className="grid min-w-0 grid-cols-[minmax(112px,0.72fr)_minmax(0,1.28fr)] gap-2">
         {rangeSelect}
         {machineSelect}
@@ -887,7 +916,7 @@ function UsageHeaderControls() {
   if (compactHeader) {
     return (
       <div className="flex items-center gap-1">
-        <UsageLimitsToggle />
+        <UsageLimitsToggle compact />
         <UsageSyncButton />
       </div>
     );
@@ -913,7 +942,7 @@ function UsageDashboard() {
   const providerLimitsRequestId = useRef(0);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
-  const [chartMode, setChartMode] = useState<ChartMode>("cost");
+  const [chartMode, setChartMode] = useState<ChartMode>("tokens");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
@@ -1257,7 +1286,7 @@ function UsageDashboard() {
             {(!stackedView || mobileSection === "chart") && (
             <>
             <section
-              className={`grid items-stretch ${stackedView ? "gap-4 sm:gap-5" : "gap-10 lg:gap-14"}`}
+              className={`grid items-stretch ${stackedView ? "gap-4 sm:gap-5" : "gap-6 lg:gap-8"}`}
               style={stackedView ? undefined : { gridTemplateColumns: "minmax(330px, 0.92fr) minmax(0, 1.65fr)" }}
             >
               <div className={stackedView ? `flex min-w-0 flex-col p-4 sm:p-5 ${CARD_CLASSES}` : "relative flex min-w-0 flex-col"}>
