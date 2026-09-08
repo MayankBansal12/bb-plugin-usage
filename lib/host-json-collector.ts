@@ -65,7 +65,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // zero-token / zero-cost rows. Cached rows store a precomputed `day`, so the
   // version MUST rise or upgraded hosts keep serving UTC buckets forever,
   // silently mixed with newly parsed local ones.
-  const cacheVersion = 4;
+  // v5: keep recorded and unpriced Pi/Prime usage in separate buckets.
+  const cacheVersion = 5;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
@@ -150,7 +151,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       cacheWriteTokens: count(raw.cacheWriteTokens),
       outputTokens: count(raw.outputTokens),
     };
-    const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project]);
+    const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project,
+      (input.agentId === "pi" || input.agentId === "prime") ? (row.loggedCostUsd !== null && row.loggedCostUsd > 0 ? "logged" : "estimate") : "all"]);
     const prior = target.get(key);
     if (!prior) {
       target.set(key, row);

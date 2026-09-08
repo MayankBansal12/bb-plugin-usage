@@ -32,11 +32,11 @@ JSON-log collection requires Node.js on each enrolled machine. Logs are streamed
 
 FX history follows the rolling retention of FX's local usage ledger. The plugin reads generation usage facts only; FX sessions and prompts are not scanned.
 
-OpenCode collection requires an OpenCode CLI with `opencode db --format json` support on each enrolled machine. The fixed `SELECT` query aggregates assistant-message usage from the last 90 calendar days—the longest range the dashboard supports—returns only usage metadata, is limited to 900 KB of output, and times out after 60 seconds. OpenCode costs use only positive values recorded by OpenCode; providers with no recorded cost remain unknown with zero cost.
+OpenCode collection requires an OpenCode CLI with `opencode db --format json` support on each enrolled machine. The fixed `SELECT` query aggregates assistant-message usage from the last 90 calendar days—the longest range the dashboard supports—returns only usage metadata, is limited to 900 KB of output, and times out after 60 seconds. OpenCode, Pi, and Prime preserve positive agent-recorded costs and otherwise estimate cost from models.dev token rates. Models without recorded costs or catalog rates remain unknown.
 
 OpenCode Go limit collection requires `curl` plus either `jq` or Node.js on the enrolled machine, and an OpenCode Go subscription configured in OpenCode's auth file. The API key stays on that machine: the collector reads it locally, calls the usage endpoint, and reports only window percentages and reset times. Machines without a Go credential or plan are skipped silently. Transient failures retain the last successful snapshot and are shown alongside the cached values.
 
-The plugin never stores prompts or message content. It stores timestamps, agent/model identifiers, token buckets, pricing status, and aggregate cost. To break usage down by project it also records the working directory's final segment (the project folder name, e.g. `bb-plugin-usage`) for agents that log one; the full directory path is never stored or transferred. FX uses the spend recorded in its local usage ledger, OpenCode uses positive agent-recorded costs only, and other agents use standard API-rate estimates when models.dev can resolve a model, then agent-reported cost when available. They are not subscription-billing totals.
+The plugin never stores prompts or message content. It stores timestamps, agent/model identifiers, token buckets, pricing status, and aggregate cost. To break usage down by project it also records the working directory's final segment (the project folder name, e.g. `bb-plugin-usage`) for agents that log one; the full directory path is never stored or transferred. FX uses the spend recorded in its local usage ledger, OpenCode, Pi, and Prime prefer positive agent-recorded costs and fall back to standard API-rate estimates, and other agents use standard API-rate estimates when models.dev can resolve a model, then agent-reported cost when available. They are not subscription-billing totals.
 
 Missing log roots are treated as normal “no data” results. Offline machines, unreadable files, malformed collector output, missing runtime tools, query failures, and timeouts are retained as per-agent sync states so available history remains visible with an error notice.
 
@@ -75,3 +75,7 @@ bb plugin dev
 ## Contributions
 
 Ideas, fixes, and improvements are welcome.
+
+### Cost estimates and unknown pricing
+
+Recorded and unpriced requests are kept in separate aggregate buckets so a recorded cost never suppresses estimates for other requests. Known providers use only their own catalog rates; automatic model aliases are limited to date suffixes. Unknown models remain unpriced. Costs, charts, and shares cover priced usage only. Catalog estimates use current base token rates, without context-tier adjustments or invoice reconciliation.

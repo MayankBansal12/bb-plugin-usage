@@ -29,6 +29,7 @@ function activeProviders() {
 }
 
 const providerAliases: Record<string, string> = {
+  "openai-codex": "openai",
   bedrock: "amazon-bedrock",
   vertex: "google-vertex",
   "x-ai": "xai",
@@ -83,7 +84,7 @@ function matchWithinProvider(providerId: string, provider: CatalogProvider, mode
 
   const alias = Object.values(provider.models)
     .filter((candidate) => candidate.cost && modelIds.some((modelId) =>
-      modelId.startsWith(`${candidate.id.toLowerCase()}-`) || modelId.startsWith(`${candidate.id.toLowerCase()}:`)))
+      modelId.startsWith(`${candidate.id.toLowerCase()}-`) && /^-(?:\d{8}|\d{4}-\d{2}-\d{2})$/.test(modelId.slice(candidate.id.length))))
     .sort((a, b) => b.id.length - a.id.length)[0];
   const price = alias?.cost ? toPrice(alias.cost) : null;
   return price ? { modelProviderId: providerId, modelProviderName: providerName(providerId, provider), price, status: "models-dev-alias" } : null;
@@ -96,6 +97,9 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
     const match = matchWithinProvider(modelProviderId, provider, model);
     if (match) return match;
   }
+
+  // Explicit providers must never inherit a different vendor's rates.
+  if (modelProviderId !== "unknown") return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
 
   const exactMatches = Object.entries(activeProviders()).flatMap(([candidateId, candidate]) => {
     const exact = normalizedModelIds(modelProviderId, model).map((modelId) => candidate.models[modelId]).find((item) => item?.cost);
