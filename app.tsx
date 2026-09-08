@@ -1264,7 +1264,7 @@ function UsageDashboard() {
                 <div className={stackedView ? "flex min-w-0 flex-col" : "absolute inset-0 flex min-w-0 flex-col"}>
                 <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-medium text-muted-foreground">{totals.unknownTokens > 0 ? "Known cost" : "Raw token cost"}</span>
+                    <span className="text-xs font-medium text-muted-foreground">Raw token cost</span>
                     {dataWarning && (
                       <TooltipProvider>
                         <Tooltip delayDuration={150}>
