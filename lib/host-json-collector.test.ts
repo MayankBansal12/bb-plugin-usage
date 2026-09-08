@@ -313,7 +313,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(4);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(5);
   });
 
   it("keeps host filesystem paths out of failure diagnostics", async () => {
@@ -333,4 +333,28 @@ describe("host JSON usage collector", () => {
     expect(result.error).toBe("A usage log could not be read.");
     await chmod(secret, 0o600);
   });
+});
+
+
+it.each(["pi", "prime"] as const)("keeps mixed %s cost buckets across scans", async (agentId) => {
+  const directory = await temporaryDirectory();
+  const root = join(directory, "sessions");
+  await mkdir(root);
+  const cachePath = join(directory, "cache.json");
+  await writeFile(join(root, "session.jsonl"), [7, 0].map((cost, id) => JSON.stringify({
+    type: "message", id: String(id), timestamp: "2026-08-09T00:00:01Z", message: {
+      role: "assistant", provider: "openai", model: "gpt-5.6-sol",
+      usage: { input: 1000000, output: 0, cost: { total: cost } },
+    },
+  })).join("\n"));
+  const { parseHostUsageAggregates } = await import("../collectors");
+  for (let i = 0; i < 2; i++) {
+    const result = await scan(agentId, root, cachePath);
+    const rows = parseHostUsageAggregates(JSON.stringify(result.rows), agentId, { machineId: "test", machineName: "test" });
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map(r => r.eventKey)).size).toBe(2);
+    expect(rows.reduce((sum, row) => sum + row.costUsd, 0)).toBe(12);
+    expect(rows.reduce((sum, row) => sum + row.processedTokens, 0)).toBe(2000000);
+    expect(result.reusedFileCount).toBe(i);
+  }
 });

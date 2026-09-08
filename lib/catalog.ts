@@ -3,6 +3,8 @@ import { pricingRevision, setPricingCatalog, type CatalogProvider } from "./pric
 
 type Database = { prepare: (sql: string) => unknown };
 
+const pendingCatalogs = new WeakMap<Database, { data: string; revision: string }>();
+
 const REFRESH_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15_000;
 
@@ -42,6 +44,8 @@ function activate(raw: string, revision: string | undefined) {
 }
 
 export function activateCachedCatalog(db: Database): string {
+  const pending = pendingCatalogs.get(db);
+  if (pending && activate(pending.data, pending.revision)) return pending.revision;
   const cached = readRow(db);
   if (cached?.data && activate(cached.data, cached.revision)) return cached.revision!;
   return pricingRevision();
@@ -61,10 +65,11 @@ export async function refreshCatalog(db: Database, fetchImpl?: typeof globalThis
     const fetchedAt = new Date().toISOString();
     const data = JSON.stringify(providers);
     const revision = cached?.data === data && cached.revision ? cached.revision : `models.dev@${fetchedAt}`;
+    pendingCatalogs.set(db, { data, revision });
     try {
       saveRow(db, revision, fetchedAt, data);
     } catch {
-      // Caching is best-effort; the in-memory catalog still activates.
+      // The next sync activates the pending catalog even if persistence fails.
     }
     return revision;
   } catch {

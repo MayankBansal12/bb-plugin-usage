@@ -83,6 +83,7 @@ type UsageRecord = {
   costUsd: number;
   loggedCostUsd: number | null;
   pricingStatus: string;
+  unknownPricedTokens: number;
   cacheSavingsUsd: number;
   processedTokens: number;
   cachedInputTokens: number;
@@ -1026,13 +1027,14 @@ function UsageDashboard() {
 
   const totals = useMemo(() => rows.reduce((sum, row) => ({
     cost: sum.cost + row.costUsd,
+    unknownTokens: sum.unknownTokens + row.unknownPricedTokens,
     processed: sum.processed + row.processedTokens,
     cached: sum.cached + row.cachedInputTokens,
     cacheWrites: sum.cacheWrites + row.cacheWriteTokens,
     cacheSavings: sum.cacheSavings + row.cacheSavingsUsd,
     uncached: sum.uncached + row.uncachedInputTokens,
     output: sum.output + row.outputTokens,
-  }), { cost: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0 }), [rows]);
+  }), { cost: 0, unknownTokens: 0, processed: 0, cached: 0, cacheWrites: 0, cacheSavings: 0, uncached: 0, output: 0 }), [rows]);
 
   const dailySeries = useMemo(() => {
     const days = rangeDays(range);
@@ -1058,7 +1060,7 @@ function UsageDashboard() {
 
   type BreakdownRow = {
     key: string; label: string; agent: string; agentId: string; provider: string; providerId: string;
-    cost: number; tokens: number;
+    cost: number; tokens: number; unknown?: boolean;
     // Only project rows fold several agents into one badge; the folded ones are
     // listed here so the `+N` suffix can name them on hover.
     otherAgents?: Array<{ id: string; name: string; cost: number }>;
@@ -1067,7 +1069,8 @@ function UsageDashboard() {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
       const key = `${row.agentId}:${row.modelProviderId}:${row.model}`;
-      const current = map.get(key) ?? { key, label: row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
+      const current: BreakdownRow = map.get(key) ?? { key, label: row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
+      current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
       map.set(key, current);
@@ -1080,11 +1083,12 @@ function UsageDashboard() {
   const projectBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> }>();
     for (const row of rows) {
-      const current = map.get(row.project) ?? {
+      const current: BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> } = map.get(row.project) ?? {
         key: row.project, label: row.project, agent: row.agentName, agentId: row.agentId,
         provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0,
         byAgent: new Map<string, { name: string; cost: number }>(),
       };
+      current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
       const agent = current.byAgent.get(row.agentId) ?? { name: row.agentName, cost: 0 };
@@ -1109,7 +1113,8 @@ function UsageDashboard() {
   const dayBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
-      const current = map.get(row.day) ?? { key: row.day, label: formatDay(row.day, true), agent: "All agents", agentId: "all", provider: "All providers", providerId: "all", cost: 0, tokens: 0 };
+      const current: BreakdownRow = map.get(row.day) ?? { key: row.day, label: formatDay(row.day, true), agent: "All agents", agentId: "all", provider: "All providers", providerId: "all", cost: 0, tokens: 0 };
+      current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
       map.set(row.day, current);
@@ -1259,7 +1264,7 @@ function UsageDashboard() {
                 <div className={stackedView ? "flex min-w-0 flex-col" : "absolute inset-0 flex min-w-0 flex-col"}>
                 <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
                   <div className="flex items-center gap-1.5">
-                    <span className="text-xs font-medium text-muted-foreground">Raw token cost</span>
+                    <span className="text-xs font-medium text-muted-foreground">{totals.unknownTokens > 0 ? "Known cost" : "Raw token cost"}</span>
                     {dataWarning && (
                       <TooltipProvider>
                         <Tooltip delayDuration={150}>
@@ -1292,7 +1297,8 @@ function UsageDashboard() {
                   <CostValue value={totals.cost} />
                   *
                 </div>
-                <div className="mt-1 text-sm text-muted-foreground">If billed at standard API rates</div>
+                <div className="mt-1 text-sm text-muted-foreground">Estimated at standard API rates</div>
+                {totals.unknownTokens > 0 && <div className="mt-1 text-sm text-muted-foreground">{compact(totals.unknownTokens)} tokens have unknown pricing and are excluded from costs, charts, and shares.</div>}
                 {!stackedView && (
                   <div className="mt-7 min-h-0 flex-1 space-y-6 overflow-y-auto pr-3">
                     {providerTotals.map((item) => (
@@ -1405,7 +1411,7 @@ function UsageDashboard() {
                           )}
                           <span className="truncate">{row.label}</span>
                         </span>
-                        <span className="shrink-0 text-sm font-medium tabular-nums"><CostValue value={row.cost} /></span>
+                        <span className="shrink-0 text-sm font-medium tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></span>
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
                         {breakdownMode !== "day" && (
@@ -1426,7 +1432,7 @@ function UsageDashboard() {
                           <span className="tabular-nums text-foreground/80">{compact(row.tokens)}</span>
                           <span>tokens</span>
                         </RowBadge>
-                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</span>
+                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{row.unknown ? "—" : percentage(row.cost, totals.cost)}</span>
                       </div>
                     </div>
                   ))}
@@ -1465,8 +1471,8 @@ function UsageDashboard() {
                               <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} />
                             </td>
                           )}
-                          <td className="px-4 py-3 text-right tabular-nums"><CostValue value={row.cost} /></td>
-                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{percentage(row.cost, totals.cost)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{row.unknown ? "—" : percentage(row.cost, totals.cost)}</td>
                           <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
                         </tr>
                       ))}

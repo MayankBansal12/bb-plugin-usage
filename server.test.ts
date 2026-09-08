@@ -746,3 +746,21 @@ describe("OpenCode Go limits", () => {
     }));
   });
 });
+
+
+it("prices OpenCode mixed recorded and unpriced requests independently", async () => {
+  const db = new Database(":memory:");
+  try {
+    db.exec("CREATE TABLE session (id TEXT, time_updated INTEGER); CREATE TABLE message (session_id TEXT, time_created INTEGER, data TEXT);");
+    const now = Date.now();
+    db.prepare("INSERT INTO session VALUES (?, ?)").run("test", now);
+    for (const cost of [7, 0]) db.prepare("INSERT INTO message VALUES (?, ?, ?)").run("test", now, JSON.stringify({
+      role: "assistant", providerID: "openai", modelID: "gpt-5.6-sol", cost, tokens: { input: 1000000, output: 0 },
+    }));
+    const { parseOpenCode } = await import("./collectors");
+    const rows = parseOpenCode(JSON.stringify(db.prepare(openCodeSql()).all()), { machineId: "test", machineName: "test" });
+    expect(rows).toHaveLength(2);
+    expect(new Set(rows.map(r => r.eventKey)).size).toBe(2);
+    expect(rows.reduce((sum, r) => sum + r.costUsd, 0)).toBe(12);
+  } finally { db.close(); }
+});

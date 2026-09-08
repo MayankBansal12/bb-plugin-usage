@@ -22,7 +22,7 @@ const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
   modelProviderId: z.string(), modelProviderName: z.string(),
   machineId: z.string(), machineName: z.string(), model: z.string(), project: z.string(),
-  costUsd: z.number(), loggedCostUsd: z.number().nullable(), pricingStatus: z.string(),
+  unknownPricedTokens: z.number(), costUsd: z.number(), loggedCostUsd: z.number().nullable(), pricingStatus: z.string(),
   cacheSavingsUsd: z.number(), processedTokens: z.number().int(), cachedInputTokens: z.number().int(),
   cacheWriteTokens: z.number().int(), uncachedInputTokens: z.number().int(), outputTokens: z.number().int(),
 });
@@ -514,7 +514,7 @@ FROM recent_sessions rs
 JOIN message m ON m.session_id = rs.id
 WHERE json_extract(m.data, '$.role') = 'assistant'
   AND m.time_created >= CAST(strftime('%s', 'now', 'localtime', 'start of day', '-${oldestDayOffset} days', 'utc') AS INTEGER) * 1000
-GROUP BY day, modelProviderId, model
+GROUP BY day, modelProviderId, model, (COALESCE(json_extract(m.data, '$.cost'), 0) > 0)
 ORDER BY day, modelProviderId, model;`.trim();
 }
 
@@ -713,6 +713,7 @@ export function dashboardRecordsSql() {
     ) SELECT day, provider_id agentId, provider_name agentName,
     model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model, project,
     SUM(cost_usd) costUsd,
+    SUM(CASE WHEN pricing_status='unknown' THEN processed_tokens ELSE 0 END) unknownPricedTokens,
     CASE WHEN COUNT(logged_cost_usd)=0 THEN NULL ELSE SUM(logged_cost_usd) END loggedCostUsd,
     CASE
       WHEN SUM(CASE WHEN pricing_status='unknown' THEN 1 ELSE 0 END)>0 THEN 'unknown'
@@ -877,13 +878,14 @@ export default async function plugin(bb: BbPluginApi) {
   bb.background.service("usage-collector", {
     async start(signal) {
       while (!signal.aborted) {
+        // Refresh before collecting so newly listed models price on the first sync.
+        try { await refreshCatalog(db); } catch (error) {
+          bb.log.warn(`models.dev catalog refresh failed: ${errorMessage(error)}`);
+        }
         try { await syncAll(signal); } catch (error) {
           if (!signal.aborted) bb.log.error(`Usage sync failed: ${errorMessage(error)}`);
         }
         if (signal.aborted) break;
-        try { await refreshCatalog(db); } catch (error) {
-          bb.log.warn(`models.dev catalog refresh failed: ${errorMessage(error)}`);
-        }
         await abortableDelay(15 * 60_000, signal);
       }
     },

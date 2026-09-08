@@ -1,5 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi, parsePrime } from "./collectors";
+
+import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
+
+afterEach(() => resetPricingCatalog());
 
 const machine = { machineId: "machine-a", machineName: "Machine A" };
 
@@ -77,6 +81,17 @@ describe("usage collectors", () => {
     expect(JSON.stringify(record)).not.toContain("not retained");
   });
 
+  it("groups Pi Codex usage under OpenAI while retaining its agent and logged cost", () => {
+    const content = JSON.stringify({ type: "message", id: "codex-entry", timestamp: "2026-08-09T00:00:01Z", message: {
+      role: "assistant", provider: "openai-codex", model: "gpt-5.6-terra",
+      usage: { input: 40, output: 20, cost: { total: 0.0012 } },
+    } });
+    expect(parsePi(content, machine)[0]).toMatchObject({
+      agentId: "pi", modelProviderId: "openai", modelProviderName: "OpenAI",
+      costUsd: 0.0012, loggedCostUsd: 0.0012, pricingStatus: "logged", processedTokens: 60,
+    });
+  });
+
   it("parses Prime Agent as a distinct agent with Pi-compatible usage", () => {
     const content = [
       { type: "session", version: 3, id: "prime-session", timestamp: "2026-08-09T00:00:00Z" },
@@ -99,7 +114,7 @@ describe("usage collectors", () => {
   it("parses OpenCode metadata aggregates and rejects malformed output", () => {
     const content = JSON.stringify([{ day: "2026-08-09", modelProviderId: "anthropic", model: "claude-sonnet-5", loggedCostUsd: 0.02, inputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 15, reasoningTokens: 5 }]);
     expect(parseOpenCode(content, machine)[0]).toMatchObject({
-      eventKey: "opencode:machine-a:2026-08-09:anthropic:claude-sonnet-5", agentId: "opencode",
+      eventKey: "opencode:machine-a:2026-08-09:anthropic:claude-sonnet-5:logged", agentId: "opencode",
       modelProviderId: "anthropic", processedTokens: 185, cachedInputTokens: 60, uncachedInputTokens: 100,
       outputTokens: 20, costUsd: 0.02, loggedCostUsd: 0.02, pricingStatus: "logged", cacheSavingsUsd: 0.000108,
     });
@@ -109,16 +124,16 @@ describe("usage collectors", () => {
     expect(parseOpenCode("[]", machine)).toEqual([]);
   });
 
-  it("leaves OpenCode cost unknown when the agent did not record a positive cost", () => {
+  it("estimates OpenCode cost when the agent did not record a positive cost", () => {
     const content = JSON.stringify([{
       day: "2026-08-09", modelProviderId: "openai", model: "gpt-5.6-sol", loggedCostUsd: 0,
       inputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 15, reasoningTokens: 5,
     }]);
     expect(parseOpenCode(content, machine)[0]).toMatchObject({
-      modelProviderId: "openai", costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown", cacheSavingsUsd: 0.00027,
+      modelProviderId: "openai", costUsd: 0.001161, loggedCostUsd: null, pricingStatus: "models-dev-exact", cacheSavingsUsd: 0.00027,
     });
     expect(parseOpenCode(content.replace('"loggedCostUsd":0', '"loggedCostUsd":-0.01'), machine)[0]).toMatchObject({
-      costUsd: 0, loggedCostUsd: null, pricingStatus: "unknown",
+      costUsd: 0.001161, loggedCostUsd: null, pricingStatus: "models-dev-exact",
     });
   });
 
@@ -165,7 +180,7 @@ describe("usage collectors", () => {
       processedTokens: 125,
     });
     expect(parseHostUsageAggregates(content, "prime", machine)[0]).toMatchObject({
-      eventKey: "prime:machine-a:2026-08-09:openai:gpt-5.6-sol:Unknown",
+      eventKey: "prime:machine-a:2026-08-09:openai:gpt-5.6-sol:Unknown:estimate",
       agentId: "prime",
       agentName: "Prime Agent",
     });
@@ -225,5 +240,39 @@ describe("usage collectors", () => {
       modelProviderId: "google",
       processedTokens: 11072,
     });
+  });
+});
+
+
+describe("agent cost fallback", () => {
+  const setup = () => setPricingCatalog({ openai: { name: "OpenAI", models: {
+    "gpt-6-astra": { id: "gpt-6-astra", cost: { input: 10, output: 50, cache_read: 1, cache_write: 12.5 } },
+    "gpt-5.6-luna": { id: "gpt-5.6-luna", cost: { input: 0.2, output: 1.2, cache_read: 0.02, cache_write: 0.25 } },
+  } } }, "test");
+
+  it.each(["gpt-6-astra", "gpt-5.6-luna"])("prices OpenCode %s token buckets", (model) => {
+    setup();
+    const row = { day: "2026-08-09", modelProviderId: "openai", model, loggedCostUsd: 0,
+      inputTokens: 1000000, cachedInputTokens: 1000000, cacheWriteTokens: 1000000, outputTokens: 800000, reasoningTokens: 200000 };
+    expect(parseOpenCode(JSON.stringify([row]), machine)[0]).toMatchObject({
+      costUsd: model === "gpt-6-astra" ? 73.5 : 1.67, pricingStatus: "models-dev-exact", processedTokens: 4000000,
+    });
+    expect(parseOpenCode(JSON.stringify([{ ...row, loggedCostUsd: 7 }]), machine)[0]).toMatchObject({ costUsd: 7, pricingStatus: "logged" });
+    expect(parseOpenCode(JSON.stringify([{ ...row, model: "unlisted" }]), machine)[0]).toMatchObject({ costUsd: 0, pricingStatus: "unknown" });
+  });
+
+  it.each([0, null, -1])("estimates Pi and Prime with recorded cost %s, including host aggregates", (loggedCostUsd) => {
+    setup();
+    const content = JSON.stringify({ type: "message", id: "entry", timestamp: "2026-08-09T00:00:01Z", message: {
+      role: "assistant", provider: "openai-codex", model: "gpt-6-astra",
+      usage: { input: 1000000, cacheRead: 1000000, cacheWrite: 1000000, output: 1000000, cost: { total: loggedCostUsd } },
+    } });
+    for (const parser of [parsePi, parsePrime]) expect(parser(content, machine)[0]).toMatchObject({ costUsd: 73.5, pricingStatus: "models-dev-exact", modelProviderId: "openai" });
+    for (const agent of ["pi", "prime"] as const) {
+      const row = { day: "2026-08-09", modelProviderId: "openai-codex", model: "gpt-6-astra", loggedCostUsd,
+        uncachedInputTokens: 1000000, cachedInputTokens: 1000000, cacheWriteTokens: 1000000, outputTokens: 1000000 };
+      expect(parseHostUsageAggregates(JSON.stringify([row]), agent, machine)[0]).toMatchObject({ costUsd: 73.5, pricingStatus: "models-dev-exact" });
+      expect(parseHostUsageAggregates(JSON.stringify([{ ...row, loggedCostUsd: 7 }]), agent, machine)[0]).toMatchObject({ costUsd: 7, pricingStatus: "logged" });
+    }
   });
 });

@@ -76,3 +76,14 @@ describe("models.dev catalog refresh", () => {
     expect(priceFor("openai", "gpt-5.6-terra")).toEqual({ input: 2, cached: 0.2, cacheWrite: 2.5, output: 12 });
   });
 });
+
+
+it("activates fresh prices at the next sync even when persistence fails", async () => {
+  const db = { prepare: () => ({ get: () => undefined, run: () => { throw new Error("disk full"); } }) };
+  await refreshCatalog(db, vi.fn(async () => jsonResponse) as unknown as typeof fetch);
+  expect(priceFor("openai", "gpt-test-model")).toBeNull();
+  activateCachedCatalog(db);
+  expect(priceFor("openai", "gpt-test-model")).toEqual({ input: 1, cached: 1, cacheWrite: 1, output: 2 });
+  activateCachedCatalog(db);
+  expect(priceFor("openai", "gpt-test-model")).not.toBeNull();
+});

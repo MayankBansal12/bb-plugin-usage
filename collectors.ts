@@ -39,7 +39,7 @@ type UsageInput = {
   cachedInputTokens: number;
   cacheWriteTokens: number;
   outputTokens: number;
-  costMode?: "estimate-or-logged" | "logged-only" | "positive-logged-only";
+  costMode?: "estimate-or-logged" | "logged-only" | "logged-or-estimate";
 };
 
 type ParseContext = { machineId: string; machineName: string };
@@ -123,11 +123,11 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
   const logged = finite(input.loggedCostUsd);
   const positiveLogged = logged !== null && logged > 0 ? logged : null;
   const loggedOnly = input.costMode === "logged-only";
-  const recordedOnly = loggedOnly || input.costMode === "positive-logged-only";
+  const recordedOnly = loggedOnly || (input.costMode === "logged-or-estimate" && positiveLogged !== null);
   const estimated = !recordedOnly && pricing.price
     ? ((uncached * pricing.price.input) + (cached * pricing.price.cached) + (writes * pricing.price.cacheWrite) + (output * pricing.price.output)) / 1_000_000
     : null;
-  const effectiveLogged = input.costMode === "positive-logged-only"
+  const effectiveLogged = input.costMode === "logged-or-estimate"
     ? positiveLogged
     : loggedOnly && logged !== null ? Math.max(0, logged) : logged;
   const timestamp = isoTimestamp(input.timestamp) ?? input.timestamp;
@@ -246,7 +246,7 @@ function parsePiCompatible(
     records.push(usageRecord({
       eventKey: `${agentId}:${sessionId}:${text(value.id, String(line))}`, timestamp, agentId, agentName,
       modelProviderId: text(message.provider, "unknown"), model: text(message.responseModel, text(message.model, "unknown")),
-      project, loggedCostUsd, costMode: "positive-logged-only",
+      project, loggedCostUsd, costMode: "logged-or-estimate",
       uncachedInputTokens: count(usage.input),
       cachedInputTokens: count(usage.cacheRead), cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
     }, context));
@@ -293,9 +293,9 @@ export function parseOpenCode(content: string, context: ParseContext): UsageReco
     const modelProviderId = normalizeProviderId(modelProvider);
     const [input, cached, cacheWrite, output, reasoning] = tokenValues as number[];
     return usageRecord({
-      eventKey: `opencode:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}`,
+      eventKey: `opencode:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${loggedCost > 0 ? "logged" : "estimate"}`,
       timestamp, day, agentId: "opencode", agentName: "OpenCode", modelProviderId, model,
-      loggedCostUsd: loggedCost, costMode: "positive-logged-only", uncachedInputTokens: input,
+      loggedCostUsd: loggedCost, costMode: "logged-or-estimate", uncachedInputTokens: input,
       cachedInputTokens: cached, cacheWriteTokens: cacheWrite, outputTokens: output + reasoning,
     }, context);
   });
@@ -328,7 +328,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const model = text(row.model, "unknown");
     const project = text(row.project, "Unknown");
     return [usageRecord({
-      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}`,
+      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
       agentId,
@@ -338,7 +338,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       project,
       loggedCostUsd: finite(row.loggedCostUsd),
       costMode: agentId === "fx" ? "logged-only"
-        : agentId === "prime" || agentId === "pi" ? "positive-logged-only"
+        : agentId === "prime" || agentId === "pi" ? "logged-or-estimate"
         : undefined,
       uncachedInputTokens: count(row.uncachedInputTokens),
       cachedInputTokens: count(row.cachedInputTokens),

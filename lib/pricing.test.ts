@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { normalizeProviderId, priceFor, resetPricingCatalog, resolvePricing, setPricingCatalog, pricingVersion } from "./pricing";
 
 describe("models.dev pricing", () => {
@@ -35,4 +35,16 @@ describe("models.dev pricing", () => {
     expect(priceFor("openai", "gpt-test-model")).toBeNull();
     expect(pricingVersion()).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
+});
+
+
+afterEach(() => resetPricingCatalog());
+it("does not guess variant prices or substitute explicit providers", () => {
+  setPricingCatalog({ openai: { models: { base: { id: "base", cost: { input: 2, output: 3 } } } }, reseller: { models: { exclusive: { id: "exclusive", cost: { input: 99, output: 99 } } } } }, "test");
+  expect(priceFor("openai", "base-fast")).toBeNull();
+  expect(priceFor("openai", "base:premium")).toBeNull();
+  expect(priceFor("openai", "base-2026-09-08")).toEqual(priceFor("openai", "base"));
+  expect(resolvePricing("openai", "exclusive")).toMatchObject({ modelProviderId: "openai", price: null });
+  expect(resolvePricing("custom-gateway", "exclusive")).toMatchObject({ modelProviderId: "custom-gateway", price: null });
+  expect(resolvePricing("unknown", "exclusive")).toMatchObject({ modelProviderId: "reseller", status: "models-dev-exact" });
 });
