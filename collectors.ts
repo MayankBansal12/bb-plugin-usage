@@ -1,6 +1,6 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
-export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity";
+export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura";
 
 export type UsageRecord = {
   eventKey: string;
@@ -316,6 +316,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     : agentId === "fx" ? "FX"
     : agentId === "prime" ? "Prime Agent"
     : agentId === "antigravity" ? "Antigravity"
+    : agentId === "thaura" ? "Thaura"
     : "Pi";
 
   return values.flatMap((raw) => {
@@ -328,7 +329,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const model = text(row.model, "unknown");
     const project = text(row.project, "Unknown");
     return [usageRecord({
-      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
+      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
       agentId,
@@ -338,7 +339,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       project,
       loggedCostUsd: finite(row.loggedCostUsd),
       costMode: agentId === "fx" ? "logged-only"
-        : agentId === "prime" || agentId === "pi" ? "logged-or-estimate"
+        : agentId === "prime" || agentId === "pi" || agentId === "thaura" ? "logged-or-estimate"
         : undefined,
       uncachedInputTokens: count(row.uncachedInputTokens),
       cachedInputTokens: count(row.cachedInputTokens),
