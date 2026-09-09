@@ -79,3 +79,7 @@ Ideas, fixes, and improvements are welcome.
 ### Cost estimates and unknown pricing
 
 Recorded and unpriced requests are kept in separate aggregate buckets so a recorded cost never suppresses estimates for other requests. Known providers use only their own catalog rates; automatic model aliases are limited to date suffixes. Unknown models remain unpriced. Costs, charts, and shares cover priced usage only. Catalog estimates use current base token rates, without context-tier adjustments or invoice reconciliation.
+
+### Backlog / WIP
+
+- **Voice cost integration**: Thaura bills audio transcription separately ($0.006 per audio minute via `/v1/audio/transcriptions`), which the token-based ledger does not capture. Track per-call audio minutes alongside tokens (or accept a logged `total_cost` covering them) so voice usage prices correctly.

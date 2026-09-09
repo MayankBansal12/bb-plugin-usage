@@ -241,6 +241,30 @@ describe("usage collectors", () => {
       processedTokens: 11072,
     });
   });
+
+  it("parses Thaura host aggregates and estimates cost from the pinned rate", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "thaura",
+      model: "thaura",
+      project: "Unknown",
+      loggedCostUsd: null,
+      uncachedInputTokens: 1_000_000,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 1_000_000,
+    }]);
+    expect(parseHostUsageAggregates(content, "thaura", machine)[0]).toMatchObject({
+      eventKey: "thaura:machine-a:2026-08-09:thaura:thaura:Unknown",
+      agentId: "thaura",
+      agentName: "Thaura",
+      modelProviderId: "thaura",
+      modelProviderName: "Thaura",
+      costUsd: 2.5,
+      pricingStatus: "models-dev-exact",
+      processedTokens: 2_000_000,
+    });
+  });
 });
 
 

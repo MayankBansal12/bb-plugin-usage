@@ -45,7 +45,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity"]),
+  agentId: z.enum(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -70,7 +70,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity"]);
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
 
@@ -185,7 +185,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   function matches(filePath: string) {
     const name = path.basename(filePath);
     if (input.agentId === "codex") return name.startsWith("rollout-") && name.endsWith(".jsonl");
-    if (input.agentId === "fx" || input.agentId === "antigravity") return name === "usage.jsonl";
+    if (input.agentId === "fx" || input.agentId === "antigravity" || input.agentId === "thaura") return name === "usage.jsonl";
     if (input.agentId === "grok") return name === "unified.jsonl";
     return name.endsWith(".jsonl");
   }
@@ -337,6 +337,30 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           modelProviderId: text(fact.provider, "google"),
           model: text(fact.model, "unknown"),
           project: projectName(fact.cwd ?? fact.workspace ?? value.cwd),
+          loggedCostUsd: finite(fact.total_cost),
+          uncachedInputTokens: inputTokens - cached,
+          cachedInputTokens: cached,
+          cacheWriteTokens: 0,
+          outputTokens: count(fact.output_tokens),
+        });
+        continue;
+      }
+
+      if (input.agentId === "thaura") {
+        // Written by the Thaura integration, one line per API call it makes
+        // to thaura.ai (OpenAI-compatible usage shape).
+        if (value.kind !== "generation") continue;
+        const fact = object(value.fact);
+        const usageDay = day(fact?.created_at_ms);
+        if (!fact || !usageDay) continue;
+        const model = text(fact.model, "thaura");
+        const inputTokens = count(fact.input_tokens);
+        const cached = Math.min(inputTokens, count(fact.cache_read_tokens));
+        add(rows, {
+          day: usageDay,
+          modelProviderId: "thaura",
+          model,
+          project: projectName(fact.cwd ?? value.cwd),
           loggedCostUsd: finite(fact.total_cost),
           uncachedInputTokens: inputTokens - cached,
           cachedInputTokens: cached,

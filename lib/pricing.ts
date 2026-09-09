@@ -36,6 +36,15 @@ const providerAliases: Record<string, string> = {
   copilot: "github-copilot",
 };
 
+// Providers not listed on models.dev get their published rates pinned here so
+// usage still prices before (or without) a catalog entry.
+const builtinPrices: Record<string, { name?: string; models: Record<string, Price> }> = {
+  thaura: {
+    name: "Thaura",
+    models: { thaura: { input: 0.5, cached: 0.5, cacheWrite: 0.5, output: 2 } },
+  },
+};
+
 export function pricingRevision() {
   return activeCatalog?.revision ?? generatedAt;
 }
@@ -96,6 +105,11 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
   if (provider) {
     const match = matchWithinProvider(modelProviderId, provider, model);
     if (match) return match;
+  }
+
+  const builtin = builtinPrices[modelProviderId]?.models[model.trim().toLowerCase()];
+  if (builtin) {
+    return { modelProviderId, modelProviderName: providerName(modelProviderId, provider) || builtinPrices[modelProviderId]!.name!, price: builtin, status: "models-dev-exact" };
   }
 
   // Explicit providers must never inherit a different vendor's rates.

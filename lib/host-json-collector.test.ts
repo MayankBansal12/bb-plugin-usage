@@ -187,6 +187,39 @@ describe("host JSON usage collector", () => {
     expect(second.rows).toEqual(first.rows);
   });
 
+  it("streams Thaura's usage ledger and prices its flat model rate", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "usage.jsonl");
+    const cachePath = join(directory, "cache", "thaura.json");
+    await writeFile(root, [
+      { kind: "coverage", status: "partial" },
+      { kind: "generation", fact: {
+        created_at_ms: Date.parse("2026-08-09T00:00:00Z"),
+        model: "thaura",
+        input_tokens: 100,
+        output_tokens: 15,
+        total_cost: null,
+      } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const first = await scan("thaura", root, cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual([expect.objectContaining({
+      day: localDay("2026-08-09T00:00:00Z"),
+      modelProviderId: "thaura",
+      model: "thaura",
+      uncachedInputTokens: 100,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 15,
+      loggedCostUsd: null,
+    })]);
+
+    const second = await scan("thaura", root, cachePath);
+    expect(second).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
   it("counts each Claude API response once across repeated rows, files, and cached scans", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "projects");
