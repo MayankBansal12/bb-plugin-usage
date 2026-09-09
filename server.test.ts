@@ -58,12 +58,20 @@ describe("JSON agent roots", () => {
     ]);
   });
 
+  it("includes the bb pi provider bridge session directory by default", () => {
+    expect(jsonAgentRoots("/home/user", "pi", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.pi/agent/sessions",
+      "/home/user/.bb/pi-bridge-sessions",
+    ]);
+  });
+
   it("moves known Prime roots out of legacy Pi extra roots", () => {
     expect(jsonAgentRoots("/home/user", "pi", {
       piSessionRoots: "~/.prime/agent; ~/.prime/agent/sessions; ~/.prime/agent/session-artifacts; /data/pi; /data/prime/sessions",
       primeSessionRoots: "/data/prime/sessions",
     })).toEqual([
       "/home/user/.pi/agent/sessions",
+      "/home/user/.bb/pi-bridge-sessions",
       "/data/pi",
     ]);
   });

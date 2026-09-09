@@ -345,7 +345,7 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
     : agentId === "grok" ? [`${home}/.grok/logs`]
     : agentId === "antigravity" ? [`${home}/.antigravity-acp/usage.jsonl`]
     : agentId === "prime" ? resolvedPrimeRoots
-    : [`${home}/.pi/agent/sessions`, ...configuredRoots(settings.piSessionRoots, home).filter((root) => {
+    : [`${home}/.pi/agent/sessions`, `${home}/.bb/pi-bridge-sessions`, ...configuredRoots(settings.piSessionRoots, home).filter((root) => {
       const defaultPrimeAgentRoot = `${home}/.prime/agent`;
       return root !== defaultPrimeAgentRoot && !resolvedPrimeRoots.includes(root);
     })];
