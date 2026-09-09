@@ -1,3 +1,4 @@
+import { grokLimitsCommand, grokLimitSnapshotSchema } from "./lib/grok-limits";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
@@ -87,6 +88,63 @@ const LIMIT_PROVIDERS = [
   { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
   { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
 ] as const;
+export const grokLimitsMigration = `CREATE TABLE IF NOT EXISTS grok_limits (
+  machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, snapshot_json TEXT,
+  fetched_at TEXT, error TEXT
+);`;
+
+export async function syncGrokLimits(
+  bb: BbPluginApi, db: Database, machine: Machine, signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  try {
+    const output = await executeHostCommand(bb, machine, grokLimitsCommand(), signal, {
+      title: "Usage: Grok Build limits", timeoutMs: 60_000,
+    });
+    const diagnostic = output.match(/__BB_USAGE_ERROR__:([^\r\n]+)/)?.[1]?.trim();
+    if (diagnostic) throw new Error(diagnostic);
+    const json = output.match(/__BB_USAGE_BEGIN__\s*([\s\S]*?)\s*__BB_USAGE_END__:0/)?.[1];
+    if (!json) throw new Error("Grok billing query returned incomplete output.");
+    const snapshot = grokLimitSnapshotSchema.parse(JSON.parse(json));
+    if (!snapshot.windows.length) throw new Error("Grok billing response contained no limit windows.");
+    db.prepare(`INSERT INTO grok_limits (machine_id, machine_name, snapshot_json, fetched_at, error)
+      VALUES (?, ?, ?, ?, NULL) ON CONFLICT(machine_id) DO UPDATE SET
+      machine_name=excluded.machine_name, snapshot_json=excluded.snapshot_json, fetched_at=excluded.fetched_at, error=NULL`)
+      .run(machine.id, machine.name, JSON.stringify(snapshot), new Date().toISOString());
+  } catch (error) {
+    const message = errorMessage(error);
+    if (message === "no-grok-credential" || message === "no-grok-plan") {
+      db.prepare("DELETE FROM grok_limits WHERE machine_id=?").run(machine.id);
+      return;
+    }
+    db.prepare(`INSERT INTO grok_limits (machine_id, machine_name, error) VALUES (?, ?, ?)
+      ON CONFLICT(machine_id) DO UPDATE SET machine_name=excluded.machine_name, error=excluded.error`)
+      .run(machine.id, machine.name, message);
+    bb.log.warn(`${machine.name}/grok: ${message}`);
+  }
+}
+
+export function loadStoredGrokLimits(db: Database, connectedMachineIds: Set<string>): ProviderLimitSource[] {
+  const rows = db.prepare("SELECT * FROM grok_limits ORDER BY machine_name").all() as Array<{
+    machine_id: string; machine_name: string; snapshot_json: string | null; fetched_at: string | null; error: string | null;
+  }>;
+  return rows.filter(row => connectedMachineIds.has(row.machine_id)).flatMap((row): ProviderLimitSource[] => {
+    let snapshot: z.infer<typeof grokLimitSnapshotSchema> | null = null;
+    let error = row.error;
+    try { if (row.snapshot_json) snapshot = grokLimitSnapshotSchema.parse(JSON.parse(row.snapshot_json)); }
+    catch { error = "Stored Grok limits could not be read."; }
+    // First-time failures remain in stored diagnostics and logs, not empty cards.
+    if (!snapshot?.windows.length) return [];
+    return [{
+      machineId: row.machine_id, machineName: row.machine_name,
+      agentId: "grok", agentName: "Grok Build", providerId: "grok", providerName: "Grok Build",
+      accountEmail: null, accountIdentity: snapshot?.accountIdentity ?? null, planLabel: null,
+      windows: snapshot?.windows ?? [], lastUpdatedAt: row.fetched_at,
+      status: error ? "error" : "ok", error,
+    }];
+  });
+}
+
 const PROVIDER_LIMITS_TIMEOUT_MS = 5_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
@@ -332,6 +390,7 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     for (const source of stale) db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
     db.prepare(`DELETE FROM usage_sources WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM usage_sync_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
+    db.prepare(`DELETE FROM grok_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
@@ -754,7 +813,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -797,6 +856,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "thaura", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
           syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
@@ -837,6 +897,7 @@ export default async function plugin(bb: BbPluginApi) {
       return groupProviderLimits([
         ...await loadProviderLimits(bb, machines, db),
         ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
+        ...loadStoredGrokLimits(db, connectedMachineIds),
       ]);
     })();
     try {
