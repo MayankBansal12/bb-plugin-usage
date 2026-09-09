@@ -329,7 +329,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const model = text(row.model, "unknown");
     const project = text(row.project, "Unknown");
     return [usageRecord({
-      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
+      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
       agentId,
@@ -339,7 +339,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       project,
       loggedCostUsd: finite(row.loggedCostUsd),
       costMode: agentId === "fx" ? "logged-only"
-        : agentId === "prime" || agentId === "pi" ? "logged-or-estimate"
+        : agentId === "prime" || agentId === "pi" || agentId === "thaura" ? "logged-or-estimate"
         : undefined,
       uncachedInputTokens: count(row.uncachedInputTokens),
       cachedInputTokens: count(row.cachedInputTokens),

@@ -255,7 +255,7 @@ describe("usage collectors", () => {
       outputTokens: 1_000_000,
     }]);
     expect(parseHostUsageAggregates(content, "thaura", machine)[0]).toMatchObject({
-      eventKey: "thaura:machine-a:2026-08-09:thaura:thaura:Unknown",
+      eventKey: "thaura:machine-a:2026-08-09:thaura:thaura:Unknown:estimate",
       agentId: "thaura",
       agentName: "Thaura",
       modelProviderId: "thaura",
@@ -264,6 +264,34 @@ describe("usage collectors", () => {
       pricingStatus: "models-dev-exact",
       processedTokens: 2_000_000,
     });
+  });
+
+  it("prefers Thaura's recorded cost over the estimate and keeps mixed days separate", () => {
+    const day = "2026-08-09";
+    const logged = JSON.stringify([{
+      day, modelProviderId: "thaura", model: "thaura", project: "Unknown",
+      loggedCostUsd: 7, uncachedInputTokens: 1_000_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1_000_000,
+    }]);
+    expect(parseHostUsageAggregates(logged, "thaura", machine)[0]).toMatchObject({
+      eventKey: `thaura:machine-a:${day}:thaura:thaura:Unknown:logged`,
+      costUsd: 7,
+      loggedCostUsd: 7,
+      pricingStatus: "logged",
+    });
+
+    // One $7 recorded request plus one ~$2.50 estimated request on the same day
+    // must total $9.50, not blend into a single blended row.
+    const mixed = JSON.stringify([
+      { day, modelProviderId: "thaura", model: "thaura", project: "Unknown",
+        loggedCostUsd: 7, uncachedInputTokens: 1_000_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1_000_000 },
+      { day, modelProviderId: "thaura", model: "thaura", project: "Unknown",
+        loggedCostUsd: null, uncachedInputTokens: 1_000_000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 1_000_000 },
+    ]);
+    const records = parseHostUsageAggregates(mixed, "thaura", machine);
+    expect(records).toHaveLength(2);
+    expect(records.reduce((sum, record) => sum + record.costUsd, 0)).toBeCloseTo(9.5);
+    expect(records.find((record) => record.pricingStatus === "logged")?.costUsd).toBe(7);
+    expect(records.find((record) => record.pricingStatus !== "logged")?.costUsd).toBeCloseTo(2.5);
   });
 });
 

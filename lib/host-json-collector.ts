@@ -151,8 +151,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       cacheWriteTokens: count(raw.cacheWriteTokens),
       outputTokens: count(raw.outputTokens),
     };
+    const keyed = new Set<HostJsonAgentId>(["pi", "prime", "thaura"]).has(input.agentId);
     const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project,
-      (input.agentId === "pi" || input.agentId === "prime") ? (row.loggedCostUsd !== null && row.loggedCostUsd > 0 ? "logged" : "estimate") : "all"]);
+      keyed ? (row.loggedCostUsd !== null && row.loggedCostUsd > 0 ? "logged" : "estimate") : "all"]);
     const prior = target.get(key);
     if (!prior) {
       target.set(key, row);

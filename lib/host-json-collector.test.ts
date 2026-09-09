@@ -220,6 +220,30 @@ describe("host JSON usage collector", () => {
     expect(second.rows).toEqual(first.rows);
   });
 
+  it("keeps recorded and estimated Thaura generations in separate aggregate rows", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "usage.jsonl");
+    const cachePath = join(directory, "cache", "thaura.json");
+    await writeFile(root, [
+      { kind: "generation", fact: {
+        created_at_ms: Date.parse("2026-08-09T00:00:00Z"),
+        model: "thaura", input_tokens: 1_000_000, output_tokens: 1_000_000, total_cost: 7, cwd: "/work/app",
+      } },
+      { kind: "generation", fact: {
+        created_at_ms: Date.parse("2026-08-09T01:00:00Z"),
+        model: "thaura", input_tokens: 1_000_000, output_tokens: 1_000_000, total_cost: null, cwd: "/work/app",
+      } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const result = await scan("thaura", root, cachePath);
+    const day = localDay("2026-08-09T00:00:00Z");
+    expect(result.rows.filter((row) => row.day === day)).toHaveLength(2);
+    const logged = result.rows.find((row) => row.loggedCostUsd !== null);
+    const estimated = result.rows.find((row) => row.loggedCostUsd === null);
+    expect(logged).toMatchObject({ loggedCostUsd: 7, uncachedInputTokens: 1_000_000, outputTokens: 1_000_000, project: "app" });
+    expect(estimated).toMatchObject({ loggedCostUsd: null, uncachedInputTokens: 1_000_000, outputTokens: 1_000_000, project: "app" });
+  });
+
   it("counts each Claude API response once across repeated rows, files, and cached scans", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "projects");
