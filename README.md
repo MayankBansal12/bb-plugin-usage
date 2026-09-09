@@ -12,7 +12,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Break usage down by model, project, or day.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
-- Show OpenCode Go, Claude Code, and Codex plan windows in the usage-limits section. The same subscription on several machines is one card with machine tags; different accounts stay separate cards in a horizontal grid.
+- Show Grok Build, OpenCode Go, Claude Code, Cursor, and Codex plan windows in the usage-limits section. The same subscription on several machines is one card with machine tags; different accounts stay separate cards in a horizontal grid.
 - Resolve model prices from [models.dev](https://models.dev), refreshed daily at runtime with the bundled snapshot as fallback, without inventing prices for ambiguous models.
 - Sync automatically every 15 minutes or manually from the dashboard.
 
@@ -26,6 +26,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Prime Agent: root sessions in `~/.prime/agent/sessions/*.jsonl` and recursive-agent sessions under `~/.prime/agent/session-artifacts/**/*.jsonl`, plus optional custom session directories in plugin settings
 - OpenCode: assistant-message usage from the last 90 days, recorded by `opencode db`
 - Antigravity: `~/.antigravity-acp/usage.jsonl`, written by the `bb-plugin-antigravity-acp` provider bridge (the `agy` CLI has no session log of its own in a stable, parseable shape, so the bridge is the source of truth, one line per turn it runs)
+- Grok Build limits: credit usage and reset times from the Grok billing endpoint, using the local Grok login (`~/.grok/auth.json`, respecting `GROK_HOME` and `GROK_AUTH_PATH`)
 - OpenCode Go limits: plan windows from `https://opencode.ai/zen/go/v1/usage`, authenticated with the `opencode-go` credential in `~/.local/share/opencode/auth.json` on each machine
 
 JSON-log collection requires Node.js on each enrolled machine. Logs are streamed and reduced to usage metadata on that machine, so large histories are not transferred through BB's file API. A metadata-only per-file cache in `~/.cache/bb-plugin-usage/json-log-scan-v1/` makes later syncs reparse only changed files. The initial 365-day scan can take longer on machines with large histories.
@@ -33,6 +34,8 @@ JSON-log collection requires Node.js on each enrolled machine. Logs are streamed
 FX history follows the rolling retention of FX's local usage ledger. The plugin reads generation usage facts only; FX sessions and prompts are not scanned.
 
 OpenCode collection requires an OpenCode CLI with `opencode db --format json` support on each enrolled machine. The fixed `SELECT` query aggregates assistant-message usage from the last 90 calendar days—the longest range the dashboard supports—returns only usage metadata, is limited to 900 KB of output, and times out after 60 seconds. OpenCode, Pi, and Prime preserve positive agent-recorded costs and otherwise estimate cost from models.dev token rates. Models without recorded costs or catalog rates remain unknown.
+
+Grok Build limits require Node.js 18+ and a first-party Grok login on the enrolled machine. The collector supports current weekly/monthly credit percentages, legacy monthly budgets, and on-demand caps. Unified credits are labeled as shared across Grok products. Credentials stay on the machine; only normalized limits and a hashed account identity are transferred. API-key-only logins and accounts without a billing plan are skipped. Expired credentials require `grok login`; the plugin does not rotate refresh tokens. The limits card appears only after valid limits have been collected, including 0% usage. First-time failures stay in diagnostics; later failures retain the previous snapshot with a warning. This uses the billing endpoint implemented by [Grok Build](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs), which may change between releases.
 
 OpenCode Go limit collection requires `curl` plus either `jq` or Node.js on the enrolled machine, and an OpenCode Go subscription configured in OpenCode's auth file. The API key stays on that machine: the collector reads it locally, calls the usage endpoint, and reports only window percentages and reset times. Machines without a Go credential or plan are skipped silently. Transient failures retain the last successful snapshot and are shown alongside the cached values.
 

@@ -1,3 +1,4 @@
+import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./server";
 import Database from "better-sqlite3";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
@@ -763,4 +764,41 @@ it("prices OpenCode mixed recorded and unpriced requests independently", async (
     expect(new Set(rows.map(r => r.eventKey)).size).toBe(2);
     expect(rows.reduce((sum, r) => sum + r.costUsd, 0)).toBe(12);
   } finally { db.close(); }
+});
+
+
+describe("Grok limit snapshots", () => {
+  it("hides first-time errors while retaining diagnostics, then shows valid zero usage", async () => {
+    const db = new Database(":memory:");
+    try {
+      db.exec(grokLimitsMigration);
+      const warn = vi.fn();
+      const bb = { log: { warn } } as unknown as BbPluginApi;
+      const machine = { id: "host-grok", name: "Grok machine" };
+      const connected = new Set([machine.id]);
+      await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => { throw new Error("Node.js is required"); });
+      expect(loadStoredGrokLimits(db, connected)).toEqual([]);
+      expect(db.prepare("SELECT error FROM grok_limits").get()).toEqual({ error: "Node.js is required" });
+      expect(warn).toHaveBeenCalled();
+      const snapshot = { accountIdentity: "a".repeat(64), windows: [{ label: "Weekly credits", usedPercent: 0, resetsAt: null }] };
+      await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
+      expect(loadStoredGrokLimits(db, connected)).toEqual([expect.objectContaining({ status: "ok", error: null, windows: snapshot.windows })]);
+    } finally { db.close(); }
+  });
+
+  it("retains a successful snapshot on errors, hides offline machines, and clears on logout", async () => {
+    const db = new Database(":memory:");
+    db.exec(grokLimitsMigration);
+    const bb = { log: { warn: vi.fn() } } as unknown as BbPluginApi;
+    const machine = { id: "host-grok", name: "Grok machine" };
+    const snapshot = { accountIdentity: "a".repeat(64), windows: [{ label: "Weekly credits", usedPercent: 40, resetsAt: null }] };
+    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
+    expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([expect.objectContaining({ status: "ok", windows: snapshot.windows, accountIdentity: snapshot.accountIdentity })]);
+    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => { throw new Error("Request failed"); });
+    expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([expect.objectContaining({ status: "error", windows: snapshot.windows, error: "Request failed" })]);
+    expect(loadStoredGrokLimits(db, new Set())).toEqual([]);
+    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
+    expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([]);
+    db.close();
+  });
 });
