@@ -1461,7 +1461,7 @@ function UsageDashboard() {
                           <span className="tabular-nums text-foreground/80">{compact(row.tokens)}</span>
                           <span>tokens</span>
                         </RowBadge>
-                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{row.unknown ? "—" : percentage(row.cost, totals.cost)}</span>
+                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`}</span>
                       </div>
                     </div>
                   ))}
@@ -1501,7 +1501,7 @@ function UsageDashboard() {
                             </td>
                           )}
                           <td className="px-4 py-3 text-right tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></td>
-                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{row.unknown ? "—" : percentage(row.cost, totals.cost)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`}</td>
                           <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
                         </tr>
                       ))}
