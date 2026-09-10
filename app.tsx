@@ -220,10 +220,11 @@ function rangeDays(range: Range) {
 
 function niceMaximum(value: number) {
   if (value <= 0) return 1;
-  const magnitude = 10 ** Math.floor(Math.log10(value));
-  const normalized = value / magnitude;
-  const nice = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
-  return nice * magnitude;
+  const roughStep = value / 4;
+  const magnitude = 10 ** Math.floor(Math.log10(roughStep));
+  const normalized = roughStep / magnitude;
+  const step = (normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 2.5 ? 2.5 : normalized <= 5 ? 5 : 10) * magnitude;
+  return Math.ceil(value / step) * step;
 }
 
 function smoothPath(points: Array<{ x: number; y: number }>, top: number, bottom: number) {
