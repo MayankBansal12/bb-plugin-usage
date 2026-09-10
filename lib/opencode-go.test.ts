@@ -192,10 +192,19 @@ describe("OpenCode Go command", () => {
       expect(missingEntry.output).toContain("no-opencode-go-credential");
     }
 
+    // The jq parser reports a parse-specific message; the node fallback lumps
+    // it with other invalid-auth failures, so assert per-parser wording.
+    const hasJq = spawnSync("sh", ["-c", "command -v jq >/dev/null 2>&1"], { encoding: "utf8" }).status === 0;
     const malformed = runUsageCommand({ auth: "{" });
     expect(malformed.status).not.toBe(0);
-    expect(malformed.output).toContain("auth file was not valid JSON");
+    expect(malformed.output).toContain(hasJq ? "auth file was not valid JSON" : "auth file or Go credential was invalid");
     expect(malformed.output).not.toContain("no-opencode-go-credential");
+
+    // Force the node fallback path regardless of whether jq is installed.
+    const malformedNode = runUsageCommand({ auth: "{", nodeOnly: true });
+    expect(malformedNode.status).not.toBe(0);
+    expect(malformedNode.output).toContain("auth file or Go credential was invalid");
+    expect(malformedNode.output).not.toContain("no-opencode-go-credential");
   });
 
   it.each([
