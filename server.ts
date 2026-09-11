@@ -458,6 +458,7 @@ async function syncJsonAgent(
     }), signal, {
       title: `Usage: ${agentId} scan`,
       timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
+      home,
     });
     const scan = extractHostJsonScan(output);
     if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
@@ -559,10 +560,44 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number };
+type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number; home?: string };
 
 function heldHostCommand(command: string) {
   return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '__BB_HOST_COMMAND_DONE__' "$bb_usage_status"; while :; do sleep 3600; done`;
+}
+
+// createTerminalRequestSchema caps start.command at 10,000 characters, a
+// boundary the serialized JSONL collectors have already crossed for some
+// inputs. Oversized commands are staged on the host through files.write
+// (whose content is unbounded) and run via `sh`, so the held wrapper -- DONE
+// marker, exit code, error passthrough -- is identical either way. The
+// content-addressed name keeps parallel agent syncs from racing on one path
+// and never executes a stale script.
+const HOST_COMMAND_MAX_CHARS = 10_000;
+
+async function stageHostCommand(
+  bb: BbPluginApi,
+  machine: Machine,
+  command: string,
+  home: string | undefined,
+  signal: AbortSignal,
+) {
+  const resolvedHome = home
+    ?? (await bb.sdk.hosts.directory({ hostId: machine.id, signal })).directory;
+  const sha256 = createHash("sha256").update(command).digest("hex");
+  const path = `${resolvedHome}/.cache/bb-plugin-usage/host-command-${sha256}.sh`;
+  const result = await bb.sdk.files.write({
+    hostId: machine.id,
+    path,
+    content: command,
+    contentEncoding: "utf8",
+    createParents: true,
+    expectedSha256: null,
+    mode: 0o600,
+  });
+  const stagedSha256 = result.outcome === "written" ? result.sha256 : result.currentSha256;
+  if (stagedSha256 !== sha256) throw new Error("the staged command file did not verify");
+  return `sh ${shellQuote(path)}`;
 }
 
 function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["terminals"]["output"]>>) {
@@ -577,12 +612,24 @@ export async function runHostCommand(
   signal: AbortSignal,
   options: HostCommandOptions,
 ) {
+  let startCommand = heldHostCommand(command);
+  if (startCommand.length > HOST_COMMAND_MAX_CHARS) {
+    // An oversized command can never be submitted, so a staging failure is
+    // the real error; sending the inline command anyway would only reproduce
+    // the contract's 10,000-character rejection.
+    const staged = await stageHostCommand(bb, machine, command, options.home, signal)
+      .catch((error) => {
+        throw new Error(`${options.title} could not stage its command on ${machine.name}: ${errorMessage(error)}`);
+      });
+    startCommand = heldHostCommand(staged);
+  }
+  signal.throwIfAborted();
   const terminal = await bb.sdk.terminals.create({
     scope: { kind: "host_path", hostId: machine.id, cwd: null },
     cols: 120,
     rows: 24,
     title: options.title,
-    start: { mode: "command", command: heldHostCommand(command) },
+    start: { mode: "command", command: startCommand },
   });
   try {
     const deadline = Date.now() + options.timeoutMs;
