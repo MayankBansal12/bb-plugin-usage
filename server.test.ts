@@ -1,5 +1,6 @@
 import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./server";
 import Database from "better-sqlite3";
+import { createHash, randomBytes } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
@@ -29,6 +30,47 @@ function fakeHostScanOutput(agentId: string, rows: Array<Record<string, unknown>
   const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0, error: null, rows };
   const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
   return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+}
+
+// The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
+// where the gzipped payload is the generated collector script with
+// agentId/roots baked in as a literal object — decode it the same way
+// to tell which JSON-agent sync this particular terminal is for.
+function agentIdFromCommand(command: string): string | null {
+  // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
+  // the closing quote of the base64 argument — the rest of the call
+  // (,'base64')) has its single quotes mangled by shellQuote's bash
+  // escaping (' becomes '"'"') once this is embedded in the full
+  // command, so anchoring on that literal text would never match here.
+  const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+  if (!outer) return null;
+  const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+  // Inner layer: the collector function is invoked as
+  // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
+  // encodedInput is JSON.stringify(input) base64'd separately from the
+  // gzip layer above.
+  const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+  if (!inner) return null;
+  const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
+  return input.agentId ?? null;
+}
+
+function hostFileWriteMock(stagedFiles: Map<string, string>) {
+  return vi.fn(async (args: { path: string; content: string }) => {
+    stagedFiles.set(args.path, args.content);
+    return {
+      outcome: "written" as const,
+      sha256: createHash("sha256").update(args.content).digest("hex"),
+      sizeBytes: args.content.length,
+    };
+  });
+}
+
+// Oversized commands reach the terminal as `sh '<staged path>'`; resolve that
+// back to the staged file contents before decoding which agent it belongs to.
+function commandTextFor(command: string, stagedFiles: Map<string, string>) {
+  const stagedPath = command.match(/sh '([^']+\.sh)'/)?.[1];
+  return (stagedPath ? stagedFiles.get(stagedPath) : undefined) ?? command;
 }
 
 describe("JSON agent roots", () => {
@@ -115,30 +157,8 @@ describe("sync RPC", () => {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
 
-    // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
-    // where the gzipped payload is the generated collector script with
-    // agentId/roots baked in as a literal object — decode it the same way
-    // to tell which JSON-agent sync this particular terminal is for.
-    function agentIdFromCommand(command: string): string | null {
-      // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
-      // the closing quote of the base64 argument — the rest of the call
-      // (,'base64')) has its single quotes mangled by shellQuote's bash
-      // escaping (' becomes '"'"') once this is embedded in the full
-      // command, so anchoring on that literal text would never match here.
-      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
-      if (!outer) return null;
-      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
-      // Inner layer: the collector function is invoked as
-      // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
-      // encodedInput is JSON.stringify(input) base64'd separately from the
-      // gzip layer above.
-      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
-      if (!inner) return null;
-      const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
-      return input.agentId ?? null;
-    }
-
     const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
 
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
@@ -156,6 +176,7 @@ describe("sync RPC", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
+        files: { write: hostFileWriteMock(stagedFiles) },
         terminals: {
           create: vi.fn(async (input: { start: { command: string } }) => {
             const id = `terminal-${commandsByTerminalId.size}`;
@@ -164,7 +185,7 @@ describe("sync RPC", () => {
           }),
           get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
           output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandsByTerminalId.get(args.terminalId) ?? "";
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
             const agentId = agentIdFromCommand(command);
             const text = agentId === "antigravity"
               ? fakeHostScanOutput("antigravity", [{
@@ -198,6 +219,98 @@ describe("sync RPC", () => {
 
     const syncState = db.prepare(
       "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'antigravity'",
+    ).get();
+    expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    // The terminal contract caps start.command at 10,000 characters; every
+    // collector command must fit, whether inline or staged through files.write.
+    for (const command of commandsByTerminalId.values()) {
+      expect(command.length).toBeLessThanOrEqual(10_000);
+    }
+
+    db.close();
+  });
+
+  it("stages an oversized collector script through files.write and still records its rows", async () => {
+    // A huge configured session root inflates the serialized scan input enough
+    // that the compressed collector command no longer fits the terminal's
+    // 10,000-character limit, forcing the files.write staging path.
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const write = hostFileWriteMock(stagedFiles);
+
+    const bb = {
+      settings: {
+        define: vi.fn(() => ({
+          get: async () => ({ piSessionRoots: `/data/${randomBytes(6_000).toString("hex")}`, primeSessionRoots: "" }),
+        })),
+      },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === "pi"
+              ? fakeHostScanOutput("pi", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "google",
+                model: "gemini-2.5-pro",
+                loggedCostUsd: null,
+                uncachedInputTokens: 100,
+                cachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                outputTokens: 10,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'pi'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    expect(write).toHaveBeenCalled();
+    for (const command of commandsByTerminalId.values()) {
+      expect(command.length).toBeLessThanOrEqual(10_000);
+    }
+    const stagedPaths = [...stagedFiles.keys()];
+    expect(stagedPaths.every((path) => path.startsWith("/home/user/.cache/bb-plugin-usage/host-command-"))).toBe(true);
+
+    const syncState = db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'pi'",
     ).get();
     expect(syncState).toEqual({ status: "ready", recordCount: 1 });
 
@@ -457,6 +570,139 @@ describe("host command output", () => {
       { title: "Usage test", timeoutMs: 1, pollMs: 1 },
     )).rejects.toThrow("timed out");
     expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
+  });
+
+  function stagedRun(text: string, overrides: { write?: unknown; directory?: unknown } = {}) {
+    const stagedFiles = new Map<string, string>();
+    const create = vi.fn(async (input: { start: { command: string } }) => ({ id: "terminal-1", status: "starting", input }));
+    const bb = {
+      sdk: {
+        files: { write: overrides.write ?? hostFileWriteMock(stagedFiles) },
+        hosts: { directory: overrides.directory ?? vi.fn(async () => ({ directory: "/resolved/home" })) },
+        terminals: {
+          create,
+          get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+          output: vi.fn(async () => ({
+            chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
+            truncated: false,
+          })),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+    return { bb, create, stagedFiles };
+  }
+
+  it("stages oversized commands on the host and runs them with sh", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const text = "scan result\n__BB_HOST_COMMAND_DONE__:0\n";
+    const { bb, create, stagedFiles } = stagedRun(text);
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).resolves.toBe(text);
+
+    const startCommand = create.mock.calls[0]![0].start.command;
+    expect(startCommand.length).toBeLessThanOrEqual(10_000);
+    expect(startCommand).toContain("__BB_HOST_COMMAND_DONE__");
+
+    const stagedPaths = [...stagedFiles.keys()];
+    expect(stagedPaths).toHaveLength(1);
+    expect(stagedPaths[0]).toMatch(/^\/home\/user\/\.cache\/bb-plugin-usage\/host-command-[0-9a-f]{64}\.sh$/);
+    expect(stagedFiles.get(stagedPaths[0]!)).toBe(command);
+    expect(startCommand).toContain(`sh '${stagedPaths[0]}'`);
+    expect(bb.sdk.files.write).toHaveBeenCalledWith(expect.objectContaining({
+      hostId: "host-1",
+      path: stagedPaths[0],
+      content: command,
+      createParents: true,
+    }));
+    expect(bb.sdk.hosts.directory).not.toHaveBeenCalled();
+  });
+
+  it("resolves the machine home directory for staging when the caller does not provide it", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const { bb, stagedFiles } = stagedRun("ok\n__BB_HOST_COMMAND_DONE__:0\n");
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).resolves.toContain("__BB_HOST_COMMAND_DONE__:0");
+
+    expect(bb.sdk.hosts.directory).toHaveBeenCalledWith({ hostId: "host-1", signal: expect.any(AbortSignal) });
+    expect([...stagedFiles.keys()][0]).toMatch(/^\/resolved\/home\/\.cache\/bb-plugin-usage\/host-command-/);
+  });
+
+  it.each([
+    { outcome: "conflict" as const, currentSha256: "mismatch" },
+    { outcome: "written" as const, sha256: "wrong", sizeBytes: 1 },
+  ])("surfaces the staging error when the staged file cannot be verified (%s)", async (result) => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const write = vi.fn(async () => result);
+    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    // An oversized command cannot be submitted inline either, so the staging
+    // failure is reported instead of creating a terminal the host must reject.
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).rejects.toThrow("Usage test could not stage its command on Machine: the staged command file did not verify");
+
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the staging error when the host file write throws", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const write = vi.fn(async () => { throw new Error("host.write_file unsupported"); });
+    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).rejects.toThrow("Usage test could not stage its command on Machine: host.write_file unsupported");
+
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("surfaces staged command diagnostics and exit codes identically", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const { bb } = stagedRun("__BB_USAGE_ERROR__:collector broke\n__BB_HOST_COMMAND_DONE__:1\n");
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).rejects.toThrow("collector broke");
+  });
+
+  it("keeps commands under the limit inline without touching the files API", async () => {
+    const write = vi.fn();
+    const { bb } = stagedRun("small\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      "printf small",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).resolves.toContain("small");
+    expect(write).not.toHaveBeenCalled();
   });
 });
 
