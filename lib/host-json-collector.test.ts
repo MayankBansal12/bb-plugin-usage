@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
@@ -9,6 +9,7 @@ import {
   compressedHostJsonCollectorScript,
   extractHostJsonScan,
   type HostJsonAgentId,
+  type HostJsonScanInput,
 } from "./host-json-collector";
 
 function localDay(timestamp: string): string {
@@ -25,12 +26,13 @@ async function temporaryDirectory() {
   return directory;
 }
 
-async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath: string) {
+async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath: string, extra?: Partial<HostJsonScanInput>) {
   const script = compressedHostJsonCollectorScript({
     agentId,
     roots: Array.isArray(root) ? root : [root],
     cachePath,
     sinceDay: "2026-08-01",
+    ...extra,
   });
   expect(script.length).toBeLessThan(9_000);
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024 });
@@ -78,6 +80,62 @@ describe("host JSON usage collector", () => {
     const partial = await scan("codex", root, cachePath);
     expect(partial).toMatchObject({ fileCount: 0, failureCount: 1 });
     expect(partial.rows).toEqual(first.rows);
+  });
+
+  it("attributes sessions under the account root to each Codex profile", async () => {
+    const directory = await temporaryDirectory();
+    const home = join(directory, "home");
+    const root = join(home, ".codex", "sessions");
+    const accountRoot = join(home, ".codex-profiles");
+    const cachePath = join(directory, "cache", "codex.json");
+    const rollout = (id: string, inputTokens: number) => [
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id, cwd: `/work/${id}` } },
+      { timestamp: "2026-08-09T12:00:00Z", type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 5 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n");
+    await mkdir(root, { recursive: true });
+    await mkdir(join(accountRoot, "saiens", "sessions", "2026", "08", "09"), { recursive: true });
+    await mkdir(join(accountRoot, "omnidrome", "sessions"), { recursive: true });
+    await mkdir(join(accountRoot, "dormant"), { recursive: true });
+    await writeFile(join(root, "rollout-main.jsonl"), rollout("main-session", 100));
+    await writeFile(join(accountRoot, "saiens", "sessions", "2026", "08", "09", "rollout-extra.jsonl"), rollout("saiens-session", 40));
+    await writeFile(join(accountRoot, "omnidrome", "sessions", "rollout-extra.jsonl"), rollout("omnidrome-session", 60));
+    await writeFile(join(accountRoot, "saiens", "auth.json"), "{}");
+
+    const first = await scan("codex", root, cachePath, { accountRoot });
+    expect(first).toMatchObject({ fileCount: 3, changedFileCount: 3, reusedFileCount: 0, failureCount: 0 });
+    const day = localDay("2026-08-09T12:00:00Z");
+    expect(first.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ day, model: "gpt-5.6-sol", project: "main-session", uncachedInputTokens: 100 }),
+      expect.objectContaining({ day, account: "saiens", project: "saiens-session", uncachedInputTokens: 40 }),
+      expect.objectContaining({ day, account: "omnidrome", project: "omnidrome-session", uncachedInputTokens: 60 }),
+    ]));
+    expect(first.rows.find((row) => row.account === undefined)?.account).toBeUndefined();
+    expect(JSON.stringify(first.rows)).not.toContain("dormant");
+
+    const second = await scan("codex", root, cachePath, { accountRoot });
+    expect(second).toMatchObject({ fileCount: 3, changedFileCount: 0, reusedFileCount: 3, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
+  it("does not double-count a profile home linked to the primary Codex home", async () => {
+    const directory = await temporaryDirectory();
+    const home = join(directory, "home");
+    const root = join(home, ".codex", "sessions");
+    const accountRoot = join(home, ".codex-profiles");
+    const cachePath = join(directory, "cache", "codex.json");
+    await mkdir(root, { recursive: true });
+    await mkdir(accountRoot, { recursive: true });
+    await writeFile(join(root, "rollout-main.jsonl"), [
+      JSON.stringify({ timestamp: "2026-08-09T12:00:00Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 100, cached_input_tokens: 0, output_tokens: 5 } } } }),
+    ].join("\n"));
+    await symlink(join(home, ".codex"), join(accountRoot, "alias"), "dir");
+
+    const result = await scan("codex", root, cachePath, { accountRoot });
+    expect(result).toMatchObject({ fileCount: 1, failureCount: 0 });
+    expect(result.rows).toHaveLength(1);
+    expect(result.rows[0]).not.toMatchObject({ account: "alias" });
+    expect(result.rows[0]).toMatchObject({ uncachedInputTokens: 100 });
   });
 
   it.each([

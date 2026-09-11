@@ -3,17 +3,26 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { z } from "zod";
 import type { AgentId, HostUsageAggregate } from "../collectors";
 
-export type HostJsonAgentId = Exclude<AgentId, "opencode">;
+// Agents collected by walking JSONL session logs. "devin" is excluded: its
+// usage lives in a SQLite database handled by devin-sqlite-collector.ts.
+export type HostJsonAgentId = Exclude<AgentId, "opencode" | "devin">;
+
+// Agents whose host scan emits the shared aggregate-row wire format.
+export type HostScanAgentId = Exclude<AgentId, "opencode">;
 
 export type HostJsonScanInput = {
   agentId: HostJsonAgentId;
   roots: string[];
   cachePath: string;
   sinceDay: string;
+  // Directory whose immediate subdirectories are per-account agent homes
+  // (e.g. ~/.codex-profiles/<name> for extra Codex accounts). Each
+  // <name>/sessions tree is scanned and its rows carry `account: <name>`.
+  accountRoot?: string;
 };
 
 export type HostJsonScanResult = {
-  agentId: HostJsonAgentId;
+  agentId: HostScanAgentId;
   fileCount: number;
   changedFileCount: number;
   reusedFileCount: number;
@@ -38,6 +47,7 @@ const aggregateSchema = z.object({
   modelProviderId: z.string(),
   model: z.string(),
   project: z.string().default("Unknown"),
+  account: z.string().optional(),
   loggedCostUsd: z.number().finite().nullable(),
   uncachedInputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
@@ -45,7 +55,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
+  agentId: z.enum(["codex", "claude", "dsh", "devin", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -73,6 +83,11 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
+  // Extra per-account homes (e.g. Codex profiles). Only the codex parser knows
+  // how to attribute them today, so other agents ignore the directory.
+  const accountRoot = input.agentId === "codex" && typeof input.accountRoot === "string" && input.accountRoot.trim()
+    ? input.accountRoot.replace(/\/+$/, "")
+    : null;
 
   type CachedUsageRow = HostUsageAggregate & { eventKey?: string };
   type CacheEntry = { signature: string; rows: CachedUsageRow[] };
@@ -81,6 +96,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   let discoveryFailed = false;
   const cutoffMs = Date.parse(`${input.sinceDay}T00:00:00Z`);
   const canDecompressZstd = typeof zlib.zstdDecompressSync === "function";
+  // Files discovered under an account home map to that account name.
+  const accountByPath = new Map<string, string>();
 
   function object(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -125,6 +142,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       && typeof row.modelProviderId === "string"
       && typeof row.model === "string"
       && typeof row.project === "string"
+      && (row.account === undefined || typeof row.account === "string")
       && (row.loggedCostUsd === null || finite(row.loggedCostUsd) !== null)
       && finite(row.uncachedInputTokens) !== null
       && finite(row.cachedInputTokens) !== null
@@ -152,8 +170,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       cacheWriteTokens: count(raw.cacheWriteTokens),
       outputTokens: count(raw.outputTokens),
     };
+    const account = text(raw.account, "");
+    if (account) row.account = account;
     const keyed = new Set<HostJsonAgentId>(["pi", "prime", "thaura"]).has(input.agentId);
-    const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project,
+    const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project, row.account ?? null,
       keyed ? (row.loggedCostUsd !== null && row.loggedCostUsd > 0 ? "logged" : "estimate") : "all"]);
     const prior = target.get(key);
     if (!prior) {
@@ -303,6 +323,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   async function parseFile(filePath: string): Promise<CachedUsageRow[]> {
     const rows = new Map<string, HostUsageAggregate>();
     const events = new Map<string, CachedUsageRow>();
+    const fileAccount = accountByPath.get(filePath);
     let codexModel = "codex-unknown";
     // Session-scoped project, learned from the first record that carries a
     // working directory and reused for later rows in the same file.
@@ -343,6 +364,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const cached = Math.min(inputTokens, count(usage.cached_input_tokens));
         add(rows, {
           day: usageDay, modelProviderId: "openai", model: codexModel, project: sessionProject, loggedCostUsd: null,
+          account: fileAccount,
           uncachedInputTokens: inputTokens - cached, cachedInputTokens: cached,
           cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
         });
@@ -554,20 +576,49 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
 
   const discovered: string[] = [];
   for (const root of [...new Set(input.roots)]) await walk(root, discovered);
-  discovered.sort();
+  const accountDiscovered: string[] = [];
+  if (accountRoot) {
+    let accountEntries: import("node:fs").Dirent[] = [];
+    try {
+      accountEntries = await fs.promises.readdir(accountRoot, { withFileTypes: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        discoveryFailed = true;
+        failures.push("A usage directory could not be read.");
+      }
+    }
+    for (const entry of accountEntries) {
+      // Dirent type bits describe the link itself, so a symlinked profile home
+      // is followed here; the inode dedup below keeps an account aliased to the
+      // primary home from being counted twice.
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      const files: string[] = [];
+      await walk(path.join(accountRoot, entry.name, "sessions"), files);
+      for (const filePath of files) accountByPath.set(filePath, entry.name);
+      accountDiscovered.push(...files);
+    }
+  }
+  // Primary roots come first so the inode dedup attributes an aliased file to
+  // the primary home rather than to whichever account path happens to sort
+  // earlier.
+  const uniquePaths = [...new Set(discovered)].sort().concat([...new Set(accountDiscovered)].sort());
   const nextFiles: Record<string, CacheEntry> = {};
   const allRows = new Map<string, HostUsageAggregate>();
   const allEvents = new Map<string, CachedUsageRow>();
+  const seenFiles = new Set<string>();
   let fileCount = 0;
   let changedFileCount = 0;
   let reusedFileCount = 0;
 
-  for (const filePath of discovered) {
+  for (const filePath of uniquePaths) {
     const sourceId = crypto.createHash("sha256").update(filePath).digest("hex");
     const prior = cache.files[sourceId];
     try {
       const stat = await fs.promises.stat(filePath);
       if (stat.mtimeMs < cutoffMs) continue;
+      const fileIdentity = `${stat.dev}:${stat.ino}`;
+      if (seenFiles.has(fileIdentity)) continue;
+      seenFiles.add(fileIdentity);
       fileCount += 1;
       const signature = `${stat.size}:${Math.trunc(stat.mtimeMs)}`;
       if (prior?.signature === signature && Array.isArray(prior.rows) && prior.rows.every(validRow)) {

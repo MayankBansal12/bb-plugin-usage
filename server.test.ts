@@ -9,8 +9,8 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  openCodeCommand, openCodeSql, runHostCommand, syncOpenCode, syncOpenCodeGo,
+  dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
+  openCodeCommand, openCodeSql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 
 function localDay(ts: number): string {
@@ -276,6 +276,119 @@ describe("sync RPC", () => {
       "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'dsh'",
     ).get();
     expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    db.close();
+  });
+
+  it("collects Codex profile accounts as separate dashboard agents", async () => {
+    const db = new Database(":memory:");
+    let handlers: {
+      sync: () => unknown;
+      dashboard: () => Promise<{
+        agents: Array<{ id: string; name: string }>;
+        records: Array<{ agentId: string; agentName: string; processedTokens: number }>;
+      }>;
+    } | undefined;
+
+    // Decode the generated collector script's baked-in scan input so the test
+    // can answer codex scans with profile-tagged rows and assert the scan
+    // covers the account root.
+    function scanInputFromCommand(command: string): { agentId?: string; roots?: string[]; accountRoot?: string } | null {
+      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+      if (!outer) return null;
+      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+      if (!inner) return null;
+      return JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8"));
+    }
+
+    const commandsByTerminalId = new Map<string, string>();
+    const day = new Date().toISOString().slice(0, 10);
+    const aggregateRow = (account?: string) => ({
+      day,
+      modelProviderId: "openai",
+      model: "gpt-5.6-sol",
+      project: "app",
+      ...(account === undefined ? {} : { account }),
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    });
+
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as typeof handlers;
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandsByTerminalId.get(args.terminalId) ?? "";
+            const input = scanInputFromCommand(command);
+            const text = input?.agentId === "codex"
+              ? fakeHostScanOutput("codex", [aggregateRow(), aggregateRow("saiens")])
+              : fakeHostScanOutput(input?.agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 2 });
+    }, { timeout: 2000 });
+
+    const codexScan = [...commandsByTerminalId.values()].map(scanInputFromCommand).find((input) => input?.agentId === "codex");
+    expect(codexScan).toMatchObject({
+      roots: ["/home/user/.codex/sessions"],
+      accountRoot: "/home/user/.codex-profiles",
+    });
+
+    const providers = db.prepare(
+      "SELECT provider_id, provider_name FROM usage_events ORDER BY provider_id",
+    ).all();
+    expect(providers).toEqual([
+      { provider_id: "codex", provider_name: "Codex" },
+      { provider_id: "codex-saiens", provider_name: "Codex (saiens)" },
+    ]);
+    expect(db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'codex'",
+    ).get()).toEqual({ status: "ready", recordCount: 2 });
+
+    const dashboard = await handlers!.dashboard();
+    expect(dashboard.agents).toEqual(expect.arrayContaining([
+      { id: "codex", name: "Codex" },
+      { id: "codex-saiens", name: "Codex (saiens)" },
+    ]));
+    expect(dashboard.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "codex", agentName: "Codex", processedTokens: 125 }),
+      expect.objectContaining({ agentId: "codex-saiens", agentName: "Codex (saiens)", processedTokens: 125 }),
+    ]));
 
     db.close();
   });
@@ -675,6 +788,203 @@ describe("OpenCode query", () => {
     expect(asLocal.getHours()).toBe(0);
     expect(asLocal.getMinutes()).toBe(0);
     expect(openCodeSql()).not.toContain("'start of day', '-89 days')");
+    db.close();
+  });
+});
+
+describe("Devin collector sync", () => {
+  function usageDb() {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE usage_events (
+        event_key TEXT PRIMARY KEY, timestamp TEXT NOT NULL, day TEXT NOT NULL,
+        provider_id TEXT NOT NULL, provider_name TEXT NOT NULL, model TEXT NOT NULL,
+        cost_usd REAL NOT NULL, cache_savings_usd REAL NOT NULL, processed_tokens INTEGER NOT NULL,
+        cached_input_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+        uncached_input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+        model_provider_id TEXT NOT NULL DEFAULT 'unknown', model_provider_name TEXT NOT NULL DEFAULT 'Unknown',
+        logged_cost_usd REAL, pricing_status TEXT NOT NULL DEFAULT 'unknown', project TEXT NOT NULL DEFAULT 'Unknown'
+      );
+      CREATE TABLE usage_sources (
+        source_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, machine_name TEXT NOT NULL,
+        provider_id TEXT NOT NULL, root_reference TEXT NOT NULL, content_sha TEXT NOT NULL,
+        last_seen_generation TEXT NOT NULL, last_success_at TEXT NOT NULL, pricing_version TEXT
+      );
+      CREATE TABLE usage_event_sources (event_key TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY (event_key, source_id));
+      CREATE TABLE usage_sync_state (
+        machine_id TEXT NOT NULL, provider_id TEXT NOT NULL, status TEXT NOT NULL, last_attempt_at TEXT,
+        last_success_at TEXT, record_count INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY (machine_id, provider_id)
+      );
+    `);
+    return db;
+  }
+
+  function decodeCollectorInput(command: string) {
+    const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+    if (!outer) return null;
+    const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+    const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+    if (!inner) return null;
+    return JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string; dbPaths?: string[] };
+  }
+
+  it("targets the Devin CLI session database through a node collector", () => {
+    const command = devinCommand("/home/user");
+    expect(command).toContain("command -v node");
+    expect(command).toContain("node -e");
+    const input = decodeCollectorInput(command);
+    expect(input).toMatchObject({
+      agentId: "devin",
+      dbPaths: [
+        "/home/user/.local/share/devin/cli/sessions.db",
+        "/home/user/Library/Application Support/devin/cli/sessions.db",
+      ],
+    });
+  });
+
+  it("stores scanned Devin aggregates and reports ready", async () => {
+    const db = usageDb();
+    const info = vi.fn();
+    const bb = { log: { info, warn: vi.fn() } } as unknown as BbPluginApi;
+    const output = fakeHostScanOutput("devin", [{
+      day: new Date().toISOString().slice(0, 10),
+      modelProviderId: "devin",
+      model: "swe-2-max",
+      project: "project-a",
+      loggedCostUsd: null,
+      uncachedInputTokens: 150,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 30,
+    }]);
+
+    await syncDevin(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => output,
+    );
+
+    const event = db.prepare("SELECT provider_id, provider_name, model, project, processed_tokens, pricing_status FROM usage_events").get();
+    expect(event).toEqual({
+      provider_id: "devin", provider_name: "Devin", model: "swe-2-max",
+      project: "project-a", processed_tokens: 245, pricing_status: "unknown",
+    });
+    expect(db.prepare("SELECT status, record_count recordCount FROM usage_sync_state").get())
+      .toEqual({ status: "ready", recordCount: 1 });
+    db.close();
+  });
+
+  it("reports no-data when the host scan finds no Devin session database", async () => {
+    const db = usageDb();
+    const bb = { log: { info: vi.fn(), warn: vi.fn() } } as unknown as BbPluginApi;
+
+    await syncDevin(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => fakeHostScanOutput("devin", []),
+    );
+
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get())
+      .toEqual({ status: "no-data", recordCount: 0, error: null });
+    db.close();
+  });
+
+  it("retains prior usage and isolates a failed Devin scan to its source state", async () => {
+    const db = usageDb();
+    db.prepare("INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens) VALUES ('devin-event', '2026-08-09T00:00:00Z', '2026-08-09', 'devin', 'Devin', 'swe-2-max', 0, 0, 60, 0, 0, 40, 20)").run();
+    db.prepare("INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id, root_reference, content_sha, last_seen_generation, last_success_at) VALUES ('devin-source', 'host-1', 'Machine', 'devin', 'ref', 'sha', 'gen', '2026-08-09T00:00:00Z')").run();
+    db.prepare("INSERT INTO usage_event_sources (event_key, source_id) VALUES ('devin-event', 'devin-source')").run();
+    const warn = vi.fn();
+    const bb = { log: { info: vi.fn(), warn } } as unknown as BbPluginApi;
+
+    await syncDevin(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => { throw new Error("Node.js is required to scan Devin usage."); },
+    );
+
+    expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get()).toEqual({
+      status: "unavailable",
+      recordCount: 1,
+      error: "Usage scan failed: Node.js is required to scan Devin usage.",
+    });
+    expect(warn).toHaveBeenCalledWith("Machine/devin: Usage scan failed: Node.js is required to scan Devin usage.");
+    db.close();
+  });
+
+  it("dispatches a Devin scan through syncAll like the JSON agents", async () => {
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const agentId = decodeCollectorInput(commandsByTerminalId.get(args.terminalId) ?? "")?.agentId;
+            const text = agentId === "devin"
+              ? fakeHostScanOutput("devin", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "devin",
+                model: "swe-2-max",
+                project: "project-a",
+                loggedCostUsd: null,
+                uncachedInputTokens: 150,
+                cachedInputTokens: 60,
+                cacheWriteTokens: 5,
+                outputTokens: 30,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'devin'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    expect(db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'devin'",
+    ).get()).toEqual({ status: "ready", recordCount: 1 });
     db.close();
   });
 });
