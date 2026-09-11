@@ -3,7 +3,12 @@ import { gunzipSync, gzipSync } from "node:zlib";
 import { z } from "zod";
 import type { AgentId, HostUsageAggregate } from "../collectors";
 
-export type HostJsonAgentId = Exclude<AgentId, "opencode">;
+// Agents collected by walking JSONL session logs. "devin" is excluded: its
+// usage lives in a SQLite database handled by devin-sqlite-collector.ts.
+export type HostJsonAgentId = Exclude<AgentId, "opencode" | "devin">;
+
+// Agents whose host scan emits the shared aggregate-row wire format.
+export type HostScanAgentId = Exclude<AgentId, "opencode">;
 
 export type HostJsonScanInput = {
   agentId: HostJsonAgentId;
@@ -17,7 +22,7 @@ export type HostJsonScanInput = {
 };
 
 export type HostJsonScanResult = {
-  agentId: HostJsonAgentId;
+  agentId: HostScanAgentId;
   fileCount: number;
   changedFileCount: number;
   reusedFileCount: number;
@@ -50,7 +55,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
+  agentId: z.enum(["codex", "claude", "devin", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
