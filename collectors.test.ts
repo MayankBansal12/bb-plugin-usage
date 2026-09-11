@@ -317,6 +317,28 @@ describe("usage collectors", () => {
     });
   });
 
+  it("parses DeepSeek Harness host aggregates with its agent name", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "deepseek",
+      model: "deepseek-v4-pro",
+      project: "dsh-proj",
+      loggedCostUsd: null,
+      uncachedInputTokens: 100,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 0,
+      outputTokens: 20,
+    }]);
+    expect(parseHostUsageAggregates(content, "dsh", machine)[0]).toMatchObject({
+      eventKey: "dsh:machine-a:2026-08-09:deepseek:deepseek-v4-pro:dsh-proj",
+      agentId: "dsh",
+      agentName: "DeepSeek Harness",
+      modelProviderId: "deepseek",
+      processedTokens: 180,
+      cachedInputTokens: 60,
+    });
+  });
+
   it("parses Thaura host aggregates and estimates cost from the pinned rate", () => {
     const content = JSON.stringify([{
       day: "2026-08-09",

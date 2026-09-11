@@ -38,6 +38,12 @@ describe("JSON agent roots", () => {
     ]);
   });
 
+  it("points DeepSeek Harness at its compressed session root", () => {
+    expect(jsonAgentRoots("/home/user", "dsh", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.dsh/sessions",
+    ]);
+  });
+
   it("includes Prime root and recursive-agent sessions", () => {
     expect(jsonAgentRoots("/home/user", "prime", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.prime/agent/sessions",
@@ -78,6 +84,29 @@ describe("JSON agent roots", () => {
   });
 });
 
+// The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
+// where the gzipped payload is the generated collector script with
+// agentId/roots baked in as a literal object — decode it the same way
+// to tell which JSON-agent sync this particular terminal is for.
+function agentIdFromCommand(command: string): string | null {
+  // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
+  // the closing quote of the base64 argument — the rest of the call
+  // (,'base64')) has its single quotes mangled by shellQuote's bash
+  // escaping (' becomes '"'"') once this is embedded in the full
+  // command, so anchoring on that literal text would never match here.
+  const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+  if (!outer) return null;
+  const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+  // Inner layer: the collector function is invoked as
+  // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
+  // encodedInput is JSON.stringify(input) base64'd separately from the
+  // gzip layer above.
+  const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+  if (!inner) return null;
+  const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
+  return input.agentId ?? null;
+}
+
 describe("sync RPC", () => {
   it("returns before a slow collection completes", async () => {
     let handlers: { sync: () => unknown } | undefined;
@@ -114,30 +143,6 @@ describe("sync RPC", () => {
     // RPC and asserts a row actually lands in the database for Antigravity.
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
-
-    // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
-    // where the gzipped payload is the generated collector script with
-    // agentId/roots baked in as a literal object — decode it the same way
-    // to tell which JSON-agent sync this particular terminal is for.
-    function agentIdFromCommand(command: string): string | null {
-      // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
-      // the closing quote of the base64 argument — the rest of the call
-      // (,'base64')) has its single quotes mangled by shellQuote's bash
-      // escaping (' becomes '"'"') once this is embedded in the full
-      // command, so anchoring on that literal text would never match here.
-      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
-      if (!outer) return null;
-      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
-      // Inner layer: the collector function is invoked as
-      // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
-      // encodedInput is JSON.stringify(input) base64'd separately from the
-      // gzip layer above.
-      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
-      if (!inner) return null;
-      const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
-      return input.agentId ?? null;
-    }
-
     const commandsByTerminalId = new Map<string, string>();
 
     const bb = {
@@ -198,6 +203,77 @@ describe("sync RPC", () => {
 
     const syncState = db.prepare(
       "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'antigravity'",
+    ).get();
+    expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    db.close();
+  });
+
+  it("actually dispatches a DeepSeek Harness scan through syncAll, not just through direct scan() calls", async () => {
+    // Same wiring regression shape as the Antigravity test above: the agent
+    // must reach syncAll()'s Promise.all, not just AGENTS/jsonAgentRoots.
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandsByTerminalId.get(args.terminalId) ?? "";
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === "dsh"
+              ? fakeHostScanOutput("dsh", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "deepseek",
+                model: "deepseek-v4-pro",
+                loggedCostUsd: null,
+                uncachedInputTokens: 100,
+                cachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                outputTokens: 20,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'dsh'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    const syncState = db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'dsh'",
     ).get();
     expect(syncState).toEqual({ status: "ready", recordCount: 1 });
 
