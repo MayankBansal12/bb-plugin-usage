@@ -8,7 +8,8 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 - Collect usage from Codex, Claude Code, FX, Grok Agent, OpenCode, Pi, Prime Agent, and Antigravity.
 - Separate the coding agent from the underlying model provider.
-- Group charts and cost summaries by agent or model provider.
+- Group charts and usage shares by agent or model provider.
+- Switch the chart, provider shares, and breakdown between cost and tokens, so unpriced usage stays visible.
 - Break usage down by model, project, or day.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
