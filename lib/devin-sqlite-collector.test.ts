@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -54,7 +54,7 @@ function assistantMessage(requestId: string | null, metrics: Record<string, numb
 async function scan(dbPath: string, sinceDay = "2026-08-01", env?: NodeJS.ProcessEnv) {
   const script = compressedDevinCollectorScript({ agentId: "devin", dbPaths: [dbPath], sinceDay });
   expect(script.length).toBeLessThan(9_000);
-  const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024, env: env ?? process.env });
+  const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024, env: { ...process.env, XDG_DATA_HOME: "", APPDATA: "", ...env } });
   return extractHostJsonScan(stdout.replace(/\n/g, "\r\n"));
 }
 
@@ -95,6 +95,29 @@ describe("devin SQLite collector", () => {
     const directory = await temporaryDirectory();
     const result = await scan(join(directory, "sessions.db"));
     expect(result).toMatchObject({ agentId: "devin", fileCount: 0, failureCount: 0, rows: [] });
+  });
+
+  // chmod cannot deny traversal to root, and Windows does not use POSIX modes.
+  it.skipIf(process.platform === "win32" || process.getuid?.() === 0)("fails instead of emitting an empty scan when the database directory is inaccessible", async () => {
+    const directory = await temporaryDirectory();
+    const dbPath = join(directory, "sessions.db");
+    const db = seedSessionsDb(dbPath);
+    db.session("session-a", "/work/project-a", "swe-2-max");
+    db.node("session-a", 1, assistantMessage("request-1", { input_tokens: 10, output_tokens: 5 }, "2026-08-09T00:00:00Z"), 1786000000);
+    db.close();
+
+    expect((await scan(dbPath)).rows).toHaveLength(1);
+    await chmod(directory, 0o000);
+    try {
+      await expect(scan(dbPath)).rejects.toMatchObject({
+        code: 1,
+        stdout: "",
+        stderr: expect.stringContaining("__BB_USAGE_ERROR__:EACCES"),
+      });
+    } finally {
+      await chmod(directory, 0o700);
+    }
+    expect((await scan(dbPath)).rows).toHaveLength(1);
   });
 
   it("skips messages without metrics, zero-token events, and malformed rows", async () => {
@@ -139,7 +162,7 @@ describe("devin SQLite collector", () => {
     db.node("session-a", 1, assistantMessage("request-1", { input_tokens: 10, output_tokens: 5, cache_read_tokens: null, cache_creation_tokens: null }, "2026-08-09T00:00:00Z"), 1786000000);
     db.close();
 
-    const result = await scan(join(directory, "absent", "sessions.db"), "2026-08-01", { ...process.env, APPDATA: appData });
+    const result = await scan(join(directory, "absent", "sessions.db"), "2026-08-01", { APPDATA: appData });
     expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 10, outputTokens: 5 })]);
   });
 

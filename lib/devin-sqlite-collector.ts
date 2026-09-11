@@ -87,7 +87,18 @@ async function devinSqliteCollector(encodedInput: string, dependencies: Collecto
       ? path.join(process.env.APPDATA.trim(), "devin/cli/sessions.db") : "",
     ...input.dbPaths,
   ].filter(Boolean);
-  const dbPath = candidates.find((candidate) => fs.existsSync(candidate));
+  const dbPath = candidates.find((candidate) => {
+    try {
+      fs.statSync(candidate);
+      return true;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      // Access errors must fail the scan so sync preserves previously saved
+      // usage instead of replacing it with a successful empty result.
+      throw error;
+    }
+  });
   // Devin CLI never ran on this machine: a normal empty scan, not an error.
   if (!dbPath) {
     emit();
