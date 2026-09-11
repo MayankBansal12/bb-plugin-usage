@@ -45,7 +45,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
+  agentId: z.enum(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -70,7 +70,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
 
@@ -80,6 +80,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const failures: string[] = [];
   let discoveryFailed = false;
   const cutoffMs = Date.parse(`${input.sinceDay}T00:00:00Z`);
+  const canDecompressZstd = typeof zlib.zstdDecompressSync === "function";
 
   function object(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -186,6 +187,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   function matches(filePath: string) {
     const name = path.basename(filePath);
     if (input.agentId === "codex") return name.startsWith("rollout-") && name.endsWith(".jsonl");
+    // Only the canonical current generation: dsh keeps earlier immutable
+    // generations (session.jsonl.zstd, session.vN...) beside the live v3 log
+    // after a migration, and they replay the same history.
+    if (input.agentId === "dsh") return name === "session.v3.jsonl.zstd";
     if (input.agentId === "fx" || input.agentId === "antigravity" || input.agentId === "thaura") return name === "usage.jsonl";
     if (input.agentId === "grok") return name === "unified.jsonl";
     return name.endsWith(".jsonl");
@@ -221,6 +226,80 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     }
   }
 
+  // DeepSeek Harness writes one Zstandard frame per append batch and
+  // concatenates them in a single file, while Node's zlib decoder stops at the
+  // end of the first frame. Frame boundaries are scanned structurally so each
+  // frame can be decompressed on its own; a torn final frame (an interrupted
+  // append) is returned separately instead of failing the whole file.
+  function zstdFrames(source: Buffer) {
+    const frames: Array<{ start: number; end: number }> = [];
+    let offset = 0;
+    while (offset < source.length) {
+      const start = offset;
+      if (source.length - offset < 4) return { frames, tornStart: start };
+      if (source.readUInt32LE(offset) !== 0xfd2fb528) throw new Error("Invalid Zstandard frame magic.");
+      offset += 4;
+      if (offset === source.length) return { frames, tornStart: start };
+      const descriptor = source.readUInt8(offset);
+      offset += 1;
+      if ((descriptor & 24) !== 0) throw new Error("Invalid Zstandard frame header.");
+      const singleSegment = (descriptor & 32) !== 0;
+      const contentSizeFlag = descriptor >>> 6;
+      const dictionaryBytes = (descriptor & 3) === 3 ? 4 : descriptor & 3;
+      const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag;
+      const headerBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes;
+      if (source.length - offset < headerBytes) return { frames, tornStart: start };
+      offset += headerBytes;
+      for (;;) {
+        if (source.length - offset < 3) return { frames, tornStart: start };
+        const blockHeader = source.readUIntLE(offset, 3);
+        offset += 3;
+        const blockType = (blockHeader >>> 1) & 3;
+        if (blockType === 3) throw new Error("Invalid Zstandard block type.");
+        const payloadBytes = blockType === 1 ? 1 : blockHeader >>> 3;
+        if (source.length - offset < payloadBytes) return { frames, tornStart: start };
+        offset += payloadBytes;
+        if ((blockHeader & 1) !== 0) break;
+      }
+      if ((descriptor & 4) !== 0) {
+        if (source.length - offset < 4) return { frames, tornStart: start };
+        offset += 4;
+      }
+      frames.push({ start, end: offset });
+    }
+    return { frames };
+  }
+
+  async function* zstdLines(filePath: string) {
+    if (!canDecompressZstd) throw new Error("This Node.js cannot decompress Zstandard usage logs.");
+    const source = await fs.promises.readFile(filePath);
+    const { frames, tornStart } = zstdFrames(source);
+    for (const frame of frames) {
+      yield* zlib.zstdDecompressSync(source.subarray(frame.start, frame.end)).toString("utf8").split("\n");
+    }
+    // The torn tail still yields the complete records written before the
+    // interrupted append; the rest becomes readable once the log is repaired.
+    if (tornStart !== undefined) {
+      try {
+        yield* zlib.zstdDecompressSync(source.subarray(tornStart), { finishFlush: zlib.constants.ZSTD_e_flush }).toString("utf8").split("\n");
+      } catch { /* unreadable bytes stay unread until a later scan */ }
+    }
+  }
+
+  // An attempt that never committed a message carries its usage in the
+  // stream's last usage chunk; committed messages carry it on data.usage.
+  function lastStreamUsage(stream: unknown) {
+    if (!Array.isArray(stream)) return null;
+    let usage: Record<string, unknown> | null = null;
+    for (const entry of stream) {
+      const chunk = object(object(entry)?.chunk);
+      if (chunk?.type !== "usage") continue;
+      const candidate = object(chunk.usage);
+      if (candidate) usage = candidate;
+    }
+    return usage;
+  }
+
   async function parseFile(filePath: string): Promise<CachedUsageRow[]> {
     const rows = new Map<string, HostUsageAggregate>();
     const events = new Map<string, CachedUsageRow>();
@@ -228,8 +307,21 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     // Session-scoped project, learned from the first record that carries a
     // working directory and reused for later rows in the same file.
     let sessionProject = "Unknown";
-    const stream = fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 1024 * 1024 });
-    const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    // dsh keeps the active request's provider/model on request/context rows;
+    // settlements without a committed message fall back to it.
+    let dshProvider = "unknown";
+    let dshModel = "unknown";
+    // A forked/seeded dsh session replays its parent's leading events before a
+    // session/end-seed marker; events at or before the last marker are the
+    // parent's, not this session's usage. The marker is sequenced after the
+    // inherited prefix, so settlements are buffered and applied once the
+    // boundary is known.
+    let dshSeeded = false;
+    let dshEndSeedSeq = -1;
+    const dshSettlements: Array<{ seq: number; row: HostUsageAggregate }> = [];
+    const lines: AsyncIterable<string> = filePath.endsWith(".zstd")
+      ? zstdLines(filePath)
+      : readline.createInterface({ input: fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 1024 * 1024 }), crlfDelay: Infinity });
     for await (const line of lines) {
       if (!line.trim()) continue;
       let raw: unknown;
@@ -392,6 +484,55 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           cacheWriteTokens: count(usage.cacheWrite), outputTokens: count(usage.output),
         });
       }
+
+      if (input.agentId === "dsh") {
+        if (value.type === "session") {
+          dshSeeded = value.isSeeded === true;
+          if (typeof value.cwd === "string") sessionProject = projectName(value.cwd);
+          continue;
+        }
+        if (value.type === "session/end-seed") {
+          // Only a tagged marker is a fork boundary; dsh also writes untagged
+          // end-seed records at ordinary resume/restore boundaries.
+          if (object(value.data)?.inherited === true && typeof value.seq === "number") {
+            dshEndSeedSeq = Math.max(dshEndSeedSeq, value.seq);
+          }
+          continue;
+        }
+        const data = object(value.data);
+        if (value.type === "request/context" && data) {
+          dshProvider = text(data.provider, dshProvider);
+          dshModel = text(data.model, dshModel);
+          continue;
+        }
+        if (value.type !== "assistant/message" && value.type !== "assistant/attempt") continue;
+        const usage = object(data?.usage) ?? lastStreamUsage(data?.stream);
+        const usageDay = day(value.time);
+        if (!usage || !usageDay) continue;
+        const inputTokens = count(usage.inputTokens);
+        const cached = count(usage.cacheReadTokens);
+        const writes = count(usage.cacheWriteTokens);
+        const output = count(usage.outputTokens);
+        if (inputTokens + cached + writes + output === 0) continue;
+        const source = object(object(data?.message)?.source);
+        const replay = object(object(source?.replayState)?.response);
+        dshSettlements.push({
+          seq: count(value.seq),
+          row: {
+            day: usageDay,
+            modelProviderId: text(source?.provider ?? replay?.provider, dshProvider),
+            model: text(replay?.responseModel ?? source?.model ?? replay?.model, dshModel),
+            project: sessionProject,
+            loggedCostUsd: null,
+            uncachedInputTokens: inputTokens, cachedInputTokens: cached,
+            cacheWriteTokens: writes, outputTokens: output,
+          },
+        });
+        continue;
+      }
+    }
+    for (const settlement of dshSettlements) {
+      if (settlement.seq > (dshSeeded ? dshEndSeedSeq : -1)) add(rows, settlement.row);
     }
     return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
   }
@@ -442,7 +583,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     } catch {
       // Absolute host paths and raw errors must not cross the host boundary;
       // this string is persisted in sync state and shown in the dashboard.
-      failures.push("A usage log could not be read.");
+      failures.push(!canDecompressZstd && filePath.endsWith(".zstd")
+        ? "A Zstandard usage log needs Node.js 22.15+ on this host."
+        : "A usage log could not be read.");
       if (prior && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
         nextFiles[sourceId] = prior;
         for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);

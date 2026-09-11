@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, FX, Grok Agent, OpenCode, Pi, Prime Agent, and Antigravity.
+- Collect usage from Codex, Claude Code, DeepSeek Harness, FX, Grok Agent, OpenCode, Pi, Prime Agent, and Antigravity.
 - Separate the coding agent from the underlying model provider.
 - Group charts and cost summaries by agent or model provider.
 - Break usage down by model, project, or day.
@@ -20,6 +20,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 - Codex: `~/.codex/sessions/**/rollout-*.jsonl`
 - Claude Code: `~/.claude/projects/**/*.jsonl`
+- DeepSeek Harness: `~/.dsh/sessions/*/*/session.v3.jsonl.zstd` (Zstandard-compressed JSONL; requires Node.js 22.15+ on the machine)
 - FX: `~/.fx/usage.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`
 - Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings

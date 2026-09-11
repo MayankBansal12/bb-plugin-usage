@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { zstdCompressSync } from "node:zlib";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -371,6 +372,165 @@ describe("host JSON usage collector", () => {
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
     expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(5);
+  });
+
+  it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const sessionDir = join(root, "--home-user-code-dsh-proj--", "session-uuid");
+    const cachePath = join(directory, "cache", "dsh.json");
+    await mkdir(sessionDir, { recursive: true });
+    // dsh seals one zstd frame per append batch, so a session file is a
+    // concatenation that Node's decoder only partially reads.
+    const frame = (records: unknown[]) => zstdCompressSync(
+      Buffer.from(`${records.map((value) => JSON.stringify(value)).join("\n")}\n`),
+    );
+    await writeFile(join(sessionDir, "session.v3.jsonl.zstd"), Buffer.concat([
+      frame([
+        { type: "session", version: 3, id: "session-uuid", createdAt: Date.parse("2026-08-09T00:00:00Z"), cwd: "/home/user/code/dsh-proj", isSeeded: false, delegationDepth: 0 },
+        { type: "request/context", seq: 1, time: Date.parse("2026-08-09T00:00:01Z"), data: { provider: "deepseek", model: "deepseek-v4.1-flash", contextWindow: 400000 } },
+      ]),
+      frame([
+        { type: "assistant/message", seq: 2, time: Date.parse("2026-08-09T00:00:02Z"), data: {
+          turn: 1, step: 1,
+          message: { id: "m-private", role: "assistant", content: [{ type: "text", text: "private" }], source: {
+            kind: "model", provider: "cliproxy", model: "deepseek-v4.1-flash-expires-on-0910",
+            replayState: { response: { provider: "cliproxy", model: "deepseek-v4.1-flash-expires-on-0910", responseModel: "deepseek-flash" } },
+          } },
+          usage: { inputTokens: 100, outputTokens: 20, totalTokens: 180, cacheReadTokens: 60 },
+        } },
+        { type: "assistant/attempt", seq: 3, time: Date.parse("2026-08-09T00:01:00Z"), data: {
+          turn: 2, step: 1,
+          stream: [
+            { type: "chunk", time: Date.parse("2026-08-09T00:00:59Z"), chunk: { type: "usage", usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } } },
+            { type: "chunk", time: Date.parse("2026-08-09T00:01:00Z"), chunk: { type: "finish", reason: { kind: "error", failure: { message: "private", code: "ABORTED" } } } },
+          ],
+        } },
+        // A committed message whose usage only survives in its stream, and a
+        // zero-usage settlement that must not produce a row.
+        { type: "assistant/message", seq: 4, time: Date.parse("2026-08-09T00:02:00Z"), data: {
+          turn: 3, step: 1,
+          message: { id: "m2", role: "assistant", content: [], source: { kind: "model", provider: "cliproxy", model: "deepseek-v4-pro" } },
+          stream: [{ type: "chunk", time: Date.parse("2026-08-09T00:02:00Z"), chunk: { type: "usage", usage: { inputTokens: 30, outputTokens: 7, totalTokens: 37 } } }],
+        } },
+        { type: "assistant/message", seq: 5, time: Date.parse("2026-08-09T00:03:00Z"), data: {
+          turn: 4, step: 1,
+          message: { id: "m3", role: "assistant", content: [], source: { kind: "model", provider: "cliproxy", model: "deepseek-v4-pro" } },
+          usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        } },
+      ]),
+    ]));
+    // A migration leaves older immutable generations next to the live v3 log;
+    // they carry the same history and must not be counted a second time.
+    await writeFile(join(sessionDir, "session.v2.jsonl.zstd"), frame([
+      { type: "session", version: 2, id: "session-uuid", createdAt: Date.parse("2026-08-09T00:00:00Z"), cwd: "/home/user/code/dsh-proj", isSeeded: false, delegationDepth: 0 },
+      { type: "assistant/message", seq: 2, time: Date.parse("2026-08-09T00:00:02Z"), data: {
+        turn: 1, step: 1,
+        message: { id: "m-old", role: "assistant", content: [], source: { kind: "model", provider: "cliproxy", model: "deepseek-flash" } },
+        usage: { inputTokens: 999, outputTokens: 999, totalTokens: 1998 },
+      } },
+    ]));
+
+    const day = localDay("2026-08-09T00:00:02Z");
+    const first = await scan("dsh", root, cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual([
+      expect.objectContaining({ day, modelProviderId: "cliproxy", model: "deepseek-flash", project: "dsh-proj", uncachedInputTokens: 100, cachedInputTokens: 60, outputTokens: 20, loggedCostUsd: null }),
+      expect.objectContaining({ day, modelProviderId: "cliproxy", model: "deepseek-v4-pro", project: "dsh-proj", uncachedInputTokens: 30, outputTokens: 7 }),
+      expect.objectContaining({ day, modelProviderId: "deepseek", model: "deepseek-v4.1-flash", project: "dsh-proj", uncachedInputTokens: 10, outputTokens: 5 }),
+    ]);
+
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toContain("private");
+    expect(cache).not.toContain("m-private");
+    expect(cache).not.toContain(root);
+
+    const second = await scan("dsh", root, cachePath);
+    expect(second).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+  });
+
+  it("reads a torn dsh frame's intact prefix without failing the file", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "dsh.json");
+    await mkdir(root, { recursive: true });
+    const message = (seq: number, inputTokens: number) => ({
+      type: "assistant/message", seq, time: Date.parse("2026-08-09T00:00:00Z") + seq, data: {
+        turn: seq, step: 1,
+        message: { id: `m-${seq}`, role: "assistant", content: [{ type: "text", text: `private ${seq} `.repeat(40) }], source: { kind: "model", provider: "deepseek", model: "deepseek-v4-pro" } },
+        usage: { inputTokens, outputTokens: 1, totalTokens: inputTokens + 1 },
+      },
+    });
+    const frame = (records: unknown[]) => zstdCompressSync(
+      Buffer.from(`${records.map((value) => JSON.stringify(value)).join("\n")}\n`),
+    );
+    const complete = frame([
+      { type: "session", version: 3, id: "s", createdAt: Date.parse("2026-08-09T00:00:00Z"), cwd: "/work/app", isSeeded: false, delegationDepth: 0 },
+      message(1, 100),
+    ]);
+    const torn = frame(Array.from({ length: 300 }, (_, index) => message(index + 2, 10)));
+    // An interrupted append leaves a structurally incomplete final frame.
+    await writeFile(join(root, "session.v3.jsonl.zstd"), Buffer.concat([complete, torn.subarray(0, torn.length - 8)]));
+
+    const result = await scan("dsh", root, cachePath);
+    expect(result).toMatchObject({ fileCount: 1, failureCount: 0 });
+    const row = result.rows.find((candidate) => candidate.day === localDay("2026-08-09T00:00:00Z"));
+    // The complete frame contributes 100 input tokens; the torn frame's
+    // recoverable prefix adds more of its 300 ten-token messages.
+    expect(row?.uncachedInputTokens).toBeGreaterThan(100);
+  });
+
+  it("counts only a seeded dsh session's own events after the last end-seed boundary", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "dsh.json");
+    await mkdir(root, { recursive: true });
+    const frame = (records: unknown[]) => zstdCompressSync(
+      Buffer.from(`${records.map((value) => JSON.stringify(value)).join("\n")}\n`),
+    );
+    const message = (seq: number, inputTokens: number) => ({
+      type: "assistant/message", seq, time: Date.parse("2026-08-09T00:00:00Z") + seq, data: {
+        turn: seq, step: 1,
+        message: { id: `m-${seq}`, role: "assistant", content: [], source: { kind: "model", provider: "deepseek", model: "deepseek-v4-pro" } },
+        usage: { inputTokens, outputTokens: 1, totalTokens: inputTokens + 1 },
+      },
+    });
+    // A forked session's stored log is the parent's prefix (which itself may
+    // carry an end-seed marker) followed by this session's own end-seed and
+    // events; only events after the LAST marker are this session's usage.
+    await writeFile(join(root, "session.v3.jsonl.zstd"), frame([
+      { type: "session", version: 3, id: "child", createdAt: Date.parse("2026-08-09T00:00:00Z"), cwd: "/work/forked-proj", isSeeded: true, delegationDepth: 0 },
+      { type: "request/context", seq: 1, time: Date.parse("2026-08-09T00:00:00Z"), data: { provider: "deepseek", model: "deepseek-v4-pro" } },
+      message(2, 500),
+      { type: "session/end-seed", seq: 3, time: Date.parse("2026-08-09T00:00:00Z"), data: { inherited: true } },
+      message(4, 400),
+      { type: "session/end-seed", seq: 5, time: Date.parse("2026-08-09T00:00:00Z"), data: { inherited: true } },
+      message(6, 100),
+      // An untagged end-seed is an ordinary resume boundary, not a new
+      // inherited cut: usage after it still belongs to this session.
+      { type: "session/end-seed", seq: 7, time: Date.parse("2026-08-09T00:00:00Z"), data: {} },
+      message(8, 50),
+    ]));
+
+    const result = await scan("dsh", root, cachePath);
+    expect(result).toMatchObject({ fileCount: 1, failureCount: 0 });
+    expect(result.rows).toEqual([
+      expect.objectContaining({ project: "forked-proj", uncachedInputTokens: 150, outputTokens: 2 }),
+    ]);
+  });
+
+  it("fails a non-Zstandard dsh log without leaking host details", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "dsh.json");
+    await mkdir(root, { recursive: true });
+    await writeFile(join(root, "session.v3.jsonl.zstd"), "not a zstd frame");
+
+    const result = await scan("dsh", root, cachePath);
+    expect(result).toMatchObject({ fileCount: 1, failureCount: 1 });
+    expect(result.error).toBe("A usage log could not be read.");
+    expect(result.rows).toEqual([]);
   });
 
   it("keeps host filesystem paths out of failure diagnostics", async () => {
