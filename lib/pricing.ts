@@ -99,6 +99,66 @@ function matchWithinProvider(providerId: string, provider: CatalogProvider, mode
   return price ? { modelProviderId: providerId, modelProviderName: providerName(providerId, provider), price, status: "models-dev-alias" } : null;
 }
 
+// First-party vendors tried in order for rows whose provider is missing from
+// the catalog — typically a proxy gateway such as cliproxy reporting bare model
+// names. The first vendor pricing a model variant wins, so canonical vendors
+// outrank reseller mirrors of the same model.
+const firstPartyProviders = [
+  "openai", "anthropic", "google", "google-vertex", "deepseek", "xai",
+  "zai", "zhipuai", "alibaba", "meta", "kimi-for-coding", "moonshotai",
+  "mistral", "minimax",
+];
+
+// Gateways decorate catalog model names with routing hints: promo tags
+// (-expires-on-…) and reasoning effort (-low/-medium/-high/-xhigh/-max). -max
+// is also part of real model names (qwen3.8-max), so variants are always tried
+// from most to least specific.
+const proxyDecorationPatterns = [/-expires-on-.+$/, /-(?:low|medium|high|xhigh|max)$/];
+
+function proxyModelIds(providerId: string, model: string) {
+  const seen = new Set<string>();
+  const modelIds: string[] = [];
+  const queue = normalizedModelIds(providerId, model);
+  while (queue.length > 0) {
+    const candidate = queue.shift()!;
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    modelIds.push(candidate);
+    for (const pattern of proxyDecorationPatterns) {
+      const stripped = candidate.replace(pattern, "");
+      if (stripped && stripped !== candidate) queue.push(stripped);
+    }
+  }
+  return modelIds;
+}
+
+function matchViaFirstParty(modelIds: string[]): PricingResult | null {
+  const providers = activeProviders();
+  for (const vendorId of firstPartyProviders) {
+    const vendor = providers[vendorId];
+    if (!vendor) continue;
+    for (const modelId of modelIds) {
+      const match = matchWithinProvider(vendorId, vendor, modelId);
+      // Attribution is inferred rather than reported, hence alias status.
+      if (match) return { ...match, status: "models-dev-alias" };
+    }
+  }
+  return null;
+}
+
+function uniqueCatalogMatch(modelIds: string[]): PricingResult | null {
+  for (const modelId of modelIds) {
+    const matches = Object.entries(activeProviders()).flatMap(([candidateId, candidate]) => {
+      const price = candidate.models[modelId]?.cost ? toPrice(candidate.models[modelId]!.cost!) : null;
+      return price ? [{ modelProviderId: normalizeProviderId(candidateId), modelProviderName: providerName(candidateId, candidate), price }] : [];
+    });
+    // Only a globally unique hit resolves; an ambiguous variant stops the walk
+    // so a less specific name cannot silently price a different model.
+    if (matches.length > 0) return matches.length === 1 ? { ...matches[0]!, status: "models-dev-alias" } : null;
+  }
+  return null;
+}
+
 export function resolvePricing(rawProviderId: string, model: string): PricingResult {
   const modelProviderId = normalizeProviderId(rawProviderId);
   const provider = activeProviders()[modelProviderId];
@@ -113,7 +173,18 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
   }
 
   // Explicit providers must never inherit a different vendor's rates.
-  if (modelProviderId !== "unknown") return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
+  if (provider || builtinPrices[modelProviderId]) {
+    return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
+  }
+
+  // Catalog-less providers (proxy gateways like cliproxy) can still resolve to
+  // the vendor actually serving the model: first-party vendors over decorated
+  // name variants, then a catalog-wide unique exact match.
+  if (modelProviderId !== "unknown") {
+    const modelIds = proxyModelIds(modelProviderId, model);
+    const inferred = matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
+    return inferred ?? { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
+  }
 
   const exactMatches = Object.entries(activeProviders()).flatMap(([candidateId, candidate]) => {
     const exact = normalizedModelIds(modelProviderId, model).map((modelId) => candidate.models[modelId]).find((item) => item?.cost);

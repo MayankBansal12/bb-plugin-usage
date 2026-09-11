@@ -106,7 +106,7 @@ describe("usage collectors", () => {
     const record = parsePrime(content, machine)[0]!;
     expect(record).toMatchObject({
       eventKey: "prime:prime-session:entry-1", agentId: "prime", agentName: "Prime Agent",
-      modelProviderId: "prime-inference", model: "openai/gpt-5.5", loggedCostUsd: 0.0012, processedTokens: 125,
+      modelProviderId: "openai", model: "openai/gpt-5.5", loggedCostUsd: 0.0012, processedTokens: 125,
     });
     expect(JSON.stringify(record)).not.toContain("not retained");
   });
