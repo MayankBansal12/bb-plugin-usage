@@ -315,7 +315,14 @@ export function modelLogoId(model: string | null | undefined): string | null {
 function specFor(id: string | null | undefined): LogoSpec | null {
   const key = (id ?? "").toLowerCase().trim();
   if (!key) return null;
-  return LOGOS[key] ?? LOGOS[LOGO_ALIASES[key] ?? ""] ?? null;
+  // Per-account agent ids (e.g. codex-saiens for a ~/.codex-profiles account)
+  // fall back to their base brand by trimming trailing dash segments.
+  for (let candidate = key; candidate; candidate = candidate.slice(0, candidate.lastIndexOf("-"))) {
+    const spec = LOGOS[candidate] ?? LOGOS[LOGO_ALIASES[candidate] ?? ""];
+    if (spec) return spec;
+    if (!candidate.includes("-")) break;
+  }
+  return null;
 }
 
 const LOGO_SIZES = {

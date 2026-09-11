@@ -18,7 +18,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Supported data sources
 
-- Codex: `~/.codex/sessions/**/rollout-*.jsonl`
+- Codex: `~/.codex/sessions/**/rollout-*.jsonl`, plus `~/.codex-profiles/*/sessions/**/rollout-*.jsonl` for extra Codex accounts exposed as ACP providers (e.g. by multi-account bridges); each profile reports as its own agent, `Codex (<name>)`
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - Devin: `~/.local/share/devin/cli/sessions.db` — the Devin CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` is honored). Devin runs in BB through the `acp-devin` provider and writes no JSONL session logs.
 - FX: `~/.fx/usage.jsonl`
