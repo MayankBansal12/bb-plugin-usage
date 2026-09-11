@@ -14,6 +14,7 @@ import {
   extractHostJsonScan,
   type HostJsonAgentId,
 } from "./lib/host-json-collector";
+import { compressedDevinCollectorScript } from "./lib/devin-sqlite-collector";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
@@ -74,6 +75,8 @@ type CollectorSettings = { piSessionRoots: string; primeSessionRoots: string };
 const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "dsh", name: "DeepSeek Harness" },
+  { id: "devin", name: "Devin" },
   { id: "fx", name: "FX" },
   { id: "grok", name: "Grok Agent" },
   { id: "opencode", name: "OpenCode" },
@@ -150,6 +153,7 @@ const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
+const DEVIN_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
@@ -401,6 +405,7 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
   return agentId === "codex" ? [`${home}/.codex/sessions`]
     : agentId === "claude" ? [`${home}/.claude/projects`]
+    : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
     : agentId === "antigravity" ? [`${home}/.antigravity-acp/usage.jsonl`]
@@ -446,6 +451,10 @@ async function syncJsonAgent(
       roots,
       cachePath,
       sinceDay: historyStartDay(),
+      // Extra Codex accounts (BB account-limits ACP providers) keep their
+      // CODEX_HOME under ~/.codex-profiles/<name>; the scan tags their rows
+      // with the profile name so each account stays a distinct agent.
+      accountRoot: agentId === "codex" ? `${home}/.codex-profiles` : undefined,
     }), signal, {
       title: `Usage: ${agentId} scan`,
       timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
@@ -475,6 +484,70 @@ async function syncJsonAgent(
       : null;
     upsertState(db, machine.id, agentId, status, recordCount, error, complete);
     bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from ${scan.fileCount} files (${scan.changedFileCount} changed, ${scan.reusedFileCount} cached, ${status})`);
+  } catch (error) {
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const message = `Usage scan failed: ${errorMessage(error)}`;
+    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+    bb.log.warn(`${machine.name}/${agentId}: ${message}`);
+  }
+}
+
+export function devinCommand(home: string) {
+  const script = compressedDevinCollectorScript({
+    agentId: "devin",
+    dbPaths: [
+      `${home}/.local/share/devin/cli/sessions.db`,
+      `${home}/Library/Application Support/devin/cli/sessions.db`,
+    ],
+    sinceDay: historyStartDay(),
+  });
+  return [
+    "if ! command -v node >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to scan Devin usage.'; exit 127",
+    "fi",
+    `node -e ${shellQuote(script)}`,
+  ].join("; ");
+}
+
+export async function syncDevin(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  home: string,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const agentId: AgentId = "devin";
+  const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const output = await executeHostCommand(bb, machine, devinCommand(home), signal, {
+      title: "Usage: Devin scan",
+      timeoutMs: DEVIN_SYNC_TIMEOUT_MS,
+    });
+    const scan = extractHostJsonScan(output);
+    if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
+    const aggregateJson = JSON.stringify(scan.rows);
+    const records = parseHostUsageAggregates(aggregateJson, agentId, {
+      machineId: machine.id,
+      machineName: machine.name,
+    });
+    const sourceId = opaqueId(machine.id, agentId, "devin-sqlite-v1");
+    upsertSourceEvents(db, {
+      id: sourceId,
+      rootReference: opaqueId("devin-cli-sessions-db"),
+      sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+      generation,
+    }, machine, agentId, records);
+    reconcileSources(db, machine.id, agentId, generation);
+
+    const complete = scan.failureCount === 0;
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
+    const error = scan.failureCount > 0
+      ? `${scan.failureCount} source problem${scan.failureCount === 1 ? "" : "s"} prevented a complete scan${scan.error ? `: ${scan.error}` : "."}`
+      : null;
+    upsertState(db, machine.id, agentId, status, recordCount, error, complete);
+    bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from Devin sessions.db (${status})`);
   } catch (error) {
     const recordCount = countForMachine(db, machine.id, agentId);
     const message = `Usage scan failed: ${errorMessage(error)}`;
@@ -894,12 +967,14 @@ export default async function plugin(bb: BbPluginApi) {
         await Promise.all([
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "thaura", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncDevin(bb, db, machine, home, timeoutSignal(DEVIN_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
           syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
           syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
@@ -963,13 +1038,19 @@ export default async function plugin(bb: BbPluginApi) {
       const sync = syncCoordinator.snapshot();
       const modelProviders = db.prepare(`SELECT model_provider_id id, MAX(model_provider_name) name
         FROM usage_events GROUP BY model_provider_id ORDER BY name`).all() as Array<{ id: string; name: string }>;
+      // Agents not in the static list (e.g. per-account Codex profiles) still
+      // need a filter entry or the dashboard would hide their records.
+      const knownAgentIds = new Set<string>(AGENTS.map((agent) => agent.id));
+      const extraAgents = (db.prepare(`SELECT provider_id id, MAX(provider_name) name
+        FROM usage_events GROUP BY provider_id ORDER BY name`).all() as Array<{ id: string; name: string }>)
+        .filter((agent) => !knownAgentIds.has(agent.id));
       return {
         mode: "live" as const,
         generatedAt: new Date().toISOString(),
         lastSyncedAt: sync.completedAt,
         pricingVersion: pricingVersion(),
         machines,
-        agents: [...AGENTS],
+        agents: [...AGENTS, ...extraAgents],
         modelProviders,
         records,
         sources,
