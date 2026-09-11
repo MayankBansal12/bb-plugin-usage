@@ -446,6 +446,10 @@ async function syncJsonAgent(
       roots,
       cachePath,
       sinceDay: historyStartDay(),
+      // Extra Codex accounts (BB account-limits ACP providers) keep their
+      // CODEX_HOME under ~/.codex-profiles/<name>; the scan tags their rows
+      // with the profile name so each account stays a distinct agent.
+      accountRoot: agentId === "codex" ? `${home}/.codex-profiles` : undefined,
     }), signal, {
       title: `Usage: ${agentId} scan`,
       timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
@@ -918,13 +922,19 @@ export default async function plugin(bb: BbPluginApi) {
       const sync = syncCoordinator.snapshot();
       const modelProviders = db.prepare(`SELECT model_provider_id id, MAX(model_provider_name) name
         FROM usage_events GROUP BY model_provider_id ORDER BY name`).all() as Array<{ id: string; name: string }>;
+      // Agents not in the static list (e.g. per-account Codex profiles) still
+      // need a filter entry or the dashboard would hide their records.
+      const knownAgentIds = new Set<string>(AGENTS.map((agent) => agent.id));
+      const extraAgents = (db.prepare(`SELECT provider_id id, MAX(provider_name) name
+        FROM usage_events GROUP BY provider_id ORDER BY name`).all() as Array<{ id: string; name: string }>)
+        .filter((agent) => !knownAgentIds.has(agent.id));
       return {
         mode: "live" as const,
         generatedAt: new Date().toISOString(),
         lastSyncedAt: sync.completedAt,
         pricingVersion: pricingVersion(),
         machines,
-        agents: [...AGENTS],
+        agents: [...AGENTS, ...extraAgents],
         modelProviders,
         records,
         sources,

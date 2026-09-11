@@ -18,7 +18,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Supported data sources
 
-- Codex: `~/.codex/sessions/**/rollout-*.jsonl`
+- Codex: `~/.codex/sessions/**/rollout-*.jsonl`, plus `~/.codex-profiles/*/sessions/**/rollout-*.jsonl` for extra Codex accounts exposed as ACP providers (e.g. by multi-account bridges); each profile reports as its own agent, `Codex (<name>)`
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - FX: `~/.fx/usage.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`

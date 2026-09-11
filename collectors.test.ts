@@ -186,6 +186,55 @@ describe("usage collectors", () => {
     });
   });
 
+  it("attributes host-scanned Codex profile rows to their own agent", () => {
+    const row = (account: string | undefined) => ({
+      day: "2026-08-09",
+      modelProviderId: "openai",
+      model: "gpt-5.6-sol",
+      project: "app",
+      ...(account === undefined ? {} : { account }),
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    });
+    const records = parseHostUsageAggregates(JSON.stringify([row("saiens"), row("omnidrome"), row(undefined)]), "codex", machine);
+    expect(records).toHaveLength(3);
+    expect(new Set(records.map((record) => record.eventKey)).size).toBe(3);
+    expect(records[0]).toMatchObject({
+      eventKey: "codex-saiens:machine-a:2026-08-09:openai:gpt-5.6-sol:app",
+      agentId: "codex-saiens",
+      agentName: "Codex (saiens)",
+      modelProviderId: "openai",
+    });
+    expect(records[1]).toMatchObject({ agentId: "codex-omnidrome", agentName: "Codex (omnidrome)" });
+    expect(records[2]).toMatchObject({
+      eventKey: "codex:machine-a:2026-08-09:openai:gpt-5.6-sol:app",
+      agentId: "codex",
+      agentName: "Codex",
+    });
+  });
+
+  it("ignores account labels on non-Codex scans", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "anthropic",
+      model: "claude-sonnet-5",
+      account: "saiens",
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 10,
+    }]);
+    expect(parseHostUsageAggregates(content, "claude", machine)[0]).toMatchObject({
+      eventKey: "claude:machine-a:2026-08-09:anthropic:claude-sonnet-5:Unknown",
+      agentId: "claude",
+      agentName: "Claude Code",
+    });
+  });
+
   it("uses FX-recorded spend without replacing it with API-rate estimates", () => {
     const aggregate = (loggedCostUsd: number | null) => JSON.stringify([{
       day: "2026-08-09",

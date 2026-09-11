@@ -1,6 +1,9 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 
-export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura";
+// `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
+// lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
+// in grouping and filters instead of merging into "codex".
+export type AgentId = "codex" | "claude" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
 
 export type UsageRecord = {
   eventKey: string;
@@ -49,6 +52,9 @@ export type HostUsageAggregate = {
   modelProviderId: string;
   model: string;
   project: string;
+  // Set when a session file came from a per-account home (a Codex profile);
+  // absent for the agent's primary home.
+  account?: string;
   loggedCostUsd: number | null;
   uncachedInputTokens: number;
   cachedInputTokens: number;
@@ -328,12 +334,18 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
     const model = text(row.model, "unknown");
     const project = text(row.project, "Unknown");
+    // Only the codex scan emits `account` today; it marks rows from
+    // ~/.codex-profiles/<name> so each extra account lands on its own
+    // dashboard agent instead of merging into Codex.
+    const account = agentId === "codex" ? text(row.account, "").slice(0, 80) : "";
+    const scopedAgentId: AgentId = account ? `codex-${account}` : agentId;
+    const scopedAgentName = account ? `Codex (${account})` : agentName;
     return [usageRecord({
-      eventKey: `${agentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
+      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
-      agentId,
-      agentName,
+      agentId: scopedAgentId,
+      agentName: scopedAgentName,
       modelProviderId,
       model,
       project,

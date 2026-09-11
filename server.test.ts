@@ -203,6 +203,119 @@ describe("sync RPC", () => {
 
     db.close();
   });
+
+  it("collects Codex profile accounts as separate dashboard agents", async () => {
+    const db = new Database(":memory:");
+    let handlers: {
+      sync: () => unknown;
+      dashboard: () => Promise<{
+        agents: Array<{ id: string; name: string }>;
+        records: Array<{ agentId: string; agentName: string; processedTokens: number }>;
+      }>;
+    } | undefined;
+
+    // Decode the generated collector script's baked-in scan input so the test
+    // can answer codex scans with profile-tagged rows and assert the scan
+    // covers the account root.
+    function scanInputFromCommand(command: string): { agentId?: string; roots?: string[]; accountRoot?: string } | null {
+      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+      if (!outer) return null;
+      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+      if (!inner) return null;
+      return JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8"));
+    }
+
+    const commandsByTerminalId = new Map<string, string>();
+    const day = new Date().toISOString().slice(0, 10);
+    const aggregateRow = (account?: string) => ({
+      day,
+      modelProviderId: "openai",
+      model: "gpt-5.6-sol",
+      project: "app",
+      ...(account === undefined ? {} : { account }),
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    });
+
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as typeof handlers;
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandsByTerminalId.get(args.terminalId) ?? "";
+            const input = scanInputFromCommand(command);
+            const text = input?.agentId === "codex"
+              ? fakeHostScanOutput("codex", [aggregateRow(), aggregateRow("saiens")])
+              : fakeHostScanOutput(input?.agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 2 });
+    }, { timeout: 2000 });
+
+    const codexScan = [...commandsByTerminalId.values()].map(scanInputFromCommand).find((input) => input?.agentId === "codex");
+    expect(codexScan).toMatchObject({
+      roots: ["/home/user/.codex/sessions"],
+      accountRoot: "/home/user/.codex-profiles",
+    });
+
+    const providers = db.prepare(
+      "SELECT provider_id, provider_name FROM usage_events ORDER BY provider_id",
+    ).all();
+    expect(providers).toEqual([
+      { provider_id: "codex", provider_name: "Codex" },
+      { provider_id: "codex-saiens", provider_name: "Codex (saiens)" },
+    ]);
+    expect(db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'codex'",
+    ).get()).toEqual({ status: "ready", recordCount: 2 });
+
+    const dashboard = await handlers!.dashboard();
+    expect(dashboard.agents).toEqual(expect.arrayContaining([
+      { id: "codex", name: "Codex" },
+      { id: "codex-saiens", name: "Codex (saiens)" },
+    ]));
+    expect(dashboard.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "codex", agentName: "Codex", processedTokens: 125 }),
+      expect.objectContaining({ agentId: "codex-saiens", agentName: "Codex (saiens)", processedTokens: 125 }),
+    ]));
+
+    db.close();
+  });
 });
 
 describe("provider limit loading", () => {
