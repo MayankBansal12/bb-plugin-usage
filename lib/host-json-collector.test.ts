@@ -578,6 +578,125 @@ describe("host JSON usage collector", () => {
     ]);
   });
 
+  describe("dsh accounting regressions", () => {
+    const timestamp = Date.parse("2026-08-09T12:00:00Z");
+    const header = (isSeeded = false) => ({
+      type: "session", version: 3, id: "session", createdAt: timestamp,
+      cwd: "/work/project", isSeeded, delegationDepth: 0,
+    });
+    const context = { type: "request/context", seq: 1, time: timestamp, data: { provider: "deepseek", model: "deepseek-v4-pro" } };
+    const frame = (records: unknown[]) => zstdCompressSync(Buffer.from(`${records.map((record) => JSON.stringify(record)).join("\n")}\n`));
+    const usage = (inputTokens: number, outputTokens: number, cacheReadTokens = 0, cacheWriteTokens = 0) => ({
+      inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens,
+    });
+    const attempt = (seq: number, sample: ReturnType<typeof usage>) => ({
+      type: "assistant/attempt", seq, time: timestamp + seq,
+      data: { turn: 1, step: 1, stream: [{ type: "chunk", time: timestamp + seq, chunk: { type: "usage", usage: sample } }] },
+    });
+    const message = (seq: number, sample: ReturnType<typeof usage>, turn = 1, step = 1) => ({
+      type: "assistant/message", seq, time: timestamp + seq,
+      data: {
+        turn, step, usage: sample,
+        message: { id: `message-${seq}`, role: "assistant", content: [], source: { kind: "model", provider: "deepseek", model: "deepseek-v4-pro" } },
+      },
+    });
+
+    it.each([false, true])("replaces an attempt's earlier samples with final usage (zero: %s)", async (zero) => {
+      const root = await temporaryDirectory();
+      const cachePath = join(root, "cache.json");
+      const final = message(4, zero ? usage(0, 0) : usage(14, 5, 8, 1));
+      // The final sample also supplies the authoritative date and model route.
+      final.time = timestamp + 24 * 60 * 60 * 1000;
+      final.data.message.source.provider = "cliproxy";
+      final.data.message.source.model = "deepseek-flash";
+      await writeFile(join(root, "session.v3.jsonl.zstd"), frame([
+        header(), context, attempt(2, usage(10, 2, 3)), attempt(3, usage(12, 4, 6)), final,
+        { ...final, seq: 5 },
+      ]));
+
+      const first = await scan("dsh", root, cachePath);
+      expect(first).toMatchObject({ failureCount: 0, changedFileCount: 1 });
+      expect(first.rows).toEqual(zero ? [] : [expect.objectContaining({
+        day: localDay(new Date(final.time).toISOString()), modelProviderId: "cliproxy", model: "deepseek-flash",
+        uncachedInputTokens: 14, outputTokens: 5, cachedInputTokens: 8, cacheWriteTokens: 1,
+      })]);
+      const second = await scan("dsh", root, cachePath);
+      expect(second).toMatchObject({ failureCount: 0, reusedFileCount: 1, rows: first.rows });
+    });
+
+    it("counts separate retries, steps, and turns while replacing samples within an attempt", async () => {
+      const root = await temporaryDirectory();
+      const cachePath = join(root, "cache.json");
+      await writeFile(join(root, "session.v3.jsonl.zstd"), frame([
+        header(), context, attempt(2, usage(10, 2, 3)),
+        { type: "llm/retry-started", seq: 3, time: timestamp + 3, data: { turn: 1, step: 1, retry: 1 } },
+        attempt(4, usage(12, 4, 6)), message(5, usage(14, 5, 8, 1)),
+        message(6, usage(30, 3), 1, 2), message(7, usage(40, 4), 2, 1),
+      ]));
+
+      const result = await scan("dsh", root, cachePath);
+      expect(result.failureCount).toBe(0);
+      expect(result.rows).toEqual([expect.objectContaining({
+        // Failed attempt 10/2 + final retry 14/5 + next step 30/3 + next turn 40/4.
+        uncachedInputTokens: 94, outputTokens: 14, cachedInputTokens: 11, cacheWriteTokens: 1,
+      })]);
+    });
+
+    it.each([false, true])("rejects a fork missing its inherited boundary (prior cache: %s)", async (withCache) => {
+      const root = await temporaryDirectory();
+      const cachePath = join(root, "cache.json");
+      const logPath = join(root, "session.v3.jsonl.zstd");
+      const prefix = frame([
+        header(true), context, message(2, usage(500, 50)),
+        // An ordinary resume marker cannot stand in for the missing fork cut.
+        { type: "session/end-seed", seq: 3, time: timestamp + 3, data: {} },
+      ]);
+      const boundary = frame([{ type: "session/end-seed", seq: 4, time: timestamp + 4, data: { inherited: true } }]);
+      let priorRows: Awaited<ReturnType<typeof scan>>["rows"] = [];
+      if (withCache) {
+        await writeFile(logPath, Buffer.concat([prefix, boundary, frame([message(5, usage(100, 10), 2)])]));
+        const prior = await scan("dsh", root, cachePath);
+        expect(prior.failureCount).toBe(0);
+        priorRows = prior.rows;
+        expect(priorRows).toEqual([expect.objectContaining({ uncachedInputTokens: 100, outputTokens: 10 })]);
+      }
+      const priorCache = withCache ? await readFile(cachePath, "utf8") : null;
+      await writeFile(logPath, Buffer.concat([prefix, boundary.subarray(0, 7)]));
+
+      for (let i = 0; i < 2; i++) {
+        const result = await scan("dsh", root, cachePath);
+        expect(result).toMatchObject({
+          failureCount: 1, changedFileCount: 0, reusedFileCount: 0,
+          error: "A usage log could not be read.", rows: priorRows,
+        });
+      }
+      if (withCache) expect(await readFile(cachePath, "utf8")).toBe(priorCache);
+      else expect(JSON.parse(await readFile(cachePath, "utf8")).files).toEqual({});
+
+      await writeFile(logPath, Buffer.concat([prefix, boundary, frame([message(5, usage(150, 15), 2)])]));
+      const repaired = await scan("dsh", root, cachePath);
+      expect(repaired).toMatchObject({ failureCount: 0, changedFileCount: 1 });
+      expect(repaired.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 150, outputTokens: 15 })]);
+    });
+
+    it("reparses unchanged dsh logs when the cache predates corrected attempt accounting", async () => {
+      const root = await temporaryDirectory();
+      const cachePath = join(root, "cache.json");
+      await writeFile(join(root, "session.v3.jsonl.zstd"), frame([header(), context, message(2, usage(14, 5))]));
+      await scan("dsh", root, cachePath);
+      const oldCache = JSON.parse(await readFile(cachePath, "utf8"));
+      oldCache.version = 5;
+      const entry = Object.values(oldCache.files)[0] as { rows: Array<{ uncachedInputTokens: number }> };
+      entry.rows[0]!.uncachedInputTokens = 999;
+      await writeFile(cachePath, JSON.stringify(oldCache));
+
+      const result = await scan("dsh", root, cachePath);
+      expect(result).toMatchObject({ failureCount: 0, changedFileCount: 1, reusedFileCount: 0 });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 14, outputTokens: 5 })]);
+      expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
+    });
+  });
+
   it("fails a non-Zstandard dsh log without leaking host details", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "sessions");

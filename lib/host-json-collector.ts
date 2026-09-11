@@ -76,10 +76,11 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // version MUST rise or upgraded hosts keep serving UTC buckets forever,
   // silently mixed with newly parsed local ones.
   // v5: keep recorded and unpriced Pi/Prime usage in separate buckets.
-  const cacheVersion = 5;
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
+  // v6 (dsh only): replace repeated attempt samples and reject missing fork cuts.
+  const cacheVersion = input.agentId === "dsh" ? 6 : 5;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -339,7 +340,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     // boundary is known.
     let dshSeeded = false;
     let dshEndSeedSeq = -1;
-    const dshSettlements: Array<{ seq: number; row: HostUsageAggregate }> = [];
+    type DshSettlement = { seq: number; turn: number; step: number; row: HostUsageAggregate };
+    const dshSettlements: DshSettlement[] = [];
+    // Samples within one attempt replace each other; a retry closes that slot.
+    let dshLastSettlement: DshSettlement | undefined;
     const lines: AsyncIterable<string> = filePath.endsWith(".zstd")
       ? zstdLines(filePath)
       : readline.createInterface({ input: fs.createReadStream(filePath, { encoding: "utf8", highWaterMark: 1024 * 1024 }), crlfDelay: Infinity });
@@ -522,6 +526,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           continue;
         }
         const data = object(value.data);
+        if (value.type === "llm/retry-started") {
+          if (dshLastSettlement?.turn === data?.turn && dshLastSettlement?.step === data?.step) {
+            dshLastSettlement = undefined;
+          }
+          continue;
+        }
         if (value.type === "request/context" && data) {
           dshProvider = text(data.provider, dshProvider);
           dshModel = text(data.model, dshModel);
@@ -535,11 +545,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const cached = count(usage.cacheReadTokens);
         const writes = count(usage.cacheWriteTokens);
         const output = count(usage.outputTokens);
-        if (inputTokens + cached + writes + output === 0) continue;
         const source = object(object(data?.message)?.source);
         const replay = object(object(source?.replayState)?.response);
-        dshSettlements.push({
+        const settlement = {
           seq: count(value.seq),
+          turn: count(data?.turn),
+          step: count(data?.step),
           row: {
             day: usageDay,
             modelProviderId: text(source?.provider ?? replay?.provider, dshProvider),
@@ -549,12 +560,24 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
             uncachedInputTokens: inputTokens, cachedInputTokens: cached,
             cacheWriteTokens: writes, outputTokens: output,
           },
-        });
+        };
+        if (dshLastSettlement?.turn === settlement.turn && dshLastSettlement.step === settlement.step) {
+          Object.assign(dshLastSettlement, settlement);
+        } else {
+          dshSettlements.push(settlement);
+          dshLastSettlement = settlement;
+        }
         continue;
       }
     }
+    // Without the cut, recovered fork history cannot be attributed safely.
+    // Throw so the caller preserves any prior valid cache instead.
+    if (dshSeeded && dshEndSeedSeq < 0) throw new Error("A seeded usage log is missing its inherited boundary.");
     for (const settlement of dshSettlements) {
-      if (settlement.seq > (dshSeeded ? dshEndSeedSeq : -1)) add(rows, settlement.row);
+      if (dshSeeded && settlement.seq <= dshEndSeedSeq) continue;
+      const row = settlement.row;
+      // A zero final sample still replaces earlier usage, but creates no row.
+      if (row.uncachedInputTokens + row.cachedInputTokens + row.cacheWriteTokens + row.outputTokens > 0) add(rows, row);
     }
     return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
   }
