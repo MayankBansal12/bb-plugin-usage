@@ -592,6 +592,7 @@ async function stageHostCommand(
     content: command,
     contentEncoding: "utf8",
     createParents: true,
+    expectedSha256: null,
     mode: 0o600,
   });
   const stagedSha256 = result.outcome === "written" ? result.sha256 : result.currentSha256;
@@ -622,6 +623,7 @@ export async function runHostCommand(
       });
     startCommand = heldHostCommand(staged);
   }
+  signal.throwIfAborted();
   const terminal = await bb.sdk.terminals.create({
     scope: { kind: "host_path", hostId: machine.id, cwd: null },
     cols: 120,

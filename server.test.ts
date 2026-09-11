@@ -56,7 +56,14 @@ function agentIdFromCommand(command: string): string | null {
 }
 
 function hostFileWriteMock(stagedFiles: Map<string, string>) {
-  return vi.fn(async (args: { path: string; content: string }) => {
+  return vi.fn(async (args: { path: string; content: string; expectedSha256?: string | null }) => {
+    const currentContent = stagedFiles.get(args.path);
+    const currentSha256 = currentContent === undefined
+      ? null
+      : createHash("sha256").update(currentContent).digest("hex");
+    if (args.expectedSha256 !== undefined && args.expectedSha256 !== currentSha256) {
+      return { outcome: "conflict" as const, currentSha256 };
+    }
     stagedFiles.set(args.path, args.content);
     return {
       outcome: "written" as const,
@@ -818,6 +825,57 @@ describe("host command output", () => {
       createParents: true,
     }));
     expect(bb.sdk.hosts.directory).not.toHaveBeenCalled();
+  });
+
+  it("reuses an identical staged script across concurrent runs without rewriting it", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const text = "scan result\n__BB_HOST_COMMAND_DONE__:0\n";
+    const { bb, create, stagedFiles } = stagedRun(text);
+    const storeFile = vi.spyOn(stagedFiles, "set");
+
+    const results = await Promise.all([0, 1].map(() => runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )));
+
+    expect(results).toEqual([text, text]);
+    expect(storeFile).toHaveBeenCalledOnce();
+    expect(stagedFiles.size).toBe(1);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[0]![0].start.command).toBe(create.mock.calls[1]![0].start.command);
+    const writes = await Promise.all(vi.mocked(bb.sdk.files.write).mock.results.map((result) => result.value));
+    expect(writes.map((result) => result.outcome)).toEqual(["written", "conflict"]);
+  });
+
+  it("does not launch a terminal when cancelled during the staging write", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const controller = new AbortController();
+    const reason = new Error("Usage sync cancelled");
+    let finishWrite!: () => void;
+    const write = vi.fn(async () => {
+      await new Promise<void>((resolve) => { finishWrite = resolve; });
+      return { outcome: "written" as const, sha256: createHash("sha256").update(command).digest("hex") };
+    });
+    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    const result = runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      controller.signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    );
+    const rejection = expect(result).rejects.toBe(reason);
+    expect(write).toHaveBeenCalledOnce();
+    controller.abort(reason);
+    finishWrite();
+
+    await rejection;
+    expect(create).not.toHaveBeenCalled();
+    expect(bb.sdk.terminals.close).not.toHaveBeenCalled();
   });
 
   it("resolves the machine home directory for staging when the caller does not provide it", async () => {
