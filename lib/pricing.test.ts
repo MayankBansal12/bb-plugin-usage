@@ -65,6 +65,20 @@ const proxyFixture = {
 };
 
 describe("proxy provider fallback", () => {
+  it.each(["MiniMax-M2.5-highspeed", "minimax-m2.5-highspeed", "MINIMAX-M2.5-HIGHSPEED"])("prefers canonical mixed-case catalog pricing for %s", (model) => {
+    setPricingCatalog({
+      minimax: { models: {
+        "MiniMax-M2.5-highspeed": { id: "MiniMax-M2.5-highspeed", cost: { input: 0.6, output: 2.4, cache_read: 0.06 } },
+      } },
+      llmgateway: { models: {
+        "minimax-m2.5-highspeed": { id: "minimax-m2.5-highspeed", cost: { input: 0.6, output: 2.4, cache_read: 0.03 } },
+      } },
+    }, "test");
+    expect(resolvePricing("cliproxy", model)).toMatchObject({
+      modelProviderId: "minimax", status: "models-dev-alias", price: { input: 0.6, output: 2.4, cached: 0.06 },
+    });
+  });
+
   it("attributes a bare model name to the canonical first-party vendor", () => {
     setPricingCatalog(proxyFixture, "test");
     expect(resolvePricing("cliproxy", "deepseek-flash")).toMatchObject({ modelProviderId: "deepseek", modelProviderName: "DeepSeek", status: "models-dev-alias", price: { input: 0.14, output: 0.28 } });

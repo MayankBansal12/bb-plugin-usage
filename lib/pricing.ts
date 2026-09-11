@@ -86,7 +86,8 @@ function providerName(providerId: string, provider?: CatalogProvider) {
 function matchWithinProvider(providerId: string, provider: CatalogProvider, model: string): PricingResult | null {
   const modelIds = normalizedModelIds(providerId, model);
   for (const modelId of modelIds) {
-    const exact = provider.models[modelId];
+    const exact = provider.models[modelId]
+      ?? Object.values(provider.models).find((candidate) => candidate.id.toLowerCase() === modelId);
     const price = exact?.cost ? toPrice(exact.cost) : null;
     if (price) return { modelProviderId: providerId, modelProviderName: providerName(providerId, provider), price, status: "models-dev-exact" };
   }
