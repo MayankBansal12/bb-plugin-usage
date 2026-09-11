@@ -186,6 +186,32 @@ describe("usage collectors", () => {
     });
   });
 
+  it("parses Devin host aggregates with the Devin agent and provider", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "devin",
+      model: "swe-2-max",
+      project: "project-a",
+      loggedCostUsd: null,
+      uncachedInputTokens: 150,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 30,
+    }]);
+    expect(parseHostUsageAggregates(content, "devin", machine)[0]).toMatchObject({
+      eventKey: "devin:machine-a:2026-08-09:devin:swe-2-max:project-a",
+      agentId: "devin",
+      agentName: "Devin",
+      modelProviderId: "devin",
+      modelProviderName: "Devin",
+      processedTokens: 245,
+      // SWE models are not listed on models.dev, so cost stays unknown rather
+      // than borrowing another vendor's rates.
+      costUsd: 0,
+      pricingStatus: "unknown",
+    });
+  });
+
   it("uses FX-recorded spend without replacing it with API-rate estimates", () => {
     const aggregate = (loggedCostUsd: number | null) => JSON.stringify([{
       day: "2026-08-09",
