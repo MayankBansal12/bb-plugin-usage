@@ -331,18 +331,24 @@ export function UsageDashboardSkeleton() {
           </div>
         </section>
 
-        {/* breakdown: real heading, real toggle, real column headers */}
+        {/* breakdown: real heading, real toggles, real column headers */}
         <section>
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
             <Label className="text-sm font-semibold">Breakdown</Label>
-            <ToggleGroupPreview
-              value="model"
-              options={[
-                { value: "model", label: "Model" },
-                { value: "project", label: "Project" },
-                { value: "day", label: "Day" },
-              ]}
-            />
+            <div className="flex flex-wrap items-center gap-2">
+              <ToggleGroupPreview
+                value="model"
+                options={[
+                  { value: "model", label: "Model" },
+                  { value: "project", label: "Project" },
+                  { value: "day", label: "Day" },
+                ]}
+              />
+              <ToggleGroupPreview
+                value="cost"
+                options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+              />
+            </div>
           </div>
 
           <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>

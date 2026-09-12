@@ -18,7 +18,7 @@ import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWin
 import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
 
 type Range = 7 | 30 | 90;
-type ChartMode = "cost" | "tokens";
+type MetricMode = "cost" | "tokens";
 type BreakdownMode = "model" | "project" | "day";
 type DimensionMode = "agent" | "provider";
 
@@ -192,6 +192,16 @@ function CostValue({ value, className }: { value: number; className?: string }) 
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
+  );
+}
+
+// A row whose priced cost is zero but has unpriced usage shows "Unknown"; a
+// partially priced row gets a "+" marker since its share understates usage.
+function PricedCost({ cost, unknown }: { cost: number; unknown?: boolean }) {
+  return (
+    <span title={unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>
+      {unknown && cost === 0 ? "Unknown" : <><CostValue value={cost} />{unknown ? "+" : ""}</>}
+    </span>
   );
 }
 
@@ -370,7 +380,7 @@ function UsageChart({
   records: UsageRecord[];
   providers: Array<{ id: string; name: string }>;
   range: Range;
-  mode: ChartMode;
+  mode: MetricMode;
   groupBy: DimensionMode;
   compactView?: boolean;
 }) {
@@ -597,14 +607,17 @@ function UsageChart({
   );
 }
 
-function ProviderCostRow({
+function ProviderShareRow({
   item,
+  mode,
   total,
 }: {
-  item: { id: string; name: string; cost: number; tokens: number };
+  item: { id: string; name: string; cost: number; tokens: number; unknown?: boolean };
+  mode: MetricMode;
   total: number;
 }) {
-  const share = total > 0 ? (item.cost / total) * 100 : 0;
+  const value = mode === "cost" ? item.cost : item.tokens;
+  const share = total > 0 ? (value / total) * 100 : 0;
   return (
     <div className="min-w-0">
       <div className="flex items-center justify-between gap-4 text-sm">
@@ -612,19 +625,29 @@ function ProviderCostRow({
           <ProviderLogo id={item.id} name={item.name} size="md" />
           <span className="truncate">{item.name}</span>
         </span>
-        <span className="shrink-0 tabular-nums"><CostValue value={item.cost} /></span>
+        <span className="shrink-0 tabular-nums">
+          {mode === "cost"
+            ? <PricedCost cost={item.cost} unknown={item.unknown} />
+            : <>{compact(item.tokens)}<span className="font-normal text-muted-foreground"> tokens</span></>}
+        </span>
       </div>
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
         <div
           className="h-full rounded-full transition-[width] duration-500 ease-out motion-reduce:transition-none"
           style={{
             width: `${share}%`,
-            minWidth: item.cost > 0 ? 3 : 0,
+            minWidth: value > 0 ? 3 : 0,
             backgroundColor: providerColor(item.id),
           }}
         />
       </div>
-      <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</div>
+      <div className="mt-2 text-xs text-muted-foreground">
+        {mode === "cost"
+          ? <>{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</>
+          : item.unknown && item.cost === 0
+            ? <>{percentage(item.tokens, total)} of tokens · <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">cost unknown</span></>
+            : <>{percentage(item.tokens, total)} of tokens · {money(item.cost)}{item.unknown ? "+" : ""}</>}
+      </div>
     </div>
   );
 }
@@ -648,16 +671,18 @@ function ChartLegend({ providers }: { providers: Array<{ id: string; name: strin
 
 const CARD_CLASSES = "rounded-xl border border-border/70 bg-muted/[0.08]";
 
-// A project row names its highest-cost agent and folds the rest into `+N`,
-// which lists them with their own cost on hover or focus.
+// A project row names its dominant agent by the active metric and folds the
+// rest into `+N`, which lists them with their own value on hover or focus.
 function AgentCell({
   agentId,
   agent,
   others,
+  mode,
 }: {
   agentId: string;
   agent: string;
-  others?: Array<{ id: string; name: string; cost: number }>;
+  others?: Array<{ id: string; name: string; cost: number; tokens: number }>;
+  mode: MetricMode;
 }) {
   return (
     <span className="inline-flex min-w-0 items-center gap-2 text-muted-foreground">
@@ -684,7 +709,7 @@ function AgentCell({
                       <ProviderLogo id={item.id} name={item.name} size="sm" />
                       <span className="truncate">{item.name}</span>
                     </span>
-                    <span className="shrink-0 tabular-nums">{money(item.cost)}</span>
+                    <span className="shrink-0 tabular-nums">{mode === "cost" ? money(item.cost) : `${compact(item.tokens)} tokens`}</span>
                   </div>
                 ))}
               </div>
@@ -943,7 +968,7 @@ function UsageDashboard() {
   const providerLimitsRequestId = useRef(0);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
-  const [chartMode, setChartMode] = useState<ChartMode>("tokens");
+  const [metricMode, setMetricMode] = useState<MetricMode>("tokens");
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
@@ -1093,8 +1118,15 @@ function UsageDashboard() {
     cost: number; tokens: number; unknown?: boolean;
     // Only project rows fold several agents into one badge; the folded ones are
     // listed here so the `+N` suffix can name them on hover.
-    otherAgents?: Array<{ id: string; name: string; cost: number }>;
+    otherAgents?: Array<{ id: string; name: string; cost: number; tokens: number }>;
   };
+  // Rows rank by the active metric, falling back to the other one so a $0
+  // unpriced row still sorts by its token volume (and vice versa).
+  const byMetric = useCallback(
+    (a: { cost: number; tokens: number }, b: { cost: number; tokens: number }) =>
+      metricMode === "cost" ? b.cost - a.cost || b.tokens - a.tokens : b.tokens - a.tokens || b.cost - a.cost,
+    [metricMode],
+  );
   const modelBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
@@ -1105,31 +1137,33 @@ function UsageDashboard() {
       current.tokens += row.processedTokens;
       map.set(key, current);
     }
-    return [...map.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
-  }, [rows]);
+    return [...map.values()].sort(byMetric);
+  }, [rows, byMetric]);
 
   // Projects can be worked on from several agents and providers, so a row keeps
-  // the dominant one by cost for its badge instead of claiming a single owner.
+  // the dominant one by the active metric for its badge instead of claiming a
+  // single owner.
   const projectBreakdown = useMemo(() => {
-    const map = new Map<string, BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> }>();
+    const map = new Map<string, BreakdownRow & { byAgent: Map<string, { name: string; cost: number; tokens: number }> }>();
     for (const row of rows) {
-      const current: BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> } = map.get(row.project) ?? {
+      const current: BreakdownRow & { byAgent: Map<string, { name: string; cost: number; tokens: number }> } = map.get(row.project) ?? {
         key: row.project, label: row.project, agent: row.agentName, agentId: row.agentId,
         provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0,
-        byAgent: new Map<string, { name: string; cost: number }>(),
+        byAgent: new Map<string, { name: string; cost: number; tokens: number }>(),
       };
       current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
-      const agent = current.byAgent.get(row.agentId) ?? { name: row.agentName, cost: 0 };
+      const agent = current.byAgent.get(row.agentId) ?? { name: row.agentName, cost: 0, tokens: 0 };
       agent.cost += row.costUsd;
+      agent.tokens += row.processedTokens;
       current.byAgent.set(row.agentId, agent);
       map.set(row.project, current);
     }
     return [...map.values()].map((item) => {
       const ranked = [...item.byAgent.entries()]
-        .map(([id, value]) => ({ id, name: value.name, cost: value.cost }))
-        .sort((a, b) => b.cost - a.cost);
+        .map(([id, value]) => ({ id, name: value.name, cost: value.cost, tokens: value.tokens }))
+        .sort(byMetric);
       const [dominant, ...others] = ranked;
       return {
         ...item,
@@ -1137,8 +1171,8 @@ function UsageDashboard() {
         agent: dominant?.name ?? item.agent,
         otherAgents: others,
       };
-    }).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
-  }, [rows]);
+    }).sort(byMetric);
+  }, [rows, byMetric]);
 
   const dayBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
@@ -1154,7 +1188,7 @@ function UsageDashboard() {
 
   const days = useMemo(() => rangeDays(range), [range]);
 
-  useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
+  useEffect(() => setBreakdownPage(1), [breakdownMode, metricMode, machine, range]);
 
   useEffect(() => {
     const element = mainRef.current;
@@ -1198,14 +1232,20 @@ function UsageDashboard() {
   const activeModelProviders = data.modelProviders.filter((item) => usedProviderIds.has(item.id));
   const activeProviders = chartGroup === "agent" ? activeAgents : activeModelProviders;
   // A single dimension control (next to the chart) drives both the chart and
-  // the cost rows so the agent/provider tabs never repeat.
-  const costDimension = chartGroup;
-  const costDimensions = costDimension === "agent" ? activeAgents : activeModelProviders;
-  const providerTotals = costDimensions.map((item) => ({
-    ...item,
-    cost: rows.filter((row) => (costDimension === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.costUsd, 0),
-    tokens: rows.filter((row) => (costDimension === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
-  })).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
+  // the share rows so the agent/provider tabs never repeat; the shared
+  // cost/tokens metric sets their sort order and primary value the same way.
+  const shareDimension = chartGroup;
+  const shareDimensions = shareDimension === "agent" ? activeAgents : activeModelProviders;
+  const providerTotals = shareDimensions.map((item) => {
+    const dimensionRows = rows.filter((row) => (shareDimension === "agent" ? row.agentId : row.modelProviderId) === item.id);
+    return {
+      ...item,
+      cost: dimensionRows.reduce((sum, row) => sum + row.costUsd, 0),
+      tokens: dimensionRows.reduce((sum, row) => sum + row.processedTokens, 0),
+      unknown: dimensionRows.some((row) => row.pricingStatus === "unknown"),
+    };
+  }).sort(byMetric);
+  const metricTotal = metricMode === "cost" ? totals.cost : totals.processed;
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
@@ -1331,7 +1371,7 @@ function UsageDashboard() {
                 {!stackedView && (
                   <div className="mt-7 min-h-0 flex-1 space-y-6 overflow-y-auto pr-3">
                     {providerTotals.map((item) => (
-                      <ProviderCostRow key={item.id} item={item} total={totals.cost} />
+                      <ProviderShareRow key={item.id} item={item} mode={metricMode} total={metricTotal} />
                     ))}
                   </div>
                 )}
@@ -1339,16 +1379,16 @@ function UsageDashboard() {
                 {stackedView && (
                   <div className="mt-5 min-w-0 border-t border-border/60 pt-4">
                     <div className="flex flex-wrap items-center gap-x-2 gap-y-2">
-                      <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                      <h2 className="mr-auto text-sm font-semibold">Daily {metricMode === "cost" ? "cost" : "tokens"}</h2>
                       <ToggleGroup
-                        value={chartMode}
-                        onChange={setChartMode}
+                        value={metricMode}
+                        onChange={setMetricMode}
                         label="Chart value"
                         options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
                       />
                     </div>
                     <div className="mt-3">
-                      <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} groupBy={chartGroup} compactView={compactView} />
+                      <UsageChart records={rows} providers={activeProviders} range={range} mode={metricMode} groupBy={chartGroup} compactView={compactView} />
                     </div>
                     <div className="mt-2">
                       <ChartLegend providers={activeProviders} />
@@ -1361,7 +1401,7 @@ function UsageDashboard() {
               {!stackedView && (
                 <div className="flex min-w-0 flex-col">
                   <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-                    <h2 className="mr-auto text-sm font-semibold">Daily {chartMode === "cost" ? "cost" : "tokens"}</h2>
+                    <h2 className="mr-auto text-sm font-semibold">Daily {metricMode === "cost" ? "cost" : "tokens"}</h2>
                     <div className="flex flex-wrap items-center gap-2">
                       <ToggleGroup
                         value={chartGroup}
@@ -1370,15 +1410,15 @@ function UsageDashboard() {
                         options={[{ value: "agent", label: "Agents" }, { value: "provider", label: "Providers" }]}
                       />
                       <ToggleGroup
-                        value={chartMode}
-                        onChange={setChartMode}
+                        value={metricMode}
+                        onChange={setMetricMode}
                         label="Chart value"
                         options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
                       />
                     </div>
                   </div>
                   <div className="mt-4">
-                    <UsageChart records={rows} providers={activeProviders} range={range} mode={chartMode} groupBy={chartGroup} />
+                    <UsageChart records={rows} providers={activeProviders} range={range} mode={metricMode} groupBy={chartGroup} />
                   </div>
                   <div className="mt-2">
                     <ChartLegend providers={activeProviders} />
@@ -1392,7 +1432,7 @@ function UsageDashboard() {
                   <div className={`overflow-hidden ${CARD_CLASSES}`}>
                     {providerTotals.map((item) => (
                       <div key={item.id} className="border-t border-border/60 px-4 py-3.5 first:border-t-0">
-                        <ProviderCostRow item={item} total={totals.cost} />
+                        <ProviderShareRow item={item} mode={metricMode} total={metricTotal} />
                       </div>
                     ))}
                   </div>
@@ -1419,14 +1459,22 @@ function UsageDashboard() {
 
             {(!stackedView || mobileSection === "breakdown") && (
             <section>
-              <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
                 <h2 className="text-sm font-semibold">Breakdown</h2>
-                <ToggleGroup
-                  value={breakdownMode}
-                  onChange={setBreakdownMode}
-                  label="Breakdown grouping"
-                  options={[{ value: "model", label: "Model" }, { value: "project", label: "Project" }, { value: "day", label: "Day" }]}
-                />
+                <div className="flex flex-wrap items-center gap-2">
+                  <ToggleGroup
+                    value={breakdownMode}
+                    onChange={setBreakdownMode}
+                    label="Breakdown grouping"
+                    options={[{ value: "model", label: "Model" }, { value: "project", label: "Project" }, { value: "day", label: "Day" }]}
+                  />
+                  <ToggleGroup
+                    value={metricMode}
+                    onChange={setMetricMode}
+                    label="Breakdown value"
+                    options={[{ value: "cost", label: "Cost" }, { value: "tokens", label: "Tokens" }]}
+                  />
+                </div>
               </div>
 
               {compactView ? (
@@ -1440,7 +1488,11 @@ function UsageDashboard() {
                           )}
                           <span className="truncate">{row.label}</span>
                         </span>
-                        <span className="shrink-0 text-sm font-medium tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></span>
+                        <span className="shrink-0 text-sm font-medium tabular-nums">
+                          {metricMode === "cost"
+                            ? <PricedCost cost={row.cost} unknown={row.unknown} />
+                            : <>{compact(row.tokens)}<span className="font-normal text-muted-foreground"> tokens</span></>}
+                        </span>
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
                         {breakdownMode !== "day" && (
@@ -1450,7 +1502,7 @@ function UsageDashboard() {
                             {row.otherAgents && row.otherAgents.length > 0 && (
                               <span
                                 className="shrink-0 tabular-nums text-foreground/70"
-                                title={row.otherAgents.map((item) => `${item.name} ${money(item.cost)}`).join(" · ")}
+                                title={row.otherAgents.map((item) => `${item.name} ${metricMode === "cost" ? money(item.cost) : `${compact(item.tokens)} tokens`}`).join(" · ")}
                               >
                                 +{row.otherAgents.length}
                               </span>
@@ -1458,10 +1510,22 @@ function UsageDashboard() {
                           </RowBadge>
                         )}
                         <RowBadge>
-                          <span className="tabular-nums text-foreground/80">{compact(row.tokens)}</span>
-                          <span>tokens</span>
+                          {metricMode === "cost" ? (
+                            <>
+                              <span className="tabular-nums text-foreground/80">{compact(row.tokens)}</span>
+                              <span>tokens</span>
+                            </>
+                          ) : row.unknown && row.cost === 0 ? (
+                            <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">Unknown cost</span>
+                          ) : (
+                            <span className="tabular-nums text-foreground/80">{money(row.cost)}{row.unknown ? "+" : ""}</span>
+                          )}
                         </RowBadge>
-                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`}</span>
+                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">
+                          {metricMode === "cost"
+                            ? row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`
+                            : percentage(row.tokens, totals.processed)}
+                        </span>
                       </div>
                     </div>
                   ))}
@@ -1477,9 +1541,9 @@ function UsageDashboard() {
                         {breakdownMode !== "day" && (
                           <th className="px-4 py-2.5 text-left font-medium">Agent</th>
                         )}
-                        <th className="px-4 py-2.5 text-right font-medium">Cost</th>
+                        <th className="px-4 py-2.5 text-right font-medium">{metricMode === "cost" ? "Cost" : "Tokens"}</th>
                         <th className="px-4 py-2.5 text-right font-medium">Share</th>
-                        <th className="px-4 py-2.5 text-right font-medium">Tokens</th>
+                        <th className="px-4 py-2.5 text-right font-medium">{metricMode === "cost" ? "Tokens" : "Cost"}</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1497,12 +1561,20 @@ function UsageDashboard() {
                           </td>
                           {breakdownMode !== "day" && (
                             <td className="px-4 py-3">
-                              <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} />
+                              <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={metricMode} />
                             </td>
                           )}
-                          <td className="px-4 py-3 text-right tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></td>
-                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`}</td>
-                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums">
+                            {metricMode === "cost" ? <PricedCost cost={row.cost} unknown={row.unknown} /> : compact(row.tokens)}
+                          </td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">
+                            {metricMode === "cost"
+                              ? row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`
+                              : percentage(row.tokens, totals.processed)}
+                          </td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">
+                            {metricMode === "cost" ? compact(row.tokens) : <PricedCost cost={row.cost} unknown={row.unknown} />}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
