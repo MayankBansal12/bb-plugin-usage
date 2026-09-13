@@ -76,7 +76,13 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string; extraUsageRoots?: string };
+type CollectorSettings = {
+  codexHomes?: string;
+  piSessionRoots: string;
+  primeSessionRoots: string;
+  codexProfileHomes?: string;
+  extraUsageRoots?: string;
+};
 
 const AGENTS = [
   { id: "amp", name: "Amp" },
@@ -338,6 +344,25 @@ function primeRoots(home: string, configured: string) {
   }))];
 }
 
+// Entries are `name=path` or a bare CODEX_HOME path whose basename becomes the
+// account label; a home literally named "codex" stays untagged so a relocated
+// primary home merges into the base Codex agent. A `=` only separates a label
+// when the prefix is pathless, so a bare path containing "=" still parses.
+function codexAccountHomes(value: string, home: string): Array<{ account: string; home: string }> {
+  const seen = new Set<string>();
+  const homes: Array<{ account: string; home: string }> = [];
+  for (const part of value.split(/[;\n]/)) {
+    const separator = part.indexOf("=");
+    const named = separator > 0 && !part.slice(0, separator).includes("/");
+    const resolved = normalizeRoot(expandHome(named ? part.slice(separator + 1) : part, home));
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+    const account = (named ? part.slice(0, separator).trim() : resolved.slice(resolved.lastIndexOf("/") + 1)).slice(0, 80);
+    homes.push({ account: account === "codex" ? "" : account, home: resolved });
+  }
+  return homes;
+}
+
 function countForMachine(db: Database, machineId: string, agentId: AgentId) {
   return (db.prepare(`SELECT COUNT(DISTINCT es.event_key) AS count FROM usage_event_sources es
     JOIN usage_sources s ON s.source_id=es.source_id WHERE s.machine_id=? AND s.provider_id=?`)
@@ -590,15 +615,21 @@ async function syncJsonAgent(
   try {
     const roots = [...new Set(jsonAgentRoots(home, agentId, settings))];
     const cachePath = `${home}/.cache/bb-plugin-usage/json-log-scan-v1/${agentId}.json`;
+    // Extra Codex accounts keep CODEX_HOME in per-account homes: the
+    // ~/.codex-profiles/<name> and ~/.codex-<name> conventions plus any
+    // configured homes. The scan tags their rows with the account name so
+    // each account stays a distinct agent.
+    const accountRoots = agentId === "codex"
+      ? [{ root: `${home}/.codex-profiles` }, { root: home, prefix: ".codex-" }]
+      : undefined;
+    const accountHomes = agentId === "codex" ? codexAccountHomes(settings.codexProfileHomes ?? "", home) : undefined;
     const output = await runHostCommand(bb, machine, jsonAgentCommand({
       agentId,
       roots,
       cachePath,
       sinceDay: historyStartDay(),
-      // Extra Codex accounts (BB account-limits ACP providers) keep their
-      // CODEX_HOME under ~/.codex-profiles/<name>; the scan tags their rows
-      // with the profile name so each account stays a distinct agent.
-      accountRoot: agentId === "codex" ? `${home}/.codex-profiles` : undefined,
+      accountRoots,
+      accountHomes,
     }), signal, {
       title: `Usage: ${agentId} scan`,
       timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
@@ -1172,6 +1203,12 @@ export default async function plugin(bb: BbPluginApi) {
       label: "Extra usage log roots",
       description: 'JSON object of agent IDs to arrays of absolute or ~/ log paths, e.g. {"codebuddy":["~/custom-buddy/projects"],"cursor":["~/custom-cursor/usage.jsonl"]}. Defaults are always scanned; paths resolve on each enrolled machine.',
       default: "{}",
+    },
+    codexProfileHomes: {
+      type: "string",
+      label: "Extra Codex profile homes",
+      description: "Optional semicolon-separated CODEX_HOME directories for extra Codex accounts, as name=path or bare paths (the basename becomes the account label). ~/.codex, ~/.codex-profiles/*, and ~/.codex-* are always scanned.",
+      default: "",
     },
   });
   const db = bb.storage.database();
