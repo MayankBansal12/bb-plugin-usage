@@ -14,7 +14,7 @@ import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
-import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWindow } from "@/lib/provider-limits";
+import { clampPercent, formatLimitReset, formatLimitValue, isLimitVisibleOnMachine, type UnifiedProviderLimit } from "@/lib/provider-limits";
 import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
 
 type Range = 7 | 30 | 90;
@@ -92,26 +92,7 @@ type UsageRecord = {
   outputTokens: number;
 };
 
-type ProviderLimitData = Array<{
-  id: string;
-  providerId: string;
-  providerName: string;
-  accountEmail: string | null;
-  planLabel: string | null;
-  windows: ProviderLimitWindow[];
-  status: "ok" | "error";
-  error: string | null;
-  lastUpdatedAt: string | null;
-  machines: Array<{
-    machineId: string;
-    machineName: string;
-    agents: Array<{ id: string; name: string }>;
-    windows: ProviderLimitWindow[];
-    status: "ok" | "error";
-    error: string | null;
-    lastUpdatedAt: string | null;
-  }>;
-}>;
+type ProviderLimitData = UnifiedProviderLimit[];
 
 type DashboardData = {
   mode: "live";
@@ -728,12 +709,12 @@ function ProviderLimits({
         <span className="text-xs text-muted-foreground">Current plan windows</span>
       </div>
       {error && (
-        <p className="mt-2 text-xs text-destructive" role="alert">Couldn’t refresh usage limits: {error}</p>
+        <p className="mt-2 text-xs text-destructive" role="alert">{error}</p>
       )}
       {loading && limits.length === 0 ? (
         <ProviderLimitsSkeleton columns={availableColumns} />
       ) : limits.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
+        <p className="mt-2 text-xs text-muted-foreground">No usage limits are available from connected machines or Account Pooler.</p>
       ) : (
         <div
           className="mt-4 grid gap-3"
@@ -751,6 +732,17 @@ function ProviderLimits({
                 </span>
                 {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
               </div>
+              {(limit.poolAccount || limit.accountEmail) && (
+                <p className="mt-1 truncate text-[11px] text-muted-foreground" title={limit.poolAccount?.label ?? limit.accountEmail ?? undefined}>
+                  {limit.poolAccount?.label ?? limit.accountEmail}
+                </p>
+              )}
+              {limit.poolAccount && (
+                <p className="mt-1 text-[10px] text-muted-foreground">
+                  Account Pooler · Shared across machines
+                  {limit.poolAccount.status !== "ready" && ` · ${limit.poolAccount.status === "exhausted" ? "Limit reached" : limit.poolAccount.status.charAt(0).toUpperCase() + limit.poolAccount.status.slice(1)}`}
+                </p>
+              )}
               {showMachineTags ? (
                 <div className="mt-1.5 flex flex-wrap gap-1">
                   {limit.machines.map((machine) => (
@@ -810,6 +802,9 @@ function ProviderLimits({
                     );
                   })}
                 </div>
+              )}
+              {limit.windows.length === 0 && limit.poolAccount && !limit.error && (
+                <p className="mt-2 text-[10px] leading-4 text-muted-foreground">{limit.poolAccount.emptyMessage}</p>
               )}
             </div>
           ))}
@@ -973,10 +968,11 @@ function UsageDashboard() {
     try {
       const nextLimits = await rpc.call("providerLimits");
       if (providerLimitsRequestId.current !== requestId) return;
-      setProviderLimits(nextLimits);
+      setProviderLimits(nextLimits.limits);
+      setProviderLimitsError(nextLimits.accountPoolError);
     } catch (reason) {
       if (providerLimitsRequestId.current !== requestId) return;
-      setProviderLimitsError(reason instanceof Error ? reason.message : String(reason));
+      setProviderLimitsError(`Couldn’t refresh usage limits: ${reason instanceof Error ? reason.message : String(reason)}`);
     } finally {
       if (providerLimitsRequestId.current === requestId) setProviderLimitsLoading(false);
     }
@@ -1229,9 +1225,7 @@ function UsageDashboard() {
     : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
-  const visibleProviderLimits = providerLimits.filter((limit) =>
-    machine === "all" || limit.machines.some((item) => item.machineId === machine)
-  );
+  const visibleProviderLimits = providerLimits.filter((limit) => isLimitVisibleOnMachine(limit, machine));
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day`, values: dailySeries.processed, color: FALLBACK_PROVIDER_COLORS[0] },

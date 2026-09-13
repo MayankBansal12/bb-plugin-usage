@@ -25,6 +25,12 @@ export type ProviderLimitSource = {
 };
 
 export type UnifiedProviderLimit = {
+  poolAccount?: {
+    id: string;
+    label: string;
+    status: string;
+    emptyMessage: string;
+  };
   id: string;
   providerId: string;
   providerName: string;
@@ -44,6 +50,11 @@ export type UnifiedProviderLimit = {
     lastUpdatedAt: string | null;
   }>;
 };
+
+export function isLimitVisibleOnMachine(limit: UnifiedProviderLimit, machineId: string) {
+  return machineId === "all" || Boolean(limit.poolAccount)
+    || limit.machines.some((machine) => machine.machineId === machineId);
+}
 
 function normalizedIdentity(value: string | null) {
   return value?.trim().toLocaleLowerCase() || null;
