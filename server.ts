@@ -344,7 +344,7 @@ function upsertState(db: Database, machineId: string, agentId: AgentId, status: 
     .run(machineId, agentId, status, now, successful ? now : null, recordCount, error);
 }
 
-function upsertSourceEvents(db: Database, source: { id: string; rootReference: string; sha256: string; generation: string }, machine: Machine, agentId: AgentId, records: UsageRecord[]) {
+function upsertSourceEvents(db: Database, source: { id: string; rootReference: string; sha256: string; generation: string }, machine: Machine, agentId: AgentId, records: UsageRecord[], complete = true) {
   const insertEvent = db.prepare(`INSERT INTO usage_events (
       event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,
       processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens,
@@ -352,14 +352,23 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
     provider_name=excluded.provider_name, model=excluded.model, project=excluded.project,
-    cost_usd=MAX(cost_usd, excluded.cost_usd),
-    cache_savings_usd=MAX(cache_savings_usd, excluded.cache_savings_usd),
+    -- Monotonic for estimates (catalog-derived) so a partial scan can never
+    -- lower a previously recorded total; logged costs and savings always take
+    -- the newest value so price corrections still flow through.
+    cost_usd=CASE WHEN pricing_status IN ('models-dev-exact','models-dev-alias') THEN MAX(cost_usd, excluded.cost_usd) ELSE excluded.cost_usd END,
+    cache_savings_usd=CASE WHEN pricing_status IN ('models-dev-exact','models-dev-alias') THEN MAX(cache_savings_usd, excluded.cache_savings_usd) ELSE excluded.cache_savings_usd END,
+    -- Token buckets take the component-wise maximum: every component is
+    -- individually monotonic, so each column stays consistent with the others
+    -- and no bucket can exceed processed_tokens.
     processed_tokens=MAX(processed_tokens, excluded.processed_tokens),
     cached_input_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens),
     cache_write_tokens=MAX(cache_write_tokens, excluded.cache_write_tokens),
     uncached_input_tokens=MAX(uncached_input_tokens, excluded.uncached_input_tokens),
     output_tokens=MAX(output_tokens, excluded.output_tokens),
-    logged_cost_usd=MAX(COALESCE(logged_cost_usd, excluded.logged_cost_usd), COALESCE(excluded.logged_cost_usd, logged_cost_usd)),
+    -- Logged costs are authoritative vendor figures: always take the newest,
+    -- so price corrections (up or down) flow through instead of freezing at
+    -- the first observed value.
+    logged_cost_usd=excluded.logged_cost_usd,
     model_provider_id=excluded.model_provider_id, model_provider_name=excluded.model_provider_name,
     pricing_status=excluded.pricing_status`);
   const insertMapping = db.prepare("INSERT OR IGNORE INTO usage_event_sources (event_key, source_id) VALUES (?, ?)");
@@ -370,7 +379,13 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       machine_name=excluded.machine_name, root_reference=excluded.root_reference, content_sha=excluded.content_sha,
       last_seen_generation=excluded.last_seen_generation, last_success_at=excluded.last_success_at, pricing_version=excluded.pricing_version`)
       .run(source.id, machine.id, machine.name, agentId, source.rootReference, source.sha256, source.generation, new Date().toISOString(), pricingRevision());
-    db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
+    // Only clear stale mappings when we actually have records to remap.
+    // With zero records (e.g. session files pruned between scans) the old
+    // mappings must survive so the monotonic high-water-mark events aren't
+    // orphaned and deleted by the prune below.
+    if (records.length > 0) {
+      db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
+    }
     for (const row of records) {
       insertEvent.run(
         row.eventKey, row.timestamp, row.day, row.agentId, row.agentName, row.model, row.costUsd, row.cacheSavingsUsd,
@@ -379,8 +394,15 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       );
       insertMapping.run(row.eventKey, source.id);
     }
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    // Never prune on a partial scan: an incomplete file set must not delete
+    // events that a complete scan had recorded. Stale keys are removed by the
+    // next successful full scan instead.
+    if (complete && records.length > 0) deleteOrphanEvents(db);
   })();
+}
+
+function deleteOrphanEvents(db: Database) {
+  db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
 }
 
 function reconcileSources(db: Database, machineId: string, agentId: AgentId, generation: string) {
@@ -391,7 +413,7 @@ function reconcileSources(db: Database, machineId: string, agentId: AgentId, gen
       db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
       db.prepare("DELETE FROM usage_sources WHERE source_id=?").run(source.id);
     }
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    deleteOrphanEvents(db);
   })();
 }
 
@@ -406,7 +428,7 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     db.prepare(`DELETE FROM grok_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    deleteOrphanEvents(db);
   })();
 }
 
@@ -482,7 +504,7 @@ async function syncJsonAgent(
       rootReference: opaqueId(...roots),
       sha256: createHash("sha256").update(aggregateJson).digest("hex"),
       generation,
-    }, machine, agentId, records);
+    }, machine, agentId, records, scan.failureCount === 0);
     reconcileSources(db, machine.id, agentId, generation);
 
     const complete = scan.failureCount === 0;

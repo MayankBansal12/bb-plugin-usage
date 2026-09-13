@@ -2,7 +2,7 @@ import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./ser
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 
 vi.mock("@bb/plugin-sdk", () => ({
@@ -13,6 +13,7 @@ import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
   openCodeCommand, openCodeSql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
+import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -1573,3 +1574,170 @@ describe("Account Pooler limits RPC integration", () => {
     }
   });
 });
+
+describe("monotonic token/cost aggregation through the real sync path", () => {
+  // The host collector only emits rows for days within its sinceDay window
+  // (HISTORY_DAYS back from today), so the fixture day must be recent.
+  const DAY = new Date().toISOString().slice(0, 10);
+
+  function piRow(overrides: Record<string, unknown> = {}) {
+    return { day: DAY, modelProviderId: "openai", model: "gpt-test", project: "proj", loggedCostUsd: null, ...overrides };
+  }
+
+  function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number) {
+    const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows };
+    const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
+    return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+  }
+
+  // Drives the unmodified plugin factory end-to-end through its public sync()
+  // RPC (like the Antigravity regression test above); the mutable `state`
+  // object lets each subsequent sync serve a different pi scan.
+  async function bootPiHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number }) {
+    const db = new Database(":memory:");
+    let handlers: { sync: () => Promise<unknown> } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => Promise<unknown> };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write: hostFileWriteMock(stagedFiles) },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === "pi"
+              ? fakeHostScanOutputWith("pi", state.rows, state.failureCount)
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+    // Wait for the initial sync to land rows, then let the rest of the pass
+    // finish so a subsequent sync runs as its own fresh coordinator pass.
+    await vi.waitFor(() => {
+      expect((db.prepare("SELECT COUNT(*) c FROM usage_events WHERE provider_id='pi'").get() as { c: number }).c).toBeGreaterThan(0);
+    }, { timeout: 10_000 });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return { db, syncAgain: () => handlers!.sync() };
+  }
+
+  // A sync RPC call only kicks off one coordinator pass; poll until the DB
+  // reflects it or the budget runs out.
+  async function waitForSync(db: Database, predicate: () => boolean, timeoutMs = 10_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (predicate()) return;
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    expect(predicate(), "condition was not met within the sync wait budget").toBe(true);
+  }
+
+  afterEach(() => resetPricingCatalog());
+
+  it("keeps previously recorded totals when a later full scan sees fewer tokens or drops the record entirely", async () => {
+    setPricingCatalog({}, "rev-no-prices"); // no catalog prices -> pricing_status 'unknown', zero cost
+    const state = { rows: [piRow({ uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500 })], failureCount: 0 };
+    const { db, syncAgain } = await bootPiHarness(state);
+    const row = () => db.prepare("SELECT processed_tokens t, event_key k FROM usage_events WHERE provider_id='pi'").get() as { t: number; k: string };
+    const gen = () => (db.prepare("SELECT last_seen_generation g FROM usage_sources WHERE provider_id='pi'").get() as { g: string }).g;
+    expect(row().t).toBe(1500);
+
+    // Later full scan reports lower totals for the same bucket: stored maximum must hold.
+    const genBefore1 = gen();
+    state.rows = [piRow({ uncachedInputTokens: 300, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 100 })];
+    await syncAgain();
+    await vi.waitFor(() => expect(gen()).not.toBe(genBefore1), { timeout: 10_000 });
+    expect(row().t).toBe(1500);
+
+    // Later full scan loses the record entirely (file pruned): the event must survive.
+    const genBefore2 = gen();
+    state.rows = [];
+    await syncAgain();
+    await vi.waitFor(() => expect(gen()).not.toBe(genBefore2), { timeout: 10_000 });
+    expect(row().t).toBe(1500);
+
+    // A partial scan (failureCount > 0) must never prune either, even with an empty result.
+    const genBefore3 = gen();
+    state.rows = [piRow({ uncachedInputTokens: 1, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 0 })];
+    await syncAgain();
+    await vi.waitFor(() => expect(gen()).not.toBe(genBefore3), { timeout: 10_000 });
+    expect(row().t).toBe(1500);
+    const genBefore4 = gen();
+    state.rows = [];
+    state.failureCount = 1;
+    await syncAgain();
+    await vi.waitFor(() => expect(gen()).not.toBe(genBefore4), { timeout: 10_000 });
+    expect(row().t).toBe(1500);
+    db.close();
+  }, 30_000);
+
+  it("lets logged-cost corrections flow through instead of freezing at the first value", async () => {
+    setPricingCatalog({}, "rev-no-prices");
+    const state = { rows: [piRow({ loggedCostUsd: 2.0, uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500 })], failureCount: 0 };
+    const { db, syncAgain } = await bootPiHarness(state);
+    const row = () => db.prepare("SELECT cost_usd c, logged_cost_usd l, pricing_status s FROM usage_events WHERE provider_id='pi'").get() as { c: number; l: number; s: string };
+    expect(row()).toMatchObject({ c: 2.0, l: 2.0, s: "logged" });
+
+    // Vendor corrects the logged price downward: the correction must land.
+    state.rows = [piRow({ loggedCostUsd: 1.0, uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500 })];
+    await syncAgain();
+    await waitForSync(db, () => (row() as { c: number }).c <= 1.0);
+    expect(row()).toMatchObject({ c: 1.0, l: 1.0, s: "logged" });
+    db.close();
+  }, 30_000);
+
+  it("reprices estimated costs when the catalog changes but never below the previous estimate", async () => {
+    setPricingCatalog({ openai: { id: "openai", name: "OpenAI", models: { "gpt-test": { id: "gpt-test", cost: { input: 1_000_000, cached: 0, cacheWrite: 0, output: 1_000_000 } } } } }, "rev-v1");
+    const state = { rows: [piRow({ uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500 })], failureCount: 0 };
+    const { db, syncAgain } = await bootPiHarness(state);
+    const row = () => db.prepare("SELECT cost_usd c, pricing_status s FROM usage_events WHERE provider_id='pi'").get() as { c: number; s: string };
+    expect(row()).toMatchObject({ c: 1500, s: "models-dev-exact" });
+
+    // Catalog revision raises the price: the new estimate applies.
+    setPricingCatalog({ openai: { id: "openai", name: "OpenAI", models: { "gpt-test": { id: "gpt-test", cost: { input: 2_000_000, cached: 0, cacheWrite: 0, output: 2_000_000 } } } } }, "rev-v2");
+    await syncAgain();
+    await waitForSync(db, () => (row() as { c: number }).c >= 3000);
+    expect(row()).toMatchObject({ c: 3000, s: "models-dev-exact" });
+
+    // Catalog revision lowers the price: the stored estimate stays at the high-water mark.
+    const genBeforeLower = (db.prepare("SELECT last_seen_generation g FROM usage_sources WHERE provider_id='pi'").get() as { g: string }).g;
+    setPricingCatalog({ openai: { id: "openai", name: "OpenAI", models: { "gpt-test": { id: "gpt-test", cost: { input: 500_000, cached: 0, cacheWrite: 0, output: 500_000 } } } } }, "rev-v3");
+    await syncAgain();
+    await vi.waitFor(() => {
+      const g = (db.prepare("SELECT last_seen_generation g FROM usage_sources WHERE provider_id='pi'").get() as { g: string }).g;
+      expect(g).not.toBe(genBeforeLower);
+    }, { timeout: 10_000 });
+    expect(row()).toMatchObject({ c: 3000, s: "models-dev-exact" });
+    db.close();
+  }, 30_000);
+});
+
+
