@@ -13,7 +13,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
 - Show Grok Build, OpenCode Go, Claude Code, Cursor, and Codex plan windows in the usage-limits section. The same subscription on several machines is one card with machine tags; different accounts stay separate cards in a horizontal grid.
-- Show every Claude and Codex account from BB’s Account Pooler with its account label, reported limit windows, and pool status. Pooled accounts stay visible under every machine filter because the pool is shared. Matching local subscriptions are combined when the account email identifies one pool account; disabled accounts and accounts without reported limits remain visible.
+- Show every Claude and Codex account from BB’s Account Pooler with its account label, reported limit windows, and pool status. Pooled accounts stay visible under every machine filter because the pool is shared. Matching local subscriptions are combined when the account email identifies one pool account; windows from either source are kept, preferring the newer reset cycle and the higher usage within a cycle. Disabled accounts and accounts without reported limits remain visible.
 - Resolve model prices from [models.dev](https://models.dev), refreshed daily at runtime with the bundled snapshot as fallback, without inventing prices for ambiguous models.
 - Sync automatically every 15 minutes or manually from the dashboard.
 

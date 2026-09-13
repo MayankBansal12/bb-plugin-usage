@@ -79,7 +79,7 @@ function combinedError(sources: ProviderLimitSource[]) {
   return errors.length > 0 ? errors.join("; ") : null;
 }
 
-export function mergeLimitWindows(sources: ProviderLimitSource[]) {
+export function mergeLimitWindows(sources: ReadonlyArray<Pick<ProviderLimitSource, "windows">>) {
   const order: string[] = [];
   const windows = new Map<string, ProviderLimitWindow>();
   for (const source of sources) {
@@ -151,6 +151,14 @@ export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProv
     };
   }).sort((left, right) => left.providerName.localeCompare(right.providerName)
     || (left.accountEmail ?? left.planLabel ?? "").localeCompare(right.accountEmail ?? right.planLabel ?? ""));
+}
+
+export function maskEmailAddresses(value: string) {
+  return value.replace(/([^\s@<>()",;:]+)@([^\s@<>()",;:]+)/g, (_email, local: string, domain: string) => {
+    const first = local.length > 1 ? local[0] : "";
+    const last = local.length > 2 ? local.at(-1) : "";
+    return `${first}***${last}@${domain}`;
+  });
 }
 
 export function clampPercent(value: number) {

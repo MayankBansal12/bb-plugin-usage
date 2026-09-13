@@ -1511,7 +1511,7 @@ describe("Grok limit snapshots", () => {
 
 
 describe("Account Pooler limits RPC integration", () => {
-  it("returns pooled accounts without connected machines and preserves local limits on pool failures", async () => {
+  it.each(["local@example.com", "pool@example.com"])("preserves local limits for %s on pool failures and missing observations", async (localEmail) => {
     const db = new Database(":memory:");
     let read: (() => Promise<unknown>) | undefined;
     const poolAccounts = [{
@@ -1536,8 +1536,8 @@ describe("Account Pooler limits RPC integration", () => {
           list: vi.fn().mockResolvedValue({ plugins: [{ id: "account-pool", enabled: true }] }), callRpc,
         },
         system: { usageLimits: vi.fn().mockResolvedValue({ codex: {
-          status: "ok", accountEmail: "local@example.com", planLabel: "Pro",
-          windows: [{ label: "5 hours", usedPercent: 25, resetsAt: null }],
+          status: "ok", accountEmail: localEmail, planLabel: "Pro",
+          windows: [{ label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" }],
         } }) },
       },
       background: { service: vi.fn() },
@@ -1556,9 +1556,18 @@ describe("Account Pooler limits RPC integration", () => {
       callRpc.mockRejectedValue(new Error("Pool temporarily unavailable"));
       const next = rpcContract.providerLimits.output.parse(await read!());
       expect(next.accountPoolError).toContain("last reported");
-      expect(next.limits).toHaveLength(2);
-      expect(next.limits.some((limit) => limit.accountEmail === "local@example.com")).toBe(true);
+      expect(next.limits).toHaveLength(localEmail === "pool@example.com" ? 1 : 2);
+      expect(next.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
+        { label: localEmail === "pool@example.com" ? "Weekly" : "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
+      ]);
       expect(next.limits.some((limit) => limit.poolAccount?.id === "pool-account")).toBe(true);
+
+      callRpc.mockResolvedValue([{ ...poolAccounts[0], observedAt: null, limitWindows: [] }]);
+      const unobserved = rpcContract.providerLimits.output.parse(await read!());
+      expect(unobserved.accountPoolError).toBeNull();
+      expect(unobserved.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
+        { label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
+      ]);
     } finally {
       db.close();
     }

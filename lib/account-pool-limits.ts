@@ -1,6 +1,6 @@
 import type { BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
-import type { ProviderLimitWindow, UnifiedProviderLimit } from "./provider-limits";
+import { mergeLimitWindows, type ProviderLimitWindow, type UnifiedProviderLimit } from "./provider-limits";
 
 const quotaSchema = z.object({
   utilization: z.number().nullable(),
@@ -98,6 +98,17 @@ function emailKey(limit: UnifiedProviderLimit) {
   return email ? `${limit.providerId}:${email}` : null;
 }
 
+function localWindowsForPool(local: UnifiedProviderLimit, pool: UnifiedProviderLimit) {
+  // BB's local provider bridges use these labels for the same quota windows.
+  const aliases: Record<string, string> = { "weekly limit": "Weekly", "current session": "5 hours" };
+  return local.windows.map((window) => {
+    const label = aliases[window.label.trim().toLowerCase()];
+    return label && pool.windows.some((candidate) => candidate.label === label)
+      ? { ...window, label }
+      : window;
+  });
+}
+
 export function mergeAccountPoolLimits(local: UnifiedProviderLimit[], pooled: UnifiedProviderLimit[]) {
   const merged = new Set<string>();
   const limits = pooled.map((pool) => {
@@ -106,7 +117,14 @@ export function mergeAccountPoolLimits(local: UnifiedProviderLimit[], pooled: Un
     const match = local.find((candidate) => emailKey(candidate) === key);
     if (!match) return pool;
     merged.add(match.id);
-    return { ...pool, planLabel: pool.planLabel ?? match.planLabel, machines: match.machines };
+    return {
+      ...pool,
+      // A pool summary may be partial or cached. Preserve both sources using
+      // the same reset-cycle rules as subscriptions shared across machines.
+      windows: mergeLimitWindows([pool, { windows: localWindowsForPool(match, pool) }]),
+      planLabel: pool.planLabel ?? match.planLabel,
+      machines: match.machines,
+    };
   });
   return [...local.filter((limit) => !merged.has(limit.id)), ...limits];
 }

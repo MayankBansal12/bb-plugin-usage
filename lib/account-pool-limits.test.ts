@@ -105,6 +105,63 @@ describe("Account Pooler limits", () => {
     expect(isLimitVisibleOnMachine(localLimits()[0]!, "different-machine")).toBe(false);
   });
 
+  it.each([
+    { name: "unobserved", overrides: { observedAt: null }, status: "ready" },
+    { name: "disabled", overrides: { enabled: false }, status: "disabled" },
+    { name: "errored", overrides: { status: "error", error: "Refresh failed" }, status: "error" },
+  ])("preserves local quotas for a matching $name pool account", ({ overrides, status }) => {
+    const local = localLimits();
+    const limits = mergeAccountPoolLimits(local, accountPoolLimits([account(overrides)]));
+    expect(limits).toHaveLength(1);
+    expect(limits[0]).toMatchObject({
+      windows: local[0]!.windows,
+      machines: local[0]!.machines,
+      poolAccount: { label: "Personal", status },
+    });
+  });
+
+  it("merges the window labels returned by BB's local provider bridges", () => {
+    const local = localLimits();
+    local[0]!.windows = [
+      { label: "Current session", usedPercent: 25, resetsAt: new Date(resetAt).toISOString() },
+      { label: "Weekly limit", usedPercent: 80, resetsAt: new Date(resetAt).toISOString() },
+    ];
+    const limits = mergeAccountPoolLimits(local, accountPoolLimits([account({ limitWindows: codexWindows })]));
+    expect(limits[0]?.windows).toEqual([
+      { label: "5 hours", usedPercent: 25, resetsAt: new Date(resetAt).toISOString() },
+      { label: "Weekly", usedPercent: 80, resetsAt: new Date(resetAt).toISOString() },
+    ]);
+    expect(local[0]!.windows.map((window) => window.label)).toEqual(["Current session", "Weekly limit"]);
+  });
+
+  it("keeps local windows missing from a partial pool observation", () => {
+    const limits = mergeAccountPoolLimits(localLimits(), accountPoolLimits([account({
+      limitWindows: [codexWindows[0]!],
+    })]));
+    expect(limits[0]?.windows).toEqual([
+      { label: "5 hours", usedPercent: 12, resetsAt: "2026-09-14T12:00:00.000Z" },
+      { label: "Weekly", usedPercent: 20, resetsAt: null },
+    ]);
+  });
+
+  it.each([
+    { localUsage: 80, poolUsage: 17, localReset: resetAt, poolReset: resetAt, expectedUsage: 80 },
+    { localUsage: 17, poolUsage: 80, localReset: resetAt, poolReset: resetAt, expectedUsage: 80 },
+    { localUsage: 5, poolUsage: 95, localReset: resetAt + 604_800_000, poolReset: resetAt, expectedUsage: 5 },
+    { localUsage: 95, poolUsage: 5, localReset: resetAt, poolReset: resetAt + 604_800_000, expectedUsage: 5 },
+  ])("merges local $localUsage% and pooled $poolUsage% using the newest reset cycle", ({
+    localUsage, poolUsage, localReset, poolReset, expectedUsage,
+  }) => {
+    const local = localLimits();
+    local[0]!.windows = [{ label: "Weekly", usedPercent: localUsage, resetsAt: new Date(localReset).toISOString() }];
+    const limits = mergeAccountPoolLimits(local, accountPoolLimits([account({ limitWindows: [
+      { slot: "primary", windowMinutes: 10080, utilization: poolUsage / 100, resetAt: poolReset, status: null },
+    ] })]));
+    expect(limits[0]?.windows).toEqual([{
+      label: "Weekly", usedPercent: expectedUsage, resetsAt: new Date(Math.max(localReset, poolReset)).toISOString(),
+    }]);
+  });
+
   it("keeps accounts separate when email is missing, ambiguous, or belongs to another provider", () => {
     for (const email of [null, "user@example.com"]) {
       const pooled = accountPoolLimits([account({ email }), account({ id: "second", email })]);
