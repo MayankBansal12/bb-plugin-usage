@@ -155,9 +155,11 @@ export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProv
 
 export function maskEmailAddresses(value: string) {
   return value.replace(/([^\s@<>()",;:]+)@([^\s@<>()",;:]+)/g, (_email, local: string, domain: string) => {
-    const first = local.length > 1 ? local[0] : "";
-    const last = local.length > 2 ? local.at(-1) : "";
-    return `${first}***${last}@${domain}`;
+    const characters = Array.from(local);
+    const first = characters.length > 1 ? characters[0]! : "";
+    const last = characters.length > 2 ? characters.at(-1)! : "";
+    const hiddenCount = characters.length - Number(Boolean(first)) - Number(Boolean(last));
+    return `${first}${"*".repeat(hiddenCount)}${last}@${domain}`;
   });
 }
 

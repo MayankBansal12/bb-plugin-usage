@@ -3,11 +3,13 @@ import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits, 
 
 describe("provider limit presentation", () => {
   it.each([
-    ["person@example.com", "p***n@example.com"],
-    ["ab@example.com", "a***@example.com"],
-    ["a@example.com", "***@example.com"],
-    ["Work <person+dev@example.com>", "Work <p***v@example.com>"],
-    ["Failed for person@example.com and other@example.org", "Failed for p***n@example.com and o***r@example.org"],
+    ["person@example.com", "p****n@example.com"],
+    ["jonathan@gmail.com", "j******n@gmail.com"],
+    ["amy@example.com", "a*y@example.com"],
+    ["ab@example.com", "a*@example.com"],
+    ["a@example.com", "*@example.com"],
+    ["Work <person+dev@example.com>", "Work <p********v@example.com>"],
+    ["Failed for person@example.com and other@example.org", "Failed for p****n@example.com and o***r@example.org"],
     ["Personal account", "Personal account"],
   ])("masks email addresses in account labels and diagnostics: %s", (value, expected) => {
     expect(maskEmailAddresses(value)).toBe(expected);
