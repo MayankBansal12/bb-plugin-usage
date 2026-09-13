@@ -14,7 +14,7 @@ import { paginateItems } from "@/lib/pagination";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
-import { clampPercent, formatLimitReset, formatLimitValue, type ProviderLimitWindow } from "@/lib/provider-limits";
+import { clampPercent, formatLimitReset, formatLimitValue, isLimitVisibleOnMachine, maskEmailAddresses, type UnifiedProviderLimit } from "@/lib/provider-limits";
 import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
 
 type Range = 7 | 30 | 90;
@@ -92,26 +92,7 @@ type UsageRecord = {
   outputTokens: number;
 };
 
-type ProviderLimitData = Array<{
-  id: string;
-  providerId: string;
-  providerName: string;
-  accountEmail: string | null;
-  planLabel: string | null;
-  windows: ProviderLimitWindow[];
-  status: "ok" | "error";
-  error: string | null;
-  lastUpdatedAt: string | null;
-  machines: Array<{
-    machineId: string;
-    machineName: string;
-    agents: Array<{ id: string; name: string }>;
-    windows: ProviderLimitWindow[];
-    status: "ok" | "error";
-    error: string | null;
-    lastUpdatedAt: string | null;
-  }>;
-}>;
+type ProviderLimitData = UnifiedProviderLimit[];
 
 type DashboardData = {
   mode: "live";
@@ -704,6 +685,17 @@ function RowBadge({ children }: { children: ReactNode }) {
   );
 }
 
+function LimitBadge({ children, title }: { children: ReactNode; title?: string }) {
+  return (
+    <span
+      className="inline-flex min-w-0 max-w-full items-center truncate rounded-md border border-border/50 bg-muted/40 px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground"
+      title={title}
+    >
+      {children}
+    </span>
+  );
+}
+
 function ProviderLimits({
   limits,
   contentWidth,
@@ -717,9 +709,11 @@ function ProviderLimits({
 }) {
   const showMachineTags = limits.some((limit) => limit.machines.length > 1)
     || new Set(limits.flatMap((limit) => limit.machines.map((machine) => machine.machineId))).size > 1;
+  const showAccountLabels = limits.some((limit) => limit.poolAccount || limit.accountEmail);
   const availableColumns =
     contentWidth > 0 && contentWidth < 640 ? 1 : contentWidth > 0 && contentWidth < 900 ? 2 : 3;
   const columnCount = Math.max(1, Math.min(availableColumns, limits.length || 1));
+  const showBadges = showMachineTags || limits.some((limit) => limit.poolAccount);
 
   return (
     <section className="rounded-xl border border-border/70 bg-muted/[0.08] p-4 sm:p-5" aria-labelledby="provider-limits-title">
@@ -728,91 +722,115 @@ function ProviderLimits({
         <span className="text-xs text-muted-foreground">Current plan windows</span>
       </div>
       {error && (
-        <p className="mt-2 text-xs text-destructive" role="alert">Couldn’t refresh usage limits: {error}</p>
+        <p className="mt-2 text-xs text-destructive" role="alert">{maskEmailAddresses(error)}</p>
       )}
       {loading && limits.length === 0 ? (
         <ProviderLimitsSkeleton columns={availableColumns} />
       ) : limits.length === 0 ? (
-        <p className="mt-2 text-xs text-muted-foreground">No provider limits are available from connected machines.</p>
+        <p className="mt-2 text-xs text-muted-foreground">No usage limits are available from connected machines or Account Pooler.</p>
       ) : (
         <div
           className="mt-4 grid gap-3"
           style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
         >
-          {limits.map((limit) => (
-            <div
-              key={limit.id}
-              className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
-            >
-              <div className="flex min-w-0 items-center justify-between gap-3">
-                <span className="flex min-w-0 items-center gap-2">
-                  <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
-                  <span className="truncate text-xs font-medium">{limit.providerName}</span>
-                </span>
-                {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={limit.planLabel}>{limit.planLabel}</div>}
-              </div>
-              {showMachineTags ? (
-                <div className="mt-1.5 flex flex-wrap gap-1">
-                  {limit.machines.map((machine) => (
-                    <span
-                      key={machine.machineId}
-                      className="inline-flex max-w-full truncate rounded-md border border-border/50 bg-muted/40 px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground"
-                      title={machine.error ? `${machine.machineName}: ${machine.error}` : machine.machineName}
-                    >
-                      {machine.machineName}
-                    </span>
-                  ))}
+          {limits.map((limit) => {
+            const accountLabel = maskEmailAddresses(limit.poolAccount?.label ?? limit.accountEmail ?? "");
+            const accountRow = Boolean(accountLabel) || (columnCount > 1 && showAccountLabels);
+            const badgeRow = Boolean(limit.poolAccount) || showMachineTags || (columnCount > 1 && showBadges);
+            const poolStatus = limit.poolAccount?.status;
+            return (
+              <div
+                key={limit.id}
+                className="grid min-w-0 gap-y-1 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
+                style={{ gridRow: `span ${2 + Number(accountRow) + Number(badgeRow)}`, gridTemplateRows: "subgrid" }}
+              >
+                <div className="flex min-w-0 items-center justify-between gap-3">
+                  <span className="flex min-w-0 items-center gap-2">
+                    <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
+                    <span className="truncate text-xs font-medium">{limit.providerName}</span>
+                  </span>
+                  {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={maskEmailAddresses(limit.planLabel)}>{maskEmailAddresses(limit.planLabel)}</div>}
                 </div>
-              ) : null}
-              {limit.error && (
-                <div className="mt-2 flex items-start gap-1.5">
-                  <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-                  <p className="text-[10px] leading-4 text-destructive/90">
-                    {limit.status === "error"
-                      ? `Couldn’t load ${limit.providerName} limits: ${limit.error}`
-                      : `Some machines couldn’t refresh ${limit.providerName}: ${limit.machines
-                        .filter((machine) => machine.status === "error")
-                        .map((machine) => machine.machineName).join(", ")}. ${limit.error}`}
-                    {limit.status === "error" && limit.windows.length > 0
-                      ? ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
-                      : ""}
+                {accountRow && (
+                  <p className="min-h-4 truncate text-[11px] leading-4 text-muted-foreground" title={accountLabel || undefined}>
+                    {accountLabel}
                   </p>
+                )}
+                {badgeRow && (
+                  <div className="flex min-h-4 flex-wrap content-start items-start gap-1">
+                    {limit.poolAccount && <LimitBadge title="Shared across machines">Account Pooler</LimitBadge>}
+                    {showMachineTags && limit.machines.map((machine) => (
+                      <LimitBadge
+                        key={machine.machineId}
+                        title={maskEmailAddresses(machine.error ? `${machine.machineName}: ${machine.error}` : machine.machineName)}
+                      >
+                        {maskEmailAddresses(machine.machineName)}
+                      </LimitBadge>
+                    ))}
+                    {poolStatus && poolStatus !== "ready" && (
+                      <LimitBadge>{poolStatus === "exhausted" ? "Limit reached" : poolStatus.charAt(0).toUpperCase() + poolStatus.slice(1)}</LimitBadge>
+                    )}
+                  </div>
+                )}
+                <div className="min-w-0 self-start pt-0.5">
+                  {limit.error && (
+                    <div className="mb-2 flex items-start gap-1.5">
+                      <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+                      <p className="text-[10px] leading-4 text-destructive/90">
+                        {maskEmailAddresses(limit.poolAccount
+                          ? `Account Pooler couldn’t refresh ${limit.providerName} limits: ${limit.error}`
+                          : limit.status === "error"
+                            ? `Couldn’t load ${limit.providerName} limits: ${limit.error}`
+                            : `Some machines couldn’t refresh ${limit.providerName}: ${limit.machines
+                              .filter((machine) => machine.status === "error")
+                              .map((machine) => machine.machineName).join(", ")}. ${limit.error}`)}
+                        {limit.status === "error" && limit.windows.length > 0
+                          ? limit.poolAccount
+                            ? " Showing available limits."
+                            : ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
+                          : ""}
+                      </p>
+                    </div>
+                  )}
+                  {limit.windows.length > 0 && (
+                    <div className="space-y-1.5">
+                      {limit.windows.map((window, index) => {
+                        const reset = formatLimitReset(window.resetsAt);
+                        const usedPercent = clampPercent(window.usedPercent);
+                        return (
+                          <div key={`${window.label}:${index}`}>
+                            <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
+                              <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
+                              <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
+                            </div>
+                            <div
+                              className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
+                              role="progressbar"
+                              aria-label={maskEmailAddresses(`${limit.providerName} ${limit.poolAccount?.label ?? limit.accountEmail ?? limit.planLabel ?? limit.machines.map((machine) => machine.machineName).join(", ")} ${window.label}`)}
+                              aria-valuemin={0}
+                              aria-valuemax={100}
+                              aria-valuenow={Math.round(usedPercent)}
+                            >
+                              <div
+                                className="h-full rounded-full"
+                                style={{
+                                  width: `${usedPercent}%`,
+                                  backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(limit.providerId),
+                                }}
+                              />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  {limit.windows.length === 0 && limit.poolAccount && !limit.error && (
+                    <p className="text-[10px] leading-4 text-muted-foreground">{limit.poolAccount.emptyMessage}</p>
+                  )}
                 </div>
-              )}
-              {limit.windows.length > 0 && (
-                <div className="mt-1.5 space-y-1.5">
-                  {limit.windows.map((window, index) => {
-                    const reset = formatLimitReset(window.resetsAt);
-                    const usedPercent = clampPercent(window.usedPercent);
-                    return (
-                      <div key={`${window.label}:${index}`}>
-                        <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
-                          <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
-                          <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
-                        </div>
-                        <div
-                          className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
-                          role="progressbar"
-                          aria-label={`${limit.providerName} ${limit.accountEmail ?? limit.planLabel ?? limit.machines.map((machine) => machine.machineName).join(", ")} ${window.label}`}
-                          aria-valuemin={0}
-                          aria-valuemax={100}
-                          aria-valuenow={Math.round(usedPercent)}
-                        >
-                          <div
-                            className="h-full rounded-full"
-                            style={{
-                              width: `${usedPercent}%`,
-                              backgroundColor: usedPercent >= 90 ? "var(--destructive)" : providerColor(limit.providerId),
-                            }}
-                          />
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          ))}
+              </div>
+            );
+          })}
         </div>
       )}
     </section>
@@ -973,10 +991,11 @@ function UsageDashboard() {
     try {
       const nextLimits = await rpc.call("providerLimits");
       if (providerLimitsRequestId.current !== requestId) return;
-      setProviderLimits(nextLimits);
+      setProviderLimits(nextLimits.limits);
+      setProviderLimitsError(nextLimits.accountPoolError);
     } catch (reason) {
       if (providerLimitsRequestId.current !== requestId) return;
-      setProviderLimitsError(reason instanceof Error ? reason.message : String(reason));
+      setProviderLimitsError(`Couldn’t refresh usage limits: ${reason instanceof Error ? reason.message : String(reason)}`);
     } finally {
       if (providerLimitsRequestId.current === requestId) setProviderLimitsLoading(false);
     }
@@ -1229,9 +1248,7 @@ function UsageDashboard() {
     : dayBreakdown;
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
-  const visibleProviderLimits = providerLimits.filter((limit) =>
-    machine === "all" || limit.machines.some((item) => item.machineId === machine)
-  );
+  const visibleProviderLimits = providerLimits.filter((limit) => isLimitVisibleOnMachine(limit, machine));
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day`, values: dailySeries.processed, color: FALLBACK_PROVIDER_COLORS[0] },

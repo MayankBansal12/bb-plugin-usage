@@ -19,6 +19,7 @@ import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
+import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/account-pool-limits";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -42,6 +43,7 @@ const providerLimitWindowSchema = z.object({
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
+  poolAccount: z.object({ id: z.string(), label: z.string(), status: z.string(), emptyMessage: z.string() }).optional(),
   id: z.string(),
   providerId: z.string(), providerName: z.string(),
   accountEmail: z.string().nullable(), planLabel: z.string().nullable(),
@@ -64,7 +66,9 @@ export const rpcContract = defineRpcContract({
     records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema),
     sync: syncStateSchema, notice: z.string(),
   }) },
-  providerLimits: { input: z.null(), output: z.array(providerLimitSchema) },
+  providerLimits: { input: z.null(), output: z.object({
+    limits: z.array(providerLimitSchema), accountPoolError: z.string().nullable(),
+  }) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
 
@@ -1008,19 +1012,26 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
-  let providerLimitsRequest: Promise<Array<z.infer<typeof providerLimitSchema>>> | null = null;
+  const loadAccountPoolLimits = createAccountPoolLimitsLoader(bb);
+  let providerLimitsRequest: Promise<z.infer<typeof rpcContract.providerLimits.output>> | null = null;
   const readProviderLimits = async () => {
     if (providerLimitsRequest) return providerLimitsRequest;
     providerLimitsRequest = (async () => {
-      const machines = await loadMachines();
-      const connectedMachineIds = new Set(
-        machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
-      );
-      return groupProviderLimits([
-        ...await loadProviderLimits(bb, machines, db),
-        ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
-        ...loadStoredGrokLimits(db, connectedMachineIds),
+      const [local, pool] = await Promise.all([
+        (async () => {
+          const machines = await loadMachines();
+          const connectedMachineIds = new Set(
+            machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
+          );
+          return groupProviderLimits([
+            ...await loadProviderLimits(bb, machines, db),
+            ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
+            ...loadStoredGrokLimits(db, connectedMachineIds),
+          ]);
+        })(),
+        loadAccountPoolLimits(),
       ]);
+      return { limits: mergeAccountPoolLimits(local, pool.limits), accountPoolError: pool.error };
     })();
     try {
       return await providerLimitsRequest;

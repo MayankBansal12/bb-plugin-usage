@@ -25,6 +25,12 @@ export type ProviderLimitSource = {
 };
 
 export type UnifiedProviderLimit = {
+  poolAccount?: {
+    id: string;
+    label: string;
+    status: string;
+    emptyMessage: string;
+  };
   id: string;
   providerId: string;
   providerName: string;
@@ -44,6 +50,11 @@ export type UnifiedProviderLimit = {
     lastUpdatedAt: string | null;
   }>;
 };
+
+export function isLimitVisibleOnMachine(limit: UnifiedProviderLimit, machineId: string) {
+  return machineId === "all" || Boolean(limit.poolAccount)
+    || limit.machines.some((machine) => machine.machineId === machineId);
+}
 
 function normalizedIdentity(value: string | null) {
   return value?.trim().toLocaleLowerCase() || null;
@@ -68,7 +79,7 @@ function combinedError(sources: ProviderLimitSource[]) {
   return errors.length > 0 ? errors.join("; ") : null;
 }
 
-export function mergeLimitWindows(sources: ProviderLimitSource[]) {
+export function mergeLimitWindows(sources: ReadonlyArray<Pick<ProviderLimitSource, "windows">>) {
   const order: string[] = [];
   const windows = new Map<string, ProviderLimitWindow>();
   for (const source of sources) {
@@ -140,6 +151,16 @@ export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProv
     };
   }).sort((left, right) => left.providerName.localeCompare(right.providerName)
     || (left.accountEmail ?? left.planLabel ?? "").localeCompare(right.accountEmail ?? right.planLabel ?? ""));
+}
+
+export function maskEmailAddresses(value: string) {
+  return value.replace(/([^\s@<>()",;:]+)@([^\s@<>()",;:]+)/g, (_email, local: string, domain: string) => {
+    const characters = Array.from(local);
+    const first = characters.length > 1 ? characters[0]! : "";
+    const last = characters.length > 2 ? characters.at(-1)! : "";
+    const hiddenCount = characters.length - Number(Boolean(first)) - Number(Boolean(last));
+    return `${first}${"*".repeat(hiddenCount)}${last}@${domain}`;
+  });
 }
 
 export function clampPercent(value: number) {

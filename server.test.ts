@@ -10,7 +10,7 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
+  rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
   openCodeCommand, openCodeSql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 
@@ -1506,5 +1506,70 @@ describe("Grok limit snapshots", () => {
     await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([]);
     db.close();
+  });
+});
+
+
+describe("Account Pooler limits RPC integration", () => {
+  it.each(["local@example.com", "pool@example.com"])("preserves local limits for %s on pool failures and missing observations", async (localEmail) => {
+    const db = new Database(":memory:");
+    let read: (() => Promise<unknown>) | undefined;
+    const poolAccounts = [{
+      id: "pool-account", provider: "codex", kind: "oauth", label: "Pooled Codex",
+      email: "pool@example.com", subscriptionType: null, enabled: true, status: "ready", error: null,
+      observedAt: 1789300800000, fiveHourUtilization: null, fiveHourResetAt: null,
+      sevenDayUtilization: null, sevenDayResetAt: null, familyWeekly: {},
+      limitWindows: [{ slot: "primary", windowMinutes: 10080, utilization: 0.17, resetAt: 1789905600000, status: null }],
+    }];
+    const callRpc = vi.fn().mockResolvedValue(poolAccounts);
+    const hosts = vi.fn().mockResolvedValue([]);
+    const bb = {
+      settings: { define: vi.fn() },
+      storage: {
+        database: () => db,
+        migrate: (_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); },
+      },
+      rpc: { register: (_contract: unknown, handlers: { providerLimits: () => Promise<unknown> }) => { read = handlers.providerLimits; } },
+      sdk: {
+        hosts: { list: hosts },
+        plugins: {
+          list: vi.fn().mockResolvedValue({ plugins: [{ id: "account-pool", enabled: true }] }), callRpc,
+        },
+        system: { usageLimits: vi.fn().mockResolvedValue({ codex: {
+          status: "ok", accountEmail: localEmail, planLabel: "Pro",
+          windows: [{ label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" }],
+        } }) },
+      },
+      background: { service: vi.fn() },
+      log: { debug: vi.fn(), warn: vi.fn() },
+    } as unknown as BbPluginApi;
+    try {
+      await plugin(bb);
+      const first = rpcContract.providerLimits.output.parse(await read!());
+      expect(first.accountPoolError).toBeNull();
+      expect(first.limits).toHaveLength(1);
+      expect(first.limits[0]).toMatchObject({
+        poolAccount: { label: "Pooled Codex" }, machines: [],
+        windows: [{ label: "Weekly", usedPercent: 17 }],
+      });
+      hosts.mockResolvedValue([{ id: "laptop", name: "Laptop", status: "connected" }]);
+      callRpc.mockRejectedValue(new Error("Pool temporarily unavailable"));
+      const next = rpcContract.providerLimits.output.parse(await read!());
+      expect(next.accountPoolError).toContain("last reported");
+      expect(next.limits).toHaveLength(localEmail === "pool@example.com" ? 1 : 2);
+      expect(next.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
+        { label: localEmail === "pool@example.com" ? "Weekly" : "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
+      ]);
+      expect(next.limits.some((limit) => limit.poolAccount?.id === "pool-account")).toBe(true);
+
+      callRpc.mockResolvedValue([{ ...poolAccounts[0], observedAt: null, limitWindows: [] }]);
+      const unobserved = rpcContract.providerLimits.output.parse(await read!());
+      expect(unobserved.accountPoolError).toBeNull();
+      expect(unobserved.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
+        { label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
+      ]);
+    } finally {
+      db.close();
+    }
   });
 });

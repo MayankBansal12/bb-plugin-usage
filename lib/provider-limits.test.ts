@@ -1,7 +1,20 @@
 import { describe, expect, it } from "vitest";
-import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits } from "./provider-limits";
+import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits, maskEmailAddresses } from "./provider-limits";
 
 describe("provider limit presentation", () => {
+  it.each([
+    ["person@example.com", "p****n@example.com"],
+    ["jonathan@gmail.com", "j******n@gmail.com"],
+    ["amy@example.com", "a*y@example.com"],
+    ["ab@example.com", "a*@example.com"],
+    ["a@example.com", "*@example.com"],
+    ["Work <person+dev@example.com>", "Work <p********v@example.com>"],
+    ["Failed for person@example.com and other@example.org", "Failed for p****n@example.com and o***r@example.org"],
+    ["Personal account", "Personal account"],
+  ])("masks email addresses in account labels and diagnostics: %s", (value, expected) => {
+    expect(maskEmailAddresses(value)).toBe(expected);
+  });
+
   it("clamps percentages to the progress range", () => {
     expect(clampPercent(-4)).toBe(0);
     expect(clampPercent(42.4)).toBe(42.4);
