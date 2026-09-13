@@ -1,9 +1,10 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 import type { AmpUsageAggregate } from "./lib/amp-usage-collector";
 
-// `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
-// lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
-// in grouping and filters instead of merging into "codex".
+// `codex-<name>` ids are emitted for extra Codex accounts whose usage lives in
+// a per-account CODEX_HOME (e.g. ~/.codex-profiles/<name>, ~/.codex-<name>, or
+// a configured home), so each account stays a distinct agent in grouping and
+// filters instead of merging into "codex".
 export type AgentId = "amp" | "codex" | "claude" | "codebuddy" | "copilot" | "cursor" | "devin" | "dsh" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
 
 export type UsageRecord = {
@@ -349,8 +350,8 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
     const model = text(row.model, "unknown");
     const project = text(row.project, "Unknown");
-    // Only the codex scan emits `account` today; it marks rows from
-    // ~/.codex-profiles/<name> so each extra account lands on its own
+    // Only the codex scan emits `account` today; it marks rows from a
+    // per-account Codex home so each extra account lands on its own
     // dashboard agent instead of merging into Codex.
     const account = agentId === "codex" ? text(row.account, "").slice(0, 80) : "";
     const scopedAgentId: AgentId = account ? `codex-${account}` : agentId;

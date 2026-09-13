@@ -16,10 +16,15 @@ export type HostJsonScanInput = {
   roots: string[];
   cachePath: string;
   sinceDay: string;
-  // Directory whose immediate subdirectories are per-account agent homes
-  // (e.g. ~/.codex-profiles/<name> for extra Codex accounts). Each
-  // home's sessions and archived_sessions trees carry `account: <name>`.
-  accountRoot?: string;
+  // Parent directories whose immediate children are per-account agent homes
+  // (e.g. ~/.codex-profiles/<name> or ~/.codex-<name> for extra Codex
+  // accounts). Each child's sessions/ and archived_sessions/ trees are scanned;
+  // rows carry `account` = the child name minus `prefix` when one is set.
+  accountRoots?: Array<{ root: string; prefix?: string }>;
+  // Explicitly labelled per-account homes: each home's sessions/ and
+  // archived_sessions/ trees are scanned and its rows carry `account`. An empty
+  // account leaves rows untagged, so a relocated primary still merges.
+  accountHomes?: Array<{ account: string; home: string }>;
 };
 
 export type HostJsonScanResult = {
@@ -91,10 +96,19 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
   // Extra per-account homes (e.g. Codex profiles). Only the codex parser knows
-  // how to attribute them today, so other agents ignore the directory.
-  const accountRoot = input.agentId === "codex" && typeof input.accountRoot === "string" && input.accountRoot.trim()
-    ? input.accountRoot.replace(/\/+$/, "")
-    : null;
+  // how to attribute them today, so other agents ignore both fields.
+  const accountRoots = input.agentId === "codex" && Array.isArray(input.accountRoots)
+    ? input.accountRoots.flatMap((entry) => {
+      const root = typeof entry?.root === "string" ? entry.root.replace(/\/+$/, "") : "";
+      return root ? [{ root, prefix: typeof entry.prefix === "string" ? entry.prefix : undefined }] : [];
+    })
+    : [];
+  const accountHomes = input.agentId === "codex" && Array.isArray(input.accountHomes)
+    ? input.accountHomes.flatMap((entry) => {
+      const home = typeof entry?.home === "string" ? entry.home.replace(/\/+$/, "") : "";
+      return home ? [{ account: typeof entry.account === "string" ? entry.account : "", home }] : [];
+    })
+    : [];
 
   type CachedUsageRow = HostUsageAggregate & { eventKey?: string };
   type CacheEntry = { signature: string; rows: CachedUsageRow[] };
@@ -689,10 +703,20 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   }
   for (const root of [...new Set(roots)]) await walk(root, discovered);
   const accountDiscovered: string[] = [];
-  if (accountRoot) {
+  // Configured homes are discovered before convention-based parents so a
+  // configured label wins when the same file is reached through both.
+  for (const { account, home } of accountHomes) {
+    const files: string[] = [];
+    await walk(path.join(home, "sessions"), files);
+    await walk(path.join(home, "archived_sessions"), files);
+    files.sort();
+    for (const filePath of files) if (!accountByPath.has(filePath)) accountByPath.set(filePath, account);
+    accountDiscovered.push(...files);
+  }
+  for (const parent of accountRoots) {
     let accountEntries: import("node:fs").Dirent[] = [];
     try {
-      accountEntries = await fs.promises.readdir(accountRoot, { withFileTypes: true });
+      accountEntries = await fs.promises.readdir(parent.root, { withFileTypes: true });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
         discoveryFailed = true;
@@ -704,17 +728,21 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       // is followed here; the inode dedup below keeps an account aliased to the
       // primary home from being counted twice.
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      if (parent.prefix !== undefined && !entry.name.startsWith(parent.prefix)) continue;
+      const account = entry.name.slice(parent.prefix?.length ?? 0);
+      if (!account) continue;
       const files: string[] = [];
-      await walk(path.join(accountRoot, entry.name, "sessions"), files);
-      await walk(path.join(accountRoot, entry.name, "archived_sessions"), files);
-      for (const filePath of files) accountByPath.set(filePath, entry.name);
+      await walk(path.join(parent.root, entry.name, "sessions"), files);
+      await walk(path.join(parent.root, entry.name, "archived_sessions"), files);
+      files.sort();
+      for (const filePath of files) if (!accountByPath.has(filePath)) accountByPath.set(filePath, account);
       accountDiscovered.push(...files);
     }
   }
   // Primary roots come first so the inode dedup attributes an aliased file to
-  // the primary home rather than to whichever account path happens to sort
-  // earlier.
-  const uniquePaths = [...new Set(discovered)].sort().concat([...new Set(accountDiscovered)].sort());
+  // the primary home; account paths keep discovery order (and dedupe by first
+  // occurrence) so an explicit label beats a convention-discovered one.
+  const uniquePaths = [...new Set(discovered)].sort().concat([...new Set(accountDiscovered)]);
   const nextFiles: Record<string, CacheEntry> = {};
   const allRows = new Map<string, HostUsageAggregate>();
   const allEvents = new Map<string, CachedUsageRow>();
@@ -726,6 +754,13 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   for (const filePath of uniquePaths) {
     const sourceId = crypto.createHash("sha256").update(filePath).digest("hex");
     const prior = cache.files[sourceId];
+    // Attribution lives outside the file-derived signature, so rows reused
+    // from cache take the current account mapping when a configured label
+    // or convention path changes.
+    const reattribute = (rows: CachedUsageRow[]): CachedUsageRow[] => {
+      const account = accountByPath.get(filePath);
+      return account === undefined ? rows : rows.map((row) => ({ ...row, account: account || undefined }));
+    };
     try {
       const stat = await fs.promises.stat(filePath);
       if (stat.mtimeMs < cutoffMs) continue;
@@ -735,8 +770,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       fileCount += 1;
       const signature = `${stat.size}:${Math.trunc(stat.mtimeMs)}`;
       if (prior?.signature === signature && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
-        nextFiles[sourceId] = prior;
-        for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
+        const rows = reattribute(prior.rows);
+        nextFiles[sourceId] = { signature, rows };
+        for (const row of rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
         reusedFileCount += 1;
         continue;
       }
@@ -751,8 +787,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         ? "A Zstandard usage log needs Node.js 22.15+ on this host."
         : "A usage log could not be read.");
       if (prior && Array.isArray(prior.rows) && prior.rows.every(validRow)) {
-        nextFiles[sourceId] = prior;
-        for (const row of prior.rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
+        const rows = reattribute(prior.rows);
+        nextFiles[sourceId] = { signature: prior.signature, rows };
+        for (const row of rows) row.eventKey ? mergeEvent(allEvents, row) : add(allRows, row);
       }
     }
   }
