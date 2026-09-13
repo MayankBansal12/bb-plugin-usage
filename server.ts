@@ -347,12 +347,17 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
-    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd, project=excluded.project,
-    cache_savings_usd=excluded.cache_savings_usd, processed_tokens=excluded.processed_tokens,
-    cached_input_tokens=excluded.cached_input_tokens, cache_write_tokens=excluded.cache_write_tokens,
-    uncached_input_tokens=excluded.uncached_input_tokens, output_tokens=excluded.output_tokens,
+    provider_name=excluded.provider_name, model=excluded.model, project=excluded.project,
+    cost_usd=MAX(cost_usd, excluded.cost_usd),
+    cache_savings_usd=MAX(cache_savings_usd, excluded.cache_savings_usd),
+    processed_tokens=MAX(processed_tokens, excluded.processed_tokens),
+    cached_input_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens),
+    cache_write_tokens=MAX(cache_write_tokens, excluded.cache_write_tokens),
+    uncached_input_tokens=MAX(uncached_input_tokens, excluded.uncached_input_tokens),
+    output_tokens=MAX(output_tokens, excluded.output_tokens),
+    logged_cost_usd=MAX(COALESCE(logged_cost_usd, excluded.logged_cost_usd), COALESCE(excluded.logged_cost_usd, logged_cost_usd)),
     model_provider_id=excluded.model_provider_id, model_provider_name=excluded.model_provider_name,
-    logged_cost_usd=excluded.logged_cost_usd, pricing_status=excluded.pricing_status`);
+    pricing_status=excluded.pricing_status`);
   const insertMapping = db.prepare("INSERT OR IGNORE INTO usage_event_sources (event_key, source_id) VALUES (?, ?)");
 
   db.transaction(() => {
