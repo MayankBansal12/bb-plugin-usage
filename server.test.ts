@@ -1508,3 +1508,71 @@ describe("Grok limit snapshots", () => {
     db.close();
   });
 });
+
+describe("monotonic token/cost aggregation", () => {
+  function usageDb() {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE usage_events (
+        event_key TEXT PRIMARY KEY, timestamp TEXT NOT NULL, day TEXT NOT NULL,
+        provider_id TEXT NOT NULL, provider_name TEXT NOT NULL, model TEXT NOT NULL,
+        cost_usd REAL NOT NULL, cache_savings_usd REAL NOT NULL, processed_tokens INTEGER NOT NULL,
+        cached_input_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+        uncached_input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+        model_provider_id TEXT NOT NULL DEFAULT 'unknown', model_provider_name TEXT NOT NULL DEFAULT 'Unknown',
+        logged_cost_usd REAL, pricing_status TEXT NOT NULL DEFAULT 'unknown', project TEXT NOT NULL DEFAULT 'Unknown'
+      );
+    `);
+    return db;
+  }
+
+  function insertEvent(db: Database, eventKey: string, tokens: number, cost: number) {
+    db.prepare(`INSERT INTO usage_events (
+        event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,
+        processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens,
+        model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
+      provider_name=excluded.provider_name, model=excluded.model, project=excluded.project,
+      cost_usd=MAX(cost_usd, excluded.cost_usd),
+      cache_savings_usd=MAX(cache_savings_usd, excluded.cache_savings_usd),
+      processed_tokens=MAX(processed_tokens, excluded.processed_tokens),
+      cached_input_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens),
+      cache_write_tokens=MAX(cache_write_tokens, excluded.cache_write_tokens),
+      uncached_input_tokens=MAX(uncached_input_tokens, excluded.uncached_input_tokens),
+      output_tokens=MAX(output_tokens, excluded.output_tokens),
+      logged_cost_usd=MAX(COALESCE(logged_cost_usd, excluded.logged_cost_usd), COALESCE(excluded.logged_cost_usd, logged_cost_usd)),
+      model_provider_id=excluded.model_provider_id, model_provider_name=excluded.model_provider_name,
+      pricing_status=excluded.pricing_status`)
+      .run(eventKey, "2026-01-01T00:00:00Z", "2026-01-01", "pi", "Pi", "gemini", cost, 0,
+        tokens, 0, 0, 0, tokens, "unknown", "Unknown", null, "unknown", "proj");
+  }
+
+  it("processed_tokens never decreases on re-upsert with lower count (partial scan)", () => {
+    const db = usageDb();
+    insertEvent(db, "k1", 1000, 0.5);
+    expect((db.prepare("SELECT processed_tokens FROM usage_events WHERE event_key='k1'").get() as { processed_tokens: number }).processed_tokens).toBe(1000);
+
+    // Simulate partial scan: token count drops from 1000 to 500
+    insertEvent(db, "k1", 500, 0.25);
+    expect((db.prepare("SELECT processed_tokens FROM usage_events WHERE event_key='k1'").get() as { processed_tokens: number }).processed_tokens).toBe(1000);
+
+    // Subsequent full scan with higher count succeeds
+    insertEvent(db, "k1", 1500, 0.75);
+    expect((db.prepare("SELECT processed_tokens FROM usage_events WHERE event_key='k1'").get() as { processed_tokens: number }).processed_tokens).toBe(1500);
+    db.close();
+  });
+
+  it("cost_usd never decreases on re-upsert with lower cost", () => {
+    const db = usageDb();
+    insertEvent(db, "k2", 500, 2.0);
+    expect((db.prepare("SELECT cost_usd FROM usage_events WHERE event_key='k2'").get() as { cost_usd: number }).cost_usd).toBe(2.0);
+
+    insertEvent(db, "k2", 500, 1.0);
+    expect((db.prepare("SELECT cost_usd FROM usage_events WHERE event_key='k2'").get() as { cost_usd: number }).cost_usd).toBe(2.0);
+
+    insertEvent(db, "k2", 500, 3.5);
+    expect((db.prepare("SELECT cost_usd FROM usage_events WHERE event_key='k2'").get() as { cost_usd: number }).cost_usd).toBe(3.5);
+    db.close();
+  });
+});
