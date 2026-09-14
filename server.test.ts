@@ -2,7 +2,7 @@ import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./ser
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 
 vi.mock("@bb/plugin-sdk", () => ({
@@ -13,6 +13,7 @@ import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
   openCodeCommand, openCodeSql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
+import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -1571,5 +1572,173 @@ describe("Account Pooler limits RPC integration", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("retained usage through the real sync path", () => {
+  const DAY = new Date().toISOString().slice(0, 10);
+  const catalog = (rate: number) => ({ openai: { id: "openai", name: "OpenAI", models: {
+    "gpt-test": { id: "gpt-test", cost: { input: rate, output: rate, cache_read: 0, cache_write: 0 } },
+  } } });
+  function piRow(overrides: Record<string, unknown> = {}) {
+    return { day: DAY, modelProviderId: "openai", model: "gpt-test", project: "proj", loggedCostUsd: null,
+      uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500, ...overrides };
+  }
+  function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number) {
+    const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows };
+    const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
+    return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+  }
+
+  // Drives the unmodified plugin factory end-to-end through its public sync()
+  // RPC (like the Antigravity regression test above); the mutable `state`
+  // object lets each subsequent sync serve a different pi scan.
+  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number }, targetAgent = "pi") {
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown; dashboard: () => Promise<{ sync: { running: boolean } }> } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as typeof handlers;
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write: hostFileWriteMock(stagedFiles) },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === targetAgent
+              ? fakeHostScanOutputWith(targetAgent, state.rows, state.failureCount)
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+    await vi.waitFor(async () => expect((await handlers!.dashboard()).sync.running).toBe(false));
+    return { db, syncAgain: async () => {
+      handlers!.sync();
+      await vi.waitFor(async () => expect((await handlers!.dashboard()).sync.running).toBe(false));
+    } };
+  }
+
+
+  afterEach(() => resetPricingCatalog());
+  const totals = (db: Database) => db.prepare(`SELECT COUNT(*) count, SUM(processed_tokens) tokens,
+    SUM(cost_usd) cost FROM usage_events`).get();
+
+  it.each([0, 1])("retains smaller and missing buckets across nonempty and empty scans (failures: %s)", async (failureCount) => {
+    setPricingCatalog(catalog(1000), "retention-v1");
+    const state = { rows: [piRow(), piRow({ project: "second" })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.failureCount = failureCount;
+      state.rows = [piRow({ uncachedInputTokens: 300, outputTokens: 100 })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.rows = [piRow({ uncachedInputTokens: 2000 })];
+      state.failureCount = 0;
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 4000, cost: 4 });
+    } finally { db.close(); }
+  });
+
+  it("sums and prices the retained buckets when old logs disappear and new usage changes the mix", async () => {
+    setPricingCatalog(catalog(1000), "mix-v1");
+    const state = { rows: [piRow()], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      state.rows = [piRow({ uncachedInputTokens: 300, outputTokens: 1000 })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 2000, cost: 2 });
+      expect(db.prepare(`SELECT processed_tokens total, uncached_input_tokens + cached_input_tokens
+        + cache_write_tokens + output_tokens buckets FROM usage_events`).get()).toEqual({ total: 2000, buckets: 2000 });
+    } finally { db.close(); }
+  });
+
+  it("applies catalog increases and decreases to both observed and missing retained rows", async () => {
+    setPricingCatalog(catalog(1000), "prices-v1");
+    const state = { rows: [piRow(), piRow({ project: "missing" })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      state.rows = [piRow()];
+      setPricingCatalog(catalog(2000), "prices-v2");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 6 });
+      setPricingCatalog(catalog(500), "prices-v3");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 1.5 });
+      state.rows = [];
+      setPricingCatalog(catalog(1000), "prices-v4");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+    } finally { db.close(); }
+  });
+
+  it("lets logged-cost corrections flow through at unchanged token counts", async () => {
+    setPricingCatalog(catalog(1000), "logged-v1");
+    const state = { rows: [piRow({ loggedCostUsd: 2 })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      state.rows = [piRow({ loggedCostUsd: 1 })];
+      await syncAgain();
+      expect(db.prepare("SELECT cost_usd cost, logged_cost_usd logged, pricing_status status FROM usage_events").get())
+        .toEqual({ cost: 1, logged: 1, status: "logged" });
+    } finally { db.close(); }
+  });
+
+  it("uses the logged fallback when catalog pricing disappears", async () => {
+    setPricingCatalog(catalog(1000), "fallback-v1");
+    const state = { rows: [piRow({ loggedCostUsd: 0.5 })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state, "dsh");
+    try {
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+      setPricingCatalog({}, "fallback-v2");
+      await syncAgain();
+      expect(db.prepare("SELECT cost_usd cost, pricing_status status FROM usage_events").get())
+        .toEqual({ cost: 0.5, status: "logged" });
+    } finally { db.close(); }
+  });
+
+  it("bounds preserved history by age even when the next scan is empty", async () => {
+    setPricingCatalog(catalog(1000), "age-v1");
+    const state = { rows: [piRow()], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      db.prepare("UPDATE usage_events SET day='2000-01-01'").run();
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 0, tokens: null, cost: null });
+      expect(db.prepare("SELECT COUNT(*) count FROM usage_event_sources").get()).toEqual({ count: 0 });
+    } finally { db.close(); }
   });
 });

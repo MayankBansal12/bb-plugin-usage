@@ -161,6 +161,15 @@ function usageRecord(input: UsageInput, context: ParseContext): UsageRecord {
   };
 }
 
+export function repriceUsageRecord(record: UsageRecord): UsageRecord {
+  return usageRecord({
+    ...record,
+    costMode: record.agentId === "fx" ? "logged-only"
+      : ["opencode", "pi", "prime", "thaura"].includes(record.agentId) ? "logged-or-estimate"
+      : "estimate-or-logged",
+  }, record);
+}
+
 export function parseCodex(content: string, context: ParseContext): UsageRecord[] {
   const records: UsageRecord[] = [];
   let model = "codex-unknown";

@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
-  parseHostUsageAggregates, parseOpenCode,
+  parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
   type AgentId, type UsageRecord,
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
@@ -351,12 +351,22 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
-    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd, project=excluded.project,
-    cache_savings_usd=excluded.cache_savings_usd, processed_tokens=excluded.processed_tokens,
-    cached_input_tokens=excluded.cached_input_tokens, cache_write_tokens=excluded.cache_write_tokens,
-    uncached_input_tokens=excluded.uncached_input_tokens, output_tokens=excluded.output_tokens,
+    provider_name=excluded.provider_name, model=excluded.model, project=excluded.project,
+    cost_usd=excluded.cost_usd, cache_savings_usd=excluded.cache_savings_usd,
+    processed_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens)
+      + MAX(cache_write_tokens, excluded.cache_write_tokens)
+      + MAX(uncached_input_tokens, excluded.uncached_input_tokens)
+      + MAX(output_tokens, excluded.output_tokens),
+    cached_input_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens),
+    cache_write_tokens=MAX(cache_write_tokens, excluded.cache_write_tokens),
+    uncached_input_tokens=MAX(uncached_input_tokens, excluded.uncached_input_tokens),
+    output_tokens=MAX(output_tokens, excluded.output_tokens),
+    -- Logged costs are authoritative vendor figures: always take the newest,
+    -- so price corrections (up or down) flow through instead of freezing at
+    -- the first observed value.
+    logged_cost_usd=excluded.logged_cost_usd,
     model_provider_id=excluded.model_provider_id, model_provider_name=excluded.model_provider_name,
-    logged_cost_usd=excluded.logged_cost_usd, pricing_status=excluded.pricing_status`);
+    pricing_status=excluded.pricing_status`);
   const insertMapping = db.prepare("INSERT OR IGNORE INTO usage_event_sources (event_key, source_id) VALUES (?, ?)");
 
   db.transaction(() => {
@@ -365,7 +375,7 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       machine_name=excluded.machine_name, root_reference=excluded.root_reference, content_sha=excluded.content_sha,
       last_seen_generation=excluded.last_seen_generation, last_success_at=excluded.last_success_at, pricing_version=excluded.pricing_version`)
       .run(source.id, machine.id, machine.name, agentId, source.rootReference, source.sha256, source.generation, new Date().toISOString(), pricingRevision());
-    db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
+    // A rescan adds observed keys; absence does not erase recorded history.
     for (const row of records) {
       insertEvent.run(
         row.eventKey, row.timestamp, row.day, row.agentId, row.agentName, row.model, row.costUsd, row.cacheSavingsUsd,
@@ -374,8 +384,35 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       );
       insertMapping.run(row.eventKey, source.id);
     }
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    // Bound retained history by age instead of scan completeness.
+    db.prepare(`DELETE FROM usage_event_sources WHERE source_id=? AND event_key IN
+      (SELECT event_key FROM usage_events WHERE day < ?)`)
+      .run(source.id, historyStartDay(agentId === "opencode" ? OPENCODE_HISTORY_DAYS : HISTORY_DAYS));
+    deleteOrphanEvents(db);
+
+    // Reprice all retained rows, including those absent from the latest scan.
+    const retained = db.prepare(`SELECT e.event_key eventKey, e.timestamp, e.day,
+      e.provider_id agentId, e.provider_name agentName, e.model_provider_id modelProviderId,
+      e.model_provider_name modelProviderName, s.machine_id machineId, s.machine_name machineName,
+      e.model, e.project, e.cost_usd costUsd, e.logged_cost_usd loggedCostUsd,
+      e.pricing_status pricingStatus, e.cache_savings_usd cacheSavingsUsd,
+      e.processed_tokens processedTokens, e.cached_input_tokens cachedInputTokens,
+      e.cache_write_tokens cacheWriteTokens, e.uncached_input_tokens uncachedInputTokens,
+      e.output_tokens outputTokens FROM usage_events e
+      JOIN usage_event_sources es ON es.event_key=e.event_key
+      JOIN usage_sources s ON s.source_id=es.source_id WHERE es.source_id=?`)
+      .all(source.id) as UsageRecord[];
+    const updatePrice = db.prepare(`UPDATE usage_events SET cost_usd=?, cache_savings_usd=?,
+      pricing_status=? WHERE event_key=?`);
+    for (const record of retained) {
+      const priced = repriceUsageRecord(record);
+      updatePrice.run(priced.costUsd, priced.cacheSavingsUsd, priced.pricingStatus, record.eventKey);
+    }
   })();
+}
+
+function deleteOrphanEvents(db: Database) {
+  db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
 }
 
 function reconcileSources(db: Database, machineId: string, agentId: AgentId, generation: string) {
@@ -386,7 +423,7 @@ function reconcileSources(db: Database, machineId: string, agentId: AgentId, gen
       db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
       db.prepare("DELETE FROM usage_sources WHERE source_id=?").run(source.id);
     }
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    deleteOrphanEvents(db);
   })();
 }
 
@@ -401,7 +438,7 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     db.prepare(`DELETE FROM grok_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    deleteOrphanEvents(db);
   })();
 }
 
@@ -421,9 +458,9 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
     })];
 }
 
-function historyStartDay() {
+function historyStartDay(days = HISTORY_DAYS) {
   const start = new Date();
-  start.setDate(start.getDate() - HISTORY_DAYS);
+  start.setDate(start.getDate() - days);
   return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
 }
 
