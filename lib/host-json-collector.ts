@@ -56,7 +56,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "codebuddy", "cursor", "devin", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
+  agentId: z.enum(["codex", "claude", "codebuddy", "copilot", "cursor", "devin", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -82,8 +82,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
   // v6 (dsh): replace repeated attempt samples and reject missing fork cuts.
   // v6 (codex): retain hashed session/bucket identities across archive moves and copies.
-  const cacheVersion = input.agentId === "dsh" || input.agentId === "codex" ? 6 : 5;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
+  // v6 (copilot): add session summaries.
+  const cacheVersion = input.agentId === "dsh" || input.agentId === "codex" || input.agentId === "copilot" ? 6 : 5;
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "copilot", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
   // Extra per-account homes (e.g. Codex profiles). Only the codex parser knows
@@ -215,6 +216,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     // generations (session.jsonl.zstd, session.vN...) beside the live v3 log
     // after a migration, and they replay the same history.
     if (input.agentId === "dsh") return name === "session.v3.jsonl.zstd";
+    if (input.agentId === "copilot") return name === "events.jsonl";
     if (input.agentId === "fx" || input.agentId === "antigravity" || input.agentId === "thaura") return name === "usage.jsonl";
     if (input.agentId === "grok") return name === "unified.jsonl";
     return name.endsWith(".jsonl");
@@ -436,6 +438,36 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           project: buddy ? sessionProject : projectName(value.project), loggedCostUsd: null,
           uncachedInputTokens: uncached, cachedInputTokens: cached, cacheWriteTokens: writes, outputTokens: output,
         });
+        continue;
+      }
+
+      if (input.agentId === "copilot") {
+        const data = object(value.data);
+        if (value.type === "session.start") {
+          const context = object(data?.context);
+          if (typeof context?.cwd === "string") sessionProject = projectName(context.cwd);
+          continue;
+        }
+        if (value.type !== "session.shutdown") continue;
+        const usageDay = day(value.timestamp);
+        const eventId = typeof value.id === "string" ? value.id : "";
+        const modelMetrics = object(data?.modelMetrics);
+        if (!usageDay || !eventId || !modelMetrics) continue;
+        for (const [modelName, rawMetrics] of Object.entries(modelMetrics)) {
+          const usage = object(object(rawMetrics)?.usage);
+          if (!usage) continue;
+          const inputTokens = count(usage.inputTokens);
+          const cached = count(usage.cacheReadTokens);
+          const writes = count(usage.cacheWriteTokens);
+          const output = count(usage.outputTokens);
+          if (inputTokens + cached + writes + output === 0) continue;
+          mergeEvent(events, {
+            eventKey: crypto.createHash("sha256").update(`copilot:${eventId}:${modelName}`).digest("hex"),
+            day: usageDay, modelProviderId: "github-copilot", model: text(modelName, "unknown"), project: sessionProject,
+            loggedCostUsd: null, uncachedInputTokens: inputTokens, cachedInputTokens: cached,
+            cacheWriteTokens: writes, outputTokens: output,
+          });
+        }
         continue;
       }
 

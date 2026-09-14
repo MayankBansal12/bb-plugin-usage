@@ -80,6 +80,7 @@ const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
   { id: "codebuddy", name: "CodeBuddy" },
+  { id: "copilot", name: "GitHub Copilot" },
   { id: "cursor", name: "Cursor Agent" },
   { id: "dsh", name: "DeepSeek Harness" },
   { id: "devin", name: "Devin" },
@@ -452,6 +453,7 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
   const defaults = agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "codebuddy" ? [`${home}/.codebuddy/projects`]
+    : agentId === "copilot" ? [`${home}/.copilot/session-state`]
     : agentId === "cursor" ? [`${home}/.cursor/usage.jsonl`]
     : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
@@ -1061,6 +1063,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "codebuddy", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "copilot", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "cursor", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),

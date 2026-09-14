@@ -394,6 +394,43 @@ describe("host JSON usage collector", () => {
     expect(second.rows).toEqual(first.rows);
   });
 
+  it("collects completed Copilot sessions once and retains only aggregate metadata", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "session-state", "session-private");
+    const cachePath = join(directory, "cache", "copilot.json");
+    await mkdir(root, { recursive: true });
+    const shutdown = {
+      type: "session.shutdown", id: "shutdown-private", timestamp: "2026-08-09T12:00:00Z",
+      data: { modelMetrics: {
+        "gpt-5-test": { requests: { count: 2, cost: 1 }, usage: {
+          inputTokens: 100, cacheReadTokens: 60, cacheWriteTokens: 5, outputTokens: 20, reasoningTokens: 7,
+        } },
+        "claude-test": { requests: { count: 1, cost: 1 }, usage: {
+          inputTokens: 40, cacheReadTokens: 10, cacheWriteTokens: 0, outputTokens: 8,
+        } },
+      }, codeChanges: { filesModified: ["/private/work/project/secret.ts"] } },
+    };
+    await writeFile(join(root, "events.jsonl"), [
+      { type: "session.start", id: "start-private", timestamp: "2026-08-09T10:00:00Z", data: { context: { cwd: "/private/work/project" } } },
+      shutdown,
+      shutdown,
+      { type: "session.usage_checkpoint", id: "checkpoint-private", timestamp: "2026-08-09T11:00:00Z", data: { totalPremiumRequests: 2 } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const first = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ day: localDay("2026-08-09T12:00:00Z"), modelProviderId: "github-copilot", model: "gpt-5-test", project: "project", uncachedInputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 20 }),
+      expect.objectContaining({ modelProviderId: "github-copilot", model: "claude-test", uncachedInputTokens: 40, cachedInputTokens: 10, cacheWriteTokens: 0, outputTokens: 8 }),
+    ]));
+    expect(first.rows).toHaveLength(2);
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toMatch(/private|secret/);
+
+    const second = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(second).toMatchObject({ changedFileCount: 0, reusedFileCount: 1, rows: first.rows });
+  });
+
   it("streams Thaura's usage ledger and prices its flat model rate", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "usage.jsonl");
@@ -861,19 +898,15 @@ describe("host JSON usage collector", () => {
   it("keeps host filesystem paths out of failure diagnostics", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "sessions");
-    const cachePath = join(directory, "cache", "codex.json");
+    const cachePath = join(directory, "cache", "dsh.json");
     await mkdir(root, { recursive: true });
-    // Discoverable and stat-able, but unreadable -- so parseFile throws and the
-    // failure path runs with a real filePath in scope.
-    const secret = join(root, "rollout-secret.jsonl");
-    await writeFile(secret, "{}\n");
-    await chmod(secret, 0o000);
+    await writeFile(join(root, "session.v3.jsonl.zstd"), "not a zstd frame");
 
-    const result = await scan("codex", root, cachePath);
+    const result = await scan("dsh", root, cachePath);
     expect(result.failureCount).toBeGreaterThan(0);
     // `error` carries the first failure string off the host verbatim.
     expect(result.error).toBe("A usage log could not be read.");
-    await chmod(secret, 0o600);
+    expect(JSON.stringify(result)).not.toContain(directory);
   });
 });
 

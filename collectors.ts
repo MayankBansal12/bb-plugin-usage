@@ -3,7 +3,7 @@ import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/p
 // `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
 // lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
 // in grouping and filters instead of merging into "codex".
-export type AgentId = "codex" | "claude" | "codebuddy" | "cursor" | "devin" | "dsh" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
+export type AgentId = "codex" | "claude" | "codebuddy" | "copilot" | "cursor" | "devin" | "dsh" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
 
 export type UsageRecord = {
   eventKey: string;
@@ -328,6 +328,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
   const agentName = agentId === "codex" ? "Codex"
     : agentId === "claude" ? "Claude Code"
     : agentId === "codebuddy" ? "CodeBuddy"
+    : agentId === "copilot" ? "GitHub Copilot"
     : agentId === "cursor" ? "Cursor Agent"
     : agentId === "dsh" ? "DeepSeek Harness"
     : agentId === "devin" ? "Devin"

@@ -11,6 +11,7 @@ optional proposal. The plugin cannot recover counters an agent never exposes.
 | Agent | Source | Coverage |
 | --- | --- | --- |
 | CodeBuddy | Native project JSONL transcripts | Historical and future reported tokens |
+| GitHub Copilot CLI | Native `session.shutdown` JSONL summaries | Historical completed sessions; active sessions appear after close |
 | Cursor Agent | Opt-in `afterAgentResponse` token hook | Conditional: future tokens only if the active CLI mode actually invokes the hook with counters |
 | Kiro | Investigated session metadata and legacy SQLite | Not supported: inspected token fields are null/zero; credits/context percentages are not substitutes |
 | agy | Existing compatible bridge's `usage.jsonl` | Supported only when that bridge actually emits tokens; the inspected `antigravity-acp` adapter does not |
@@ -23,6 +24,22 @@ the inspected adapter decodes conversation steps, but not generation token usage
 Reliable support requires a documented counter source or an upstream adapter
 change. No private database field numbers or installation-specific paths are
 guessed here.
+
+## GitHub Copilot CLI accounting
+
+Copilot CLI persists `session.shutdown` events under
+`~/.copilot/session-state/**/events.jsonl`. Its published event type defines
+`data.modelMetrics` as cumulative per-model input, output, cache-read, and
+cache-write token totals for the completed session. The collector reads only
+those totals, the close timestamp, the session-start project basename, and a
+hashed event identity. It ignores checkpoint, context-window, premium-request,
+and code-change fields; premium-request cost multipliers are not USD prices.
+
+An open session has no final cumulative event, so it is intentionally omitted
+until Copilot closes it. Session totals are attributed to that close date: the
+native log does not provide a per-request timestamped token ledger that could
+allocate a multi-day session more precisely. Custom session-state roots can be
+configured through `extraUsageRoots` under `copilot`.
 
 ## CodeBuddy accounting
 

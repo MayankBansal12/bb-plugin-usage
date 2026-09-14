@@ -106,12 +106,15 @@ describe("JSON agent roots", () => {
 
   it("resolves extra roots on each enrolled host while retaining defaults", () => {
     const settings = { piSessionRoots: "", primeSessionRoots: "", codexProfileHomes: "",
-      extraUsageRoots: '{"codebuddy":["~/custom buddy/projects","/shared/logs","~/custom buddy/projects"],"cursor":["~/cursor-work/usage.jsonl"]}' };
+      extraUsageRoots: '{"codebuddy":["~/custom buddy/projects","/shared/logs","~/custom buddy/projects"],"copilot":["~/copilot-history"],"cursor":["~/cursor-work/usage.jsonl"]}' };
     expect(jsonAgentRoots("/home/alice", "codebuddy", settings)).toEqual([
       "/home/alice/.codebuddy/projects", "/home/alice/custom buddy/projects", "/shared/logs",
     ]);
     expect(jsonAgentRoots("/home/bob", "cursor", settings)).toEqual([
       "/home/bob/.cursor/usage.jsonl", "/home/bob/cursor-work/usage.jsonl",
+    ]);
+    expect(jsonAgentRoots("/home/bob", "copilot", settings)).toEqual([
+      "/home/bob/.copilot/session-state", "/home/bob/copilot-history",
     ]);
     expect(() => jsonAgentRoots("/home/u", "codebuddy", { ...settings, extraUsageRoots: '{"codebuddy":["relative"]}' })).toThrow(/absolute paths/);
     expect(() => jsonAgentRoots("/home/u", "codebuddy", { ...settings, extraUsageRoots: '[]' })).toThrow(/JSON object/);
@@ -193,7 +196,7 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it.each(["antigravity", "codebuddy", "cursor"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
+  it.each(["antigravity", "codebuddy", "copilot", "cursor"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
     // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
