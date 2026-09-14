@@ -709,7 +709,6 @@ function ProviderLimits({
 }) {
   const showMachineTags = limits.some((limit) => limit.machines.length > 1)
     || new Set(limits.flatMap((limit) => limit.machines.map((machine) => machine.machineId))).size > 1;
-  const showAccountLabels = limits.some((limit) => limit.poolAccount || limit.accountEmail);
   const availableColumns =
     contentWidth > 0 && contentWidth < 640 ? 1 : contentWidth > 0 && contentWidth < 900 ? 2 : 3;
   const columnCount = Math.max(1, Math.min(availableColumns, limits.length || 1));
@@ -735,27 +734,32 @@ function ProviderLimits({
         >
           {limits.map((limit) => {
             const accountLabel = maskEmailAddresses(limit.poolAccount?.label ?? limit.accountEmail ?? "");
-            const accountRow = Boolean(accountLabel) || (columnCount > 1 && showAccountLabels);
             const badgeRow = Boolean(limit.poolAccount) || showMachineTags || (columnCount > 1 && showBadges);
             const poolStatus = limit.poolAccount?.status;
             return (
               <div
                 key={limit.id}
                 className="grid min-w-0 gap-y-1 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
-                style={{ gridRow: `span ${2 + Number(accountRow) + Number(badgeRow)}`, gridTemplateRows: "subgrid" }}
+                style={{ gridRow: `span ${2 + Number(badgeRow)}`, gridTemplateRows: "subgrid" }}
               >
                 <div className="flex min-w-0 items-center justify-between gap-3">
-                  <span className="flex min-w-0 items-center gap-2">
+                  <span className="flex min-w-0 max-w-[45%] shrink-0 items-center gap-2">
                     <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
                     <span className="truncate text-xs font-medium">{limit.providerName}</span>
                   </span>
-                  {limit.planLabel && <div className="max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground" title={maskEmailAddresses(limit.planLabel)}>{maskEmailAddresses(limit.planLabel)}</div>}
+                  <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-2">
+                    {accountLabel && (
+                      <span className="truncate text-[11px] leading-4 text-muted-foreground" title={accountLabel}>
+                        {accountLabel}
+                      </span>
+                    )}
+                    {limit.planLabel && (
+                      <div className="flex max-w-[45%] shrink-0">
+                        <LimitBadge title={maskEmailAddresses(limit.planLabel)}>{maskEmailAddresses(limit.planLabel)}</LimitBadge>
+                      </div>
+                    )}
+                  </div>
                 </div>
-                {accountRow && (
-                  <p className="min-h-4 truncate text-[11px] leading-4 text-muted-foreground" title={accountLabel || undefined}>
-                    {accountLabel}
-                  </p>
-                )}
                 {badgeRow && (
                   <div className="flex min-h-4 flex-wrap content-start items-start gap-1">
                     {limit.poolAccount && <LimitBadge title="Shared across machines">Account Pooler</LimitBadge>}

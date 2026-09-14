@@ -153,13 +153,23 @@ export function groupProviderLimits(sources: ProviderLimitSource[]): UnifiedProv
     || (left.accountEmail ?? left.planLabel ?? "").localeCompare(right.accountEmail ?? right.planLabel ?? ""));
 }
 
+const MASKED_EMAIL_PART = /^[^.@·]?(?:\.{3}|·{3})[^.@·]?$/u;
+
+function maskEmailPart(value: string) {
+  if (MASKED_EMAIL_PART.test(value)) return value.replace("...", "···");
+  const characters = Array.from(value);
+  const first = characters.length > 1 ? characters[0]! : "";
+  const last = characters.length > 2 ? characters.at(-1)! : "";
+  return `${first}···${last}`;
+}
+
 export function maskEmailAddresses(value: string) {
   return value.replace(/([^\s@<>()",;:]+)@([^\s@<>()",;:]+)/g, (_email, local: string, domain: string) => {
-    const characters = Array.from(local);
-    const first = characters.length > 1 ? characters[0]! : "";
-    const last = characters.length > 2 ? characters.at(-1)! : "";
-    const hiddenCount = characters.length - Number(Boolean(first)) - Number(Boolean(last));
-    return `${first}${"*".repeat(hiddenCount)}${last}@${domain}`;
+    // Keep the TLD (and any trailing sentence periods) visible.
+    const suffix = MASKED_EMAIL_PART.test(domain) ? "" : domain.match(/\.[^.]+\.*$/)?.[0] ?? "";
+    const name = domain.slice(0, domain.length - suffix.length);
+    const maskedDomain = maskEmailPart(name) + suffix;
+    return `${maskEmailPart(local)}@${maskedDomain}`;
   });
 }
 

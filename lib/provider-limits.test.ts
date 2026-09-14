@@ -3,16 +3,27 @@ import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits, 
 
 describe("provider limit presentation", () => {
   it.each([
-    ["person@example.com", "p****n@example.com"],
-    ["jonathan@gmail.com", "j******n@gmail.com"],
-    ["amy@example.com", "a*y@example.com"],
-    ["ab@example.com", "a*@example.com"],
-    ["a@example.com", "*@example.com"],
-    ["Work <person+dev@example.com>", "Work <p********v@example.com>"],
-    ["Failed for person@example.com and other@example.org", "Failed for p****n@example.com and o***r@example.org"],
+    ["emelie@gmail.com", "e···e@g···l.com"],
+    ["person@example.com", "p···n@e···e.com"],
+    ["jonathan@gmail.com", "j···n@g···l.com"],
+    ["averylongaccountname@averylongcompanyname.com", "a···e@a···e.com"],
+    ["amy@example.com", "a···y@e···e.com"],
+    ["ab@example.com", "a···@e···e.com"],
+    ["a@example.com", "···@e···e.com"],
+    ["Work <person+dev@example.com>", "Work <p···v@e···e.com>"],
+    ["Failed for person@example.com and other@example.org", "Failed for p···n@e···e.com and o···r@e···e.org"],
+    ["person@team.example.co.uk", "p···n@t···o.uk"],
+    ["a@x.io", "···@···.io"],
+    ["person@例子.公司", "p···n@例···.公司"],
+    ["Failed for person@example.com.", "Failed for p···n@e···e.com."],
+    ["p****n@e*****e.com", "p···n@e···e.com"],
+    ["p...n@e...e.com", "p···n@e···e.com"],
+    ["person@localhost", "p···n@l···t"],
     ["Personal account", "Personal account"],
+    ["p···n@e···e.com", "p···n@e···e.com"],
   ])("masks email addresses in account labels and diagnostics: %s", (value, expected) => {
     expect(maskEmailAddresses(value)).toBe(expected);
+    expect(maskEmailAddresses(expected)).toBe(expected);
   });
 
   it("clamps percentages to the progress range", () => {
