@@ -12,7 +12,9 @@ import { ToggleGroup } from "@/components/ui/toggle-group";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { ProviderLimitsSkeleton, UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
+import { BreakdownDonut } from "@/components/breakdown-donut";
 import { paginateItems } from "@/lib/pagination";
+import { buildBreakdownDonut } from "@/lib/breakdown-donut";
 import { compareUsage, nextUsageSort, type MetricMode, type UsageSort } from "@/lib/usage-sort";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
@@ -1104,6 +1106,7 @@ function UsageDashboard() {
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
+  const [breakdownHover, setBreakdownHover] = useState<string | null>(null);
   const [syncRequested, setSyncRequested] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);
@@ -1435,6 +1438,9 @@ function UsageDashboard() {
     : dayBreakdown;
   const breakdown = [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort));
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
+  const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
+  const breakdownGroupLabel = breakdownMode === "model" ? "models" : breakdownMode === "project" ? "projects" : "days";
+  const donutBesideTable = contentWidth >= 1060;
   const activeDays = new Set(rows.map((row) => row.day)).size;
   const visibleProviderLimits = providerLimits.filter((limit) => isLimitVisibleOnMachine(limit, machine));
 
@@ -1650,6 +1656,9 @@ function UsageDashboard() {
 
               {compactView ? (
                 <div className="mt-2">
+                  <div className={`mb-2 flex justify-center px-3.5 py-4 ${CARD_CLASSES}`}>
+                    <BreakdownDonut donut={breakdownDonut} rows={breakdown} mode={breakdownSort.metric} groupLabel={breakdownGroupLabel} hoveredKey={breakdownHover} onHoverKey={setBreakdownHover} formatValue={breakdownSort.metric === "cost" ? (value) => <CostValue value={value} /> : (value) => compact(value)} />
+                  </div>
                   <div className="mb-2 flex min-w-0 items-center justify-between gap-2 text-xs text-muted-foreground">
                     <span>Sort by</span>
                     <div className="flex items-center gap-3" role="group" aria-label="Breakdown sorting">
@@ -1659,8 +1668,9 @@ function UsageDashboard() {
                   </div>
                   <ul className="space-y-2" aria-label={`Usage by ${breakdownMode}`}>
                     {paginatedBreakdown.items.map((row) => (
-                      <li key={row.key} className={`min-w-0 px-3 py-3 ${CARD_CLASSES}`}>
+                      <li key={row.key} className={`min-w-0 px-3 py-3 transition-colors ${CARD_CLASSES} ${breakdownHover === row.key ? "bg-muted/30" : ""}`} onMouseEnter={() => setBreakdownHover(row.key)} onMouseLeave={() => setBreakdownHover(null)}>
                         <div className="flex min-w-0 items-start gap-2.5">
+                          <span className="mt-1.5 size-2 shrink-0 rounded-full" style={{ backgroundColor: breakdownDonut.colorByKey.get(row.key) }} />
                           {breakdownMode === "model" && (
                             <span className="mt-0.5 shrink-0">
                               <ProviderLogo id={modelLogoId(row.label)} size="sm" />
@@ -1694,7 +1704,11 @@ function UsageDashboard() {
                   </ul>
                 </div>
               ) : (
-                <div className={`${stackedView ? "" : "mt-3"} overflow-x-auto ${CARD_CLASSES}`}>
+                <div className={`${stackedView ? "" : "mt-3"} ${CARD_CLASSES} ${donutBesideTable ? "flex items-stretch" : ""}`}>
+                  <div className={`flex shrink-0 items-center justify-center px-5 py-4 ${donutBesideTable ? "border-r border-border/60" : "border-b border-border/60"}`}>
+                    <BreakdownDonut donut={breakdownDonut} rows={breakdown} mode={breakdownSort.metric} groupLabel={breakdownGroupLabel} hoveredKey={breakdownHover} onHoverKey={setBreakdownHover} formatValue={breakdownSort.metric === "cost" ? (value) => <CostValue value={value} /> : (value) => compact(value)} />
+                  </div>
+                  <div className="min-w-0 flex-1 overflow-x-auto">
                   <table
                     className={`w-full border-collapse text-sm ${stackedView ? "table-fixed" : ""}`}
                     aria-label="Usage breakdown"
@@ -1725,16 +1739,19 @@ function UsageDashboard() {
                     </thead>
                     <tbody>
                       {paginatedBreakdown.items.map((row) => (
-                        <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
+                        <tr key={row.key} className={`border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0 ${breakdownHover === row.key ? "bg-muted/20" : ""}`} onMouseEnter={() => setBreakdownHover(row.key)} onMouseLeave={() => setBreakdownHover(null)}>
                           <td className="px-4 py-3 font-medium">
-                            {breakdownMode === "model" ? (
-                              <span className="flex min-w-0 items-center gap-2">
-                                <ProviderLogo id={modelLogoId(row.label)} size="sm" />
-                                <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
-                              </span>
-                            ) : (
-                              <span className="block truncate" title={row.label}>{row.label}</span>
-                            )}
+                            <span className="flex min-w-0 items-center gap-2">
+                              <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: breakdownDonut.colorByKey.get(row.key) }} />
+                              {breakdownMode === "model" ? (
+                                <>
+                                  <ProviderLogo id={modelLogoId(row.label)} size="sm" />
+                                  <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
+                                </>
+                              ) : (
+                                <span className="truncate" title={row.label}>{row.label}</span>
+                              )}
+                            </span>
                           </td>
                           {breakdownMode !== "day" && (
                             <td className="px-4 py-3">
@@ -1751,6 +1768,7 @@ function UsageDashboard() {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 </div>
               )}
 
