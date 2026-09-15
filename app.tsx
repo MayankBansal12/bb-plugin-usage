@@ -1263,6 +1263,17 @@ function UsageDashboard() {
 
   const days = useMemo(() => rangeDays(range), [range]);
 
+  // Hooks must run before the early returns below, so the donut memo lives
+  // here even though `breakdown` is only consumed after them.
+  const breakdownRows = breakdownMode === "model" ? modelBreakdown
+    : breakdownMode === "project" ? projectBreakdown
+    : dayBreakdown;
+  const breakdown = useMemo(
+    () => [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort)),
+    [breakdownRows, breakdownSort],
+  );
+  const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
+
   useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
   useEffect(() => {
@@ -1339,12 +1350,7 @@ function UsageDashboard() {
     sources: visibleSources,
     hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
-  const breakdownRows = breakdownMode === "model" ? modelBreakdown
-    : breakdownMode === "project" ? projectBreakdown
-    : dayBreakdown;
-  const breakdown = [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort));
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
-  const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
   const breakdownGroupLabel = breakdownMode === "model" ? "models" : breakdownMode === "project" ? "projects" : "days";
   const donutBesideTable = contentWidth >= 1060;
   const activeDays = new Set(rows.map((row) => row.day)).size;
