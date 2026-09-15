@@ -113,6 +113,32 @@ describe("proxy provider fallback", () => {
     expect(resolvePricing("openai", "gpt-5.6-sol-high")).toMatchObject({ modelProviderId: "openai", price: null, status: "unknown" });
   });
 
+  it("uses canonical prices when a supported route adds only a transport suffix", () => {
+    setPricingCatalog({
+      ...proxyFixture,
+      zai: catalogProvider({ "glm-5.3-flash": { input: 0.075, output: 0.25 } }, "Z.ai"),
+      moonshotai: catalogProvider({ "kimi-k3": { input: 3, output: 15 } }, "Moonshot AI"),
+      "ollama-cloud": { name: "Ollama Cloud", models: {
+        "deepseek-v4-flash:0731": { id: "deepseek-v4-flash:0731" },
+      } },
+      deepseek: catalogProvider({
+        "deepseek-v4-flash": { input: 0.14, output: 0.28 },
+      }, "DeepSeek"),
+    }, "test");
+
+    expect(resolvePricing("codebuddy", "glm-5.3-flash-ioa")).toMatchObject({ modelProviderId: "zai", modelProviderName: "Z.ai", status: "models-dev-alias", price: { input: 0.075, output: 0.25 } });
+    expect(resolvePricing("codebuddy", "kimi-k3-ioa")).toMatchObject({ modelProviderId: "moonshotai", modelProviderName: "Moonshot AI", status: "models-dev-alias", price: { input: 3, output: 15 } });
+    expect(resolvePricing("ollama-cloud", "deepseek-v4-flash:0731-cloud")).toMatchObject({ modelProviderId: "deepseek", status: "models-dev-alias", price: { input: 0.14, output: 0.28 } });
+  });
+
+  it("uses DeepSeek's published V4.1 rate while the live catalog catches up", () => {
+    setPricingCatalog({
+      "ollama-cloud": { name: "Ollama Cloud", models: { "deepseek-v4.1-flash": { id: "deepseek-v4.1-flash" } } },
+    }, "test");
+
+    expect(resolvePricing("ollama-cloud", "deepseek-v4.1-flash")).toMatchObject({ modelProviderId: "deepseek", modelProviderName: "DeepSeek", status: "models-dev-alias", price: { input: 0.15, cached: 0.003, output: 0.6 } });
+  });
+
   it("leaves models missing from the catalog unpriced", () => {
     setPricingCatalog(proxyFixture, "test");
     for (const model of ["swe-2-max", "codex-auto-review"]) {
