@@ -34,6 +34,12 @@ Deduplicate by response/message identity across content blocks, copied files, an
 cached rescans. Never add `turn-metrics.tokenDelta` on top of response usage.
 Unrecognized model names retain token counts with unknown cost.
 
+CodeBuddy's `-ioa` suffix identifies its internal route rather than a distinct
+model. When removing that suffix produces an unambiguous first-party catalog
+match, the dashboard attributes an estimated base-model cost to that provider.
+Models without such a match remain token-only; the collector does not invent a
+price for a private route.
+
 Standard roots are per-host home paths, not CLI installation paths. Use
 `extraUsageRoots` for relocated logs or provider-private environment overrides.
 The host also honors an absolute `CODEBUDDY_CONFIG_DIR` it can see.
