@@ -14,6 +14,7 @@ import { BreakdownDonut } from "@/components/breakdown-donut";
 import { paginateItems } from "@/lib/pagination";
 import { buildBreakdownDonut } from "@/lib/breakdown-donut";
 import { compareUsage, nextUsageSort, type MetricMode, type UsageSort } from "@/lib/usage-sort";
+import { cacheHitRateGroups, type CacheHitRateGroup } from "@/lib/cache-hit-rate";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
@@ -23,6 +24,7 @@ import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-cur
 type Range = 7 | 30 | 90;
 type BreakdownMode = "model" | "project" | "day";
 type DimensionMode = "agent" | "provider";
+type CacheHitRateMode = "agent" | "model";
 
 const BREAKDOWN_PAGE_SIZE = 10;
 const SHOW_USAGE_LIMITS_STORAGE_KEY = "bb-plugin-usage:show-usage-limits";
@@ -677,6 +679,42 @@ function ProviderShareRow({
   );
 }
 
+function CacheHitRateRow({ item }: { item: CacheHitRateGroup }) {
+  const ratePercent = item.rate === null ? null : item.rate * 100;
+  return (
+    <div className="px-4 py-3.5 sm:px-5">
+      <div className="flex items-center gap-3">
+        {item.model
+          ? <ProviderLogo id={modelLogoId(item.model)} size="md" />
+          : <ProviderLogo id={item.agentId} name={item.agentName} size="md" />}
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-sm font-medium" title={item.model ?? item.agentName}>{item.model ?? item.agentName}</div>
+          <div className="mt-0.5 truncate text-xs text-muted-foreground">
+            {item.model ? item.agentName : `${compact(item.cachedInputTokens)} cached of ${compact(item.totalInputTokens)} input tokens`}
+          </div>
+        </div>
+        <div
+          className="shrink-0 text-sm font-semibold tabular-nums"
+          title={item.rate === null ? "This agent does not report cache usage, or no input tokens were recorded." : "Token-weighted cached input share"}
+        >
+          {ratePercent === null ? "Unknown" : `${ratePercent.toFixed(1)}%`}
+        </div>
+      </div>
+      <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-muted">
+        <div
+          className="h-full rounded-full bg-amber-500 transition-[width] duration-500 ease-out motion-reduce:transition-none"
+          style={{ width: `${ratePercent ?? 0}%`, minWidth: ratePercent && ratePercent > 0 ? 3 : 0 }}
+        />
+      </div>
+      {item.model && (
+        <div className="mt-2 text-xs text-muted-foreground">
+          {item.rate === null ? "Cache usage unavailable" : `${compact(item.cachedInputTokens)} cached of ${compact(item.totalInputTokens)} input tokens`}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ChartLegend({ providers }: { providers: Array<{ id: string; name: string }> }) {
   if (providers.length === 0) return null;
   return (
@@ -1029,6 +1067,7 @@ function UsageDashboard() {
   const [chartMode, setChartMode] = useState<MetricMode>("tokens");
   const [breakdownSort, setBreakdownSort] = useState<UsageSort>({ metric: "tokens", direction: "descending" });
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
+  const [cacheHitRateMode, setCacheHitRateMode] = useState<CacheHitRateMode>("agent");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
   const [breakdownHover, setBreakdownHover] = useState<string | null>(null);
@@ -1268,6 +1307,7 @@ function UsageDashboard() {
     [breakdownRows, breakdownSort],
   );
   const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
+  const cacheHitRates = useMemo(() => cacheHitRateGroups(rows, cacheHitRateMode), [rows, cacheHitRateMode]);
 
   useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
@@ -1530,6 +1570,33 @@ function UsageDashboard() {
                     color={metric.color}
                   />
                 ))}
+              </div>
+            </section>
+
+            <section>
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                <div>
+                  <h2 className="text-sm font-semibold">Cache hit rate</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">Token-weighted cached input share; cache writes are excluded.</p>
+                </div>
+                <ToggleGroup
+                  value={cacheHitRateMode}
+                  onChange={setCacheHitRateMode}
+                  label="Cache hit rate grouping"
+                  options={[{ value: "agent", label: "Agent" }, { value: "model", label: "Model" }]}
+                />
+              </div>
+              <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                <div className="max-h-[480px] overflow-y-auto">
+                  {cacheHitRates.map((item, index) => (
+                    <div
+                      key={item.key}
+                      className={index > 0 ? "border-t border-border/60" : undefined}
+                    >
+                      <CacheHitRateRow item={item} />
+                    </div>
+                  ))}
+                </div>
               </div>
             </section>
             </>
