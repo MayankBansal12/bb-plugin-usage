@@ -7,10 +7,10 @@ import { hostJsonCollectorSource } from "./host-scripts.generated";
 // Agents collected by walking JSONL session logs. "devin" and "kilocode" are
 // excluded: their usage lives in SQLite databases handled by their own
 // collectors, and "opencode" is queried through the opencode CLI.
-export type HostJsonAgentId = Exclude<AgentId, "opencode" | "devin" | "kilocode">;
+export type HostJsonAgentId = Exclude<AgentId, "amp" | "opencode" | "devin" | "kilocode">;
 
 // Agents whose host scan emits the shared aggregate-row wire format.
-export type HostScanAgentId = Exclude<AgentId, "opencode">;
+export type HostScanAgentId = Exclude<AgentId, "amp" | "opencode">;
 
 export type HostJsonScanInput = {
   agentId: HostJsonAgentId;

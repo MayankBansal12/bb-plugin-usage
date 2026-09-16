@@ -39,6 +39,10 @@ const providerAliases: Record<string, string> = {
 // Published first-party rates bridge catalog lag and providers absent from
 // models.dev. A live catalog price still takes precedence.
 const builtinPrices: Record<string, { name?: string; models: Record<string, Price> }> = {
+  // Amp reports exact tokens, but its credits and linked-provider subscriptions
+  // are not API-equivalent USD. Keep its models unpriced and attributed to Amp
+  // instead of inferring first-party rates from model names.
+  amp: { name: "Amp", models: {} },
   deepseek: {
     name: "DeepSeek",
     // https://api-docs.deepseek.com/quick_start/pricing
