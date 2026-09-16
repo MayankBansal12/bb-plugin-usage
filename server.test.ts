@@ -38,6 +38,17 @@ function fakeHostScanOutput(agentId: string, rows: Array<Record<string, unknown>
   return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
 }
 
+function fakeAmpScanOutput(rows: Array<Record<string, unknown>>) {
+  const threadId = "T-01a0aa94-f1e7-7610-a400-f8054fe02ad5";
+  const scan = {
+    agentId: "amp", threadCount: 1, changedThreadCount: 1, reusedThreadCount: 0,
+    failureCount: 0, error: null,
+    threads: [{ threadId, updated: "2026-09-16T12:00:00Z", rows: rows.map((row) => ({ threadId, ...row })) }],
+  };
+  const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
+  return `__BB_AMP_USAGE_SCAN_BEGIN__\n${encoded}\n__BB_AMP_USAGE_SCAN_END__\n__BB_HOST_COMMAND_DONE__:0\n`;
+}
+
 // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
 // where the gzipped payload is the generated collector script with
 // agentId/roots baked in as a literal object — decode it the same way
@@ -59,6 +70,12 @@ function agentIdFromCommand(command: string): string | null {
   if (!inner) return null;
   const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
   return input.agentId ?? null;
+}
+
+function isAmpCommand(command: string) {
+  const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+  if (!outer) return false;
+  return gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8").includes("__BB_AMP_USAGE_SCAN_BEGIN__");
 }
 
 function hostFileWriteMock(stagedFiles: Map<string, string>) {
@@ -204,15 +221,10 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it.each(["antigravity", "codebuddy", "cursor", "copilot", "freebuff", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
-    // Regression test for the exact gap flagged in review on
-    // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
-    // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
-    // never called syncJsonAgent(..., "antigravity", ...), so no scan ever
-    // ran for it in production even though the unit tests (which call
-    // scan()/parseHostUsageAggregates directly) all passed. This drives the
-    // real, unmodified plugin factory end-to-end through its public sync()
-    // RPC and asserts a row actually lands in the database for Antigravity.
+  it.each(["amp", "antigravity", "codebuddy", "copilot", "cursor", "freebuff", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
+    // Drive the real plugin factory through its public sync RPC so registering
+    // a collector without wiring it into syncAll cannot pass on parser tests
+    // alone. Antigravity previously exposed exactly that production gap.
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
     const commandsByTerminalId = new Map<string, string>();
@@ -245,7 +257,13 @@ describe("sync RPC", () => {
           output: vi.fn(async (args: { terminalId: string }) => {
             const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
             const agentId = agentIdFromCommand(command);
-            const text = agentId === targetAgent
+            const text = isAmpCommand(command)
+              ? fakeAmpScanOutput(targetAgent === "amp" ? [{
+                day: new Date().toISOString().slice(0, 10), modelProviderId: "amp", model: "gpt-5.6-sol",
+                project: "bb-plugin-usage", loggedCostUsd: null, uncachedInputTokens: 13814,
+                cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 53,
+              }] : [])
+              : agentId === targetAgent
               ? fakeHostScanOutput(targetAgent, [{
                 day: new Date().toISOString().slice(0, 10),
                 modelProviderId: "google",

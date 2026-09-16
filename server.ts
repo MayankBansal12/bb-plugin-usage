@@ -4,9 +4,10 @@ import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
-  parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
+  parseAmpUsageAggregates, parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
   type AgentId, type UsageRecord,
 } from "./collectors";
+import { compressedAmpUsageCollectorScript, extractAmpUsageScan } from "./lib/amp-usage-collector";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
 import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
 import {
@@ -78,6 +79,7 @@ type Machine = { id: string; name: string };
 type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string; extraUsageRoots?: string };
 
 const AGENTS = [
+  { id: "amp", name: "Amp" },
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
   { id: "copilot", name: "GitHub Copilot" },
@@ -163,6 +165,7 @@ const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
+const AMP_SYNC_TIMEOUT_MS = 10 * 60_000;
 const DEVIN_SYNC_TIMEOUT_MS = 60_000;
 const KILOCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
@@ -495,6 +498,83 @@ export function jsonAgentCommand(input: Parameters<typeof compressedHostJsonColl
     "fi",
     `node -e ${shellQuote(script)}`,
   ].join("; ");
+}
+
+export function ampUsageCommand(home: string) {
+  const script = compressedAmpUsageCollectorScript({
+    cachePath: `${home}/.cache/bb-plugin-usage/amp-thread-scan-v1.json`,
+    sinceDay: historyStartDay(),
+  });
+  return [
+    "if ! command -v node >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to scan Amp usage.'; exit 127",
+    "fi",
+    "if ! command -v amp >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Amp CLI is required to collect Amp usage.'; exit 127",
+    "fi",
+    `node -e ${shellQuote(script)}`,
+  ].join("; ");
+}
+
+export async function syncAmp(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  home: string,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const agentId: AgentId = "amp";
+  const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const output = await executeHostCommand(bb, machine, ampUsageCommand(home), signal, {
+      title: "Usage: Amp scan",
+      timeoutMs: AMP_SYNC_TIMEOUT_MS,
+      home,
+    });
+    const scan = extractAmpUsageScan(output);
+    if (scan.agentId !== agentId) throw new Error(`Amp usage scan returned ${scan.agentId} data.`);
+
+    // A partial scan must not delete a thread whose export failed. Mark prior
+    // sources seen first; complete scans still reconcile threads no longer in
+    // the account or retention window.
+    if (scan.failureCount > 0) {
+      db.prepare("UPDATE usage_sources SET last_seen_generation=? WHERE machine_id=? AND provider_id=?")
+        .run(generation, machine.id, agentId);
+    }
+    for (const thread of scan.threads) {
+      const records = parseAmpUsageAggregates(thread.rows, {
+        machineId: machine.id,
+        machineName: machine.name,
+      });
+      const aggregateJson = JSON.stringify(thread.rows);
+      upsertSourceEvents(db, {
+        id: opaqueId(machine.id, agentId, thread.threadId),
+        rootReference: opaqueId("amp-thread", thread.threadId),
+        sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+        generation,
+      }, machine, agentId, records);
+    }
+    reconcileSources(db, machine.id, agentId, generation);
+
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const complete = scan.failureCount === 0;
+    const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
+    const error = complete ? null
+      : `${scan.failureCount} Amp thread problem${scan.failureCount === 1 ? "" : "s"} prevented a complete scan${scan.error ? `: ${scan.error}` : "."}`;
+    upsertState(db, machine.id, agentId, status, recordCount, error, complete);
+    bb.log.info(`${machine.name}/amp: ${recordCount} records from ${scan.threadCount} threads (${scan.changedThreadCount} changed, ${scan.reusedThreadCount} cached, ${status})`);
+  } catch (error) {
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const message = errorMessage(error);
+    if (message.includes("Amp CLI is required")) {
+      upsertState(db, machine.id, agentId, "skipped", recordCount, message, false);
+      bb.log.info(`${machine.name}/amp: skipped (no local Amp CLI)`);
+    } else {
+      upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+      bb.log.warn(`${machine.name}/amp: ${message}`);
+    }
+  }
 }
 
 async function syncJsonAgent(
@@ -1129,6 +1209,7 @@ export default async function plugin(bb: BbPluginApi) {
           continue;
         }
         await Promise.all([
+          syncAmp(bb, db, machine, home, timeoutSignal(AMP_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "copilot", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
