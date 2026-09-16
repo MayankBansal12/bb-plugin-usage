@@ -78,7 +78,7 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
   type ThreadResult = { threadId: string; updated: string; rows: AmpUsageAggregate[] };
   type Cache = { version: number; threads: Record<string, ThreadResult> };
   const failures: string[] = [];
-  const cacheVersion = 1;
+  const cacheVersion = 2;
   let cache: Cache = { version: cacheVersion, threads: {} };
   try {
     const parsed = JSON.parse(await fs.promises.readFile(input.cachePath, "utf8")) as Cache;
@@ -102,11 +102,11 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
     return Number.isFinite(numeric) && numeric >= 0 ? Math.round(numeric) : 0;
   }
 
-  function localDay(value: unknown) {
+  function utcDay(value: unknown) {
     if (typeof value !== "string") return null;
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return null;
-    return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    return date.toISOString().slice(0, 10);
   }
 
   function projectName(value: unknown) {
@@ -148,12 +148,13 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
         throw new Error("unexpected export shape");
       }
       const initial = object(object(exported.env)?.initial);
-      const project = projectName(initial?.workingDirectory);
+      const firstTree = Array.isArray(initial?.trees) ? object(initial.trees[0]) : null;
+      const project = projectName(firstTree?.displayName ?? firstTree?.uri ?? initial?.workingDirectory);
       const aggregates = new Map<string, AmpUsageAggregate>();
       for (const rawMessage of exported.messages) {
         const message = object(rawMessage);
         const usage = object(message?.usage);
-        const day = localDay(usage?.timestamp);
+        const day = utcDay(usage?.timestamp);
         const model = typeof usage?.model === "string" && usage.model.trim() ? usage.model.trim().slice(0, 160) : "";
         if (!usage || !day || day < input.sinceDay || !model) continue;
         const uncached = count(usage.inputTokens);

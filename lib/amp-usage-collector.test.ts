@@ -15,10 +15,10 @@ async function temporaryDirectory() {
   return directory;
 }
 
-async function runScan(directory: string, cachePath: string) {
+async function runScan(directory: string, cachePath: string, timezone?: string) {
   const script = compressedAmpUsageCollectorScript({ cachePath, sinceDay: "2026-09-01" });
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], {
-    env: { ...process.env, PATH: `${join(directory, "bin")}:${process.env.PATH}` },
+    env: { ...process.env, PATH: `${join(directory, "bin")}:${process.env.PATH}`, ...(timezone ? { TZ: timezone } : {}) },
     maxBuffer: 2 * 1024 * 1024,
   });
   return extractAmpUsageScan(stdout.replace(/\n/g, "\r\n"));
@@ -50,11 +50,11 @@ describe("Amp usage collector", () => {
     const threadId = "T-01a0aa94-f1e7-7610-a400-f8054fe02ad5";
     await fakeAmp(directory, [{ id: threadId, updated: "2026-09-16T12:00:00Z" }], {
       id: threadId,
-      env: { initial: { workingDirectory: "file:///home/alice/code/private-project" } },
+      env: { initial: { trees: [{ uri: "file:///home/alice/code/private-project", displayName: "private-project" }] } },
       messages: [
         { messageId: 1, role: "user", content: "secret prompt" },
         { messageId: 2, role: "assistant", content: "secret response", usage: {
-          model: "gpt-5.6-sol", timestamp: "2026-09-16T12:00:01Z", inputTokens: 40,
+          model: "gpt-5.6-sol", timestamp: "2026-09-16T00:00:01Z", inputTokens: 40,
           cacheReadInputTokens: 60, cacheCreationInputTokens: 5, outputTokens: 20,
         } },
         { messageId: 4, role: "assistant", usage: {
@@ -67,7 +67,7 @@ describe("Amp usage collector", () => {
       ],
     });
 
-    const first = await runScan(directory, cachePath);
+    const first = await runScan(directory, cachePath, "America/Los_Angeles");
     expect(first).toMatchObject({ threadCount: 1, changedThreadCount: 1, reusedThreadCount: 0, failureCount: 0 });
     expect(first.threads[0]?.rows).toEqual([{
       threadId,
@@ -87,7 +87,7 @@ describe("Amp usage collector", () => {
     expect(cache).not.toContain("secret response");
     expect(cache).not.toContain("/home/alice");
 
-    const second = await runScan(directory, cachePath);
+    const second = await runScan(directory, cachePath, "Pacific/Auckland");
     expect(second).toMatchObject({ changedThreadCount: 0, reusedThreadCount: 1, failureCount: 0 });
     expect(second.threads).toEqual(first.threads);
   });
