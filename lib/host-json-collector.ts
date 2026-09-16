@@ -83,7 +83,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // v6 (dsh): replace repeated attempt samples and reject missing fork cuts.
   // v6 (codex): retain hashed session/bucket identities across archive moves and copies.
   // v6 (copilot): add session summaries.
-  const cacheVersion = input.agentId === "dsh" || input.agentId === "codex" || input.agentId === "copilot" ? 6 : 5;
+  // All agents share this version so existing caches migrate consistently.
+  const cacheVersion = 6;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "copilot", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -657,7 +658,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         ])).digest("hex"),
       }));
     }
-    return input.agentId === "claude" || input.agentId === "codebuddy" || input.agentId === "cursor"
+    return input.agentId === "claude" || input.agentId === "codebuddy" || input.agentId === "cursor" || input.agentId === "copilot"
       ? [...events.values(), ...rows.values()]
       : [...rows.values()];
   }
