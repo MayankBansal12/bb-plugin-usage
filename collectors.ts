@@ -1,9 +1,10 @@
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
+import type { AmpUsageAggregate } from "./lib/amp-usage-collector";
 
 // `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
 // lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
 // in grouping and filters instead of merging into "codex".
-export type AgentId = "codex" | "claude" | "codebuddy" | "copilot" | "cursor" | "devin" | "dsh" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
+export type AgentId = "amp" | "codex" | "claude" | "codebuddy" | "copilot" | "cursor" | "devin" | "dsh" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
 
 export type UsageRecord = {
   eventKey: string;
@@ -316,7 +317,7 @@ export function parseOpenCode(content: string, context: ParseContext): UsageReco
   });
 }
 
-export function parseHostUsageAggregates(content: string, agentId: Exclude<AgentId, "opencode">, context: ParseContext): UsageRecord[] {
+export function parseHostUsageAggregates(content: string, agentId: Exclude<AgentId, "amp" | "opencode">, context: ParseContext): UsageRecord[] {
   let values: unknown;
   try {
     values = JSON.parse(content.trim() || "[]");
@@ -373,4 +374,26 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       outputTokens: count(row.outputTokens),
     }, context)];
   });
+}
+
+export function parseAmpUsageAggregates(rows: AmpUsageAggregate[], context: ParseContext): UsageRecord[] {
+  return rows.map((row) => usageRecord({
+    // Amp account data can be visible from several enrolled machines. The
+    // machine-independent key lets usage_event_sources map those copies to one
+    // canonical event instead of multiplying account usage by host count.
+    eventKey: `amp:${row.threadId}:${row.day}:${encodeURIComponent(row.model)}:${encodeURIComponent(row.project)}`,
+    timestamp: `${row.day}T00:00:00Z`,
+    day: row.day,
+    agentId: "amp",
+    agentName: "Amp",
+    modelProviderId: "amp",
+    model: row.model,
+    project: row.project,
+    loggedCostUsd: null,
+    costMode: "logged-only",
+    uncachedInputTokens: row.uncachedInputTokens,
+    cachedInputTokens: row.cachedInputTokens,
+    cacheWriteTokens: row.cacheWriteTokens,
+    outputTokens: row.outputTokens,
+  }, context));
 }

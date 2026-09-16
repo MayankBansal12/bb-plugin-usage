@@ -6,10 +6,10 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, CodeBuddy, GitHub Copilot, Cursor Agent (opt-in token hook), DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
+- Collect usage from Amp, Codex, Claude Code, CodeBuddy, GitHub Copilot, Cursor Agent (opt-in token hook), DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
 - Separate the coding agent from the underlying model provider.
 - Group charts and usage shares by agent or model provider.
-- Switch the chart and provider shares between cost and tokens.
+- Switch the chart, provider shares, and breakdown between cost and tokens, so unpriced usage stays visible.
 - Sort breakdowns by tokens or cost using column headers, with each metric’s share shown beneath its value. Unknown costs stay visible without a misleading percentage.
 - Break usage down by model, project, or day.
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
@@ -21,6 +21,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Supported data sources
 
+- Amp: account threads discovered with `amp threads list --include-archived --json` and reduced from `amp threads export` on each host. Requires an installed, signed-in Amp CLI. Exact per-message input, cache-read, cache-creation, and output tokens are aggregated locally; thread content never leaves the host process. A metadata-only cache avoids exporting unchanged threads. Account/thread identities deduplicate the same usage when the account is available on several enrolled machines. Amp credits and linked-provider subscriptions are not API-equivalent USD, so Amp cost remains unknown.
 - Codex: `rollout-*.jsonl` files recursively under both `sessions/` and `archived_sessions/` in `~/.codex` and each `~/.codex-profiles/<name>` home; each profile reports as its own agent, `Codex (<name>)`. Additional homes can be configured in plugin settings.
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - CodeBuddy: `~/.codebuddy/projects/**/*.jsonl`. Also honors `CODEBUDDY_CONFIG_DIR` when available in the host scan environment. Counts assistant/API response usage, including tool-call responses; copied messages are deduplicated. Turn summaries, credits, and tool results are not counted.
@@ -38,7 +39,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - OpenCode Go limits: plan windows from `https://opencode.ai/zen/go/v1/usage`, authenticated with the `opencode-go` credential in `~/.local/share/opencode/auth.json` on each machine
 - Account Pooler limits: non-secret account summaries from the enabled BB `account-pool` plugin’s `account.list` RPC, including Codex limit windows and Claude five-hour, weekly, and model-family limits. API key accounts show that subscription limits are unavailable. This adds quota cards, not per-account token or cost attribution. Pool refresh failures retain the last successful snapshot with a warning; an absent or disabled pool plugin needs no configuration.
 
-JSON-log collection requires Node.js on each enrolled machine. Logs are streamed and reduced to usage metadata on that machine, so large histories are not transferred through BB's file API. A metadata-only per-file cache in `~/.cache/bb-plugin-usage/json-log-scan-v1/` makes later syncs reparse only changed files. The initial 365-day scan can take longer on machines with large histories.
+Host-side collection requires Node.js on each enrolled machine. Logs and Amp thread exports are reduced to usage metadata on that machine, so large histories and conversation content are not transferred through BB's file API. Metadata-only caches under `~/.cache/bb-plugin-usage/` make later syncs reparse only changed files or threads. The initial 365-day scan can take longer on machines with large histories.
 
 For a custom `CODEX_HOME` outside the default locations, add the home directory to **Extra Codex homes** (`codexHomes`) in the plugin settings. Separate paths with semicolons or newlines; `~` expands to each enrolled machine's home. Both active and archived sessions are scanned, and these extra homes report under Codex. Copies of the same session within an account are counted once. The first sync after upgrading reparses Codex logs to populate session identities in the metadata cache; later syncs reuse unchanged files.
 
