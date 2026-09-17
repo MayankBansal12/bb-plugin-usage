@@ -4,8 +4,8 @@ import { cacheHitRateGroups, reportsCacheUsage } from "./cache-hit-rate";
 describe("cache hit rate groups", () => {
   it("calculates a token-weighted agent rate instead of averaging row percentages", () => {
     const groups = cacheHitRateGroups([
-      { agentId: "amp", agentName: "Amp", model: "large", cachedInputTokens: 90, uncachedInputTokens: 10 },
-      { agentId: "amp", agentName: "Amp", model: "small", cachedInputTokens: 0, uncachedInputTokens: 10 },
+      { agentId: "amp", agentName: "Amp", model: "large", cachedInputTokens: 90, cacheWriteTokens: 5, uncachedInputTokens: 5 },
+      { agentId: "amp", agentName: "Amp", model: "small", cachedInputTokens: 0, cacheWriteTokens: 5, uncachedInputTokens: 5 },
     ], "agent");
 
     expect(groups).toEqual([expect.objectContaining({
@@ -18,8 +18,8 @@ describe("cache hit rate groups", () => {
 
   it("keeps the same model separate when it is used by different agents", () => {
     const groups = cacheHitRateGroups([
-      { agentId: "amp", agentName: "Amp", model: "gpt", cachedInputTokens: 60, uncachedInputTokens: 40 },
-      { agentId: "codex", agentName: "Codex", model: "gpt", cachedInputTokens: 10, uncachedInputTokens: 90 },
+      { agentId: "amp", agentName: "Amp", model: "gpt", cachedInputTokens: 60, cacheWriteTokens: 10, uncachedInputTokens: 30 },
+      { agentId: "codex", agentName: "Codex", model: "gpt", cachedInputTokens: 10, cacheWriteTokens: 0, uncachedInputTokens: 90 },
     ], "model");
 
     expect(groups.map((group) => [group.agentId, group.model, group.rate])).toEqual([
@@ -30,8 +30,8 @@ describe("cache hit rate groups", () => {
 
   it("reports unknown for unsupported agents and rows without input", () => {
     const groups = cacheHitRateGroups([
-      { agentId: "future", agentName: "Future", model: "model", cachedInputTokens: 5, uncachedInputTokens: 5 },
-      { agentId: "amp", agentName: "Amp", model: "output-only", cachedInputTokens: 0, uncachedInputTokens: 0 },
+      { agentId: "future", agentName: "Future", model: "model", cachedInputTokens: 5, cacheWriteTokens: 0, uncachedInputTokens: 5 },
+      { agentId: "amp", agentName: "Amp", model: "output-only", cachedInputTokens: 0, cacheWriteTokens: 0, uncachedInputTokens: 0 },
     ], "agent");
 
     expect(groups.every((group) => group.rate === null)).toBe(true);
