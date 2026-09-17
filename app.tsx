@@ -11,6 +11,7 @@ import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { ProviderLimitsSkeleton, UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
 import { paginateItems } from "@/lib/pagination";
+import { compareUsage, nextUsageSort, type MetricMode, type UsageSort } from "@/lib/usage-sort";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
@@ -18,7 +19,6 @@ import { clampPercent, formatLimitReset, formatLimitValue, isLimitVisibleOnMachi
 import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
 
 type Range = 7 | 30 | 90;
-type ChartMode = "cost" | "tokens";
 type BreakdownMode = "model" | "project" | "day";
 type DimensionMode = "agent" | "provider";
 
@@ -173,6 +173,61 @@ function CostValue({ value, className }: { value: number; className?: string }) 
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
+  );
+}
+
+// A row whose priced cost is zero but has unpriced usage shows "Unknown"; a
+// partially priced row gets a "+" marker since its share understates usage.
+function PricedCost({ cost, unknown }: { cost: number; unknown?: boolean }) {
+  return (
+    <span title={unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>
+      {unknown && cost === 0 ? "Unknown" : <><CostValue value={cost} />{unknown ? "+" : ""}</>}
+    </span>
+  );
+}
+
+function UsageSortButton({ metric, sort, onSort }: {
+  metric: MetricMode;
+  sort: UsageSort;
+  onSort: (metric: MetricMode) => void;
+}) {
+  const active = sort.metric === metric;
+  const next = nextUsageSort(sort, metric);
+  return (
+    <button
+      type="button"
+      onClick={() => onSort(metric)}
+      aria-label={`Sort by ${metric}, ${next.direction}`}
+      title={`Sort ${next.direction === "descending" ? "highest" : "lowest"} first`}
+      className={`inline-flex min-h-8 items-center justify-end gap-1.5 rounded px-1 text-xs font-medium outline-none transition-colors duration-150 hover:bg-muted/50 hover:text-foreground focus-visible:ring-1 focus-visible:ring-ring active:scale-[0.97] [@media(pointer:coarse)]:min-h-11 ${active ? "text-foreground" : "text-muted-foreground"}`}
+    >
+      {metric === "tokens" ? "Tokens" : "Cost"}
+      <Icon name={active ? sort.direction === "descending" ? "ArrowDown" : "ArrowUp" : "ArrowUpDown"} className="size-3.5" aria-hidden="true" />
+      {active && <span className="sr-only">Sorted {sort.direction}</span>}
+    </button>
+  );
+}
+
+function BreakdownValue({ metric, row, totals }: {
+  metric: MetricMode;
+  row: { cost: number; tokens: number; unknown?: boolean };
+  totals: { cost: number; processed: number; unknownTokens: number };
+}) {
+  const unknownCost = row.unknown && row.cost === 0;
+  return (
+    <div className="whitespace-nowrap tabular-nums">
+      <div className="text-sm font-medium">
+        {metric === "tokens" ? compact(row.tokens) : <PricedCost cost={row.cost} unknown={row.unknown} />}
+      </div>
+      {(metric === "tokens" || !unknownCost) && (
+        <div
+          className="mt-0.5 text-[11px] font-normal text-muted-foreground"
+          title={metric === "cost" && totals.unknownTokens > 0 ? "Share of priced cost; usage with unknown pricing is excluded." : undefined}
+        >
+          {metric === "tokens" ? `${percentage(row.tokens, totals.processed)} of tokens` : `${percentage(row.cost, totals.cost)} of cost`}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -351,7 +406,7 @@ function UsageChart({
   records: UsageRecord[];
   providers: Array<{ id: string; name: string }>;
   range: Range;
-  mode: ChartMode;
+  mode: MetricMode;
   groupBy: DimensionMode;
   compactView?: boolean;
 }) {
@@ -578,14 +633,17 @@ function UsageChart({
   );
 }
 
-function ProviderCostRow({
+function ProviderShareRow({
   item,
+  mode,
   total,
 }: {
-  item: { id: string; name: string; cost: number; tokens: number };
+  item: { id: string; name: string; cost: number; tokens: number; unknown?: boolean };
+  mode: MetricMode;
   total: number;
 }) {
-  const share = total > 0 ? (item.cost / total) * 100 : 0;
+  const value = mode === "cost" ? item.cost : item.tokens;
+  const share = total > 0 ? (value / total) * 100 : 0;
   return (
     <div className="min-w-0">
       <div className="flex items-center justify-between gap-4 text-sm">
@@ -593,19 +651,29 @@ function ProviderCostRow({
           <ProviderLogo id={item.id} name={item.name} size="md" />
           <span className="truncate">{item.name}</span>
         </span>
-        <span className="shrink-0 tabular-nums"><CostValue value={item.cost} /></span>
+        <span className="shrink-0 tabular-nums">
+          {mode === "cost"
+            ? <PricedCost cost={item.cost} unknown={item.unknown} />
+            : <>{compact(item.tokens)}<span className="font-normal text-muted-foreground"> tokens</span></>}
+        </span>
       </div>
       <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-muted">
         <div
           className="h-full rounded-full transition-[width] duration-500 ease-out motion-reduce:transition-none"
           style={{
             width: `${share}%`,
-            minWidth: item.cost > 0 ? 3 : 0,
+            minWidth: value > 0 ? 3 : 0,
             backgroundColor: providerColor(item.id),
           }}
         />
       </div>
-      <div className="mt-2 text-xs text-muted-foreground">{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</div>
+      <div className="mt-2 text-xs text-muted-foreground">
+        {mode === "cost"
+          ? <>{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</>
+          : item.unknown && item.cost === 0
+            ? <>{percentage(item.tokens, total)} of tokens · <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">cost unknown</span></>
+            : <>{percentage(item.tokens, total)} of tokens · <PricedCost cost={item.cost} unknown={item.unknown} /></>}
+      </div>
     </div>
   );
 }
@@ -629,16 +697,18 @@ function ChartLegend({ providers }: { providers: Array<{ id: string; name: strin
 
 const CARD_CLASSES = "rounded-xl border border-border/70 bg-muted/[0.08]";
 
-// A project row names its highest-cost agent and folds the rest into `+N`,
-// which lists them with their own cost on hover or focus.
+// A project row names its dominant agent by the active metric and folds the
+// rest into `+N`, which lists them with their own value on hover or focus.
 function AgentCell({
   agentId,
   agent,
   others,
+  mode,
 }: {
   agentId: string;
   agent: string;
-  others?: Array<{ id: string; name: string; cost: number }>;
+  others?: Array<{ id: string; name: string; cost: number; tokens: number; unknown?: boolean }>;
+  mode: MetricMode;
 }) {
   return (
     <span className="inline-flex min-w-0 items-center gap-2 text-muted-foreground">
@@ -665,7 +735,7 @@ function AgentCell({
                       <ProviderLogo id={item.id} name={item.name} size="sm" />
                       <span className="truncate">{item.name}</span>
                     </span>
-                    <span className="shrink-0 tabular-nums">{money(item.cost)}</span>
+                    <span className="shrink-0 tabular-nums">{mode === "cost" ? <PricedCost cost={item.cost} unknown={item.unknown} /> : `${compact(item.tokens)} tokens`}</span>
                   </div>
                 ))}
               </div>
@@ -673,14 +743,6 @@ function AgentCell({
           </Tooltip>
         </TooltipProvider>
       )}
-    </span>
-  );
-}
-
-function RowBadge({ children }: { children: ReactNode }) {
-  return (
-    <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-border/50 bg-muted/40 px-1.5 py-1 text-[11px] leading-none text-muted-foreground">
-      {children}
     </span>
   );
 }
@@ -965,7 +1027,8 @@ function UsageDashboard() {
   const providerLimitsRequestId = useRef(0);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
-  const [chartMode, setChartMode] = useState<ChartMode>("tokens");
+  const [chartMode, setChartMode] = useState<MetricMode>("tokens");
+  const [breakdownSort, setBreakdownSort] = useState<UsageSort>({ metric: "tokens", direction: "descending" });
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
@@ -1116,7 +1179,22 @@ function UsageDashboard() {
     cost: number; tokens: number; unknown?: boolean;
     // Only project rows fold several agents into one badge; the folded ones are
     // listed here so the `+N` suffix can name them on hover.
-    otherAgents?: Array<{ id: string; name: string; cost: number }>;
+    otherAgents?: Array<{ id: string; name: string; cost: number; tokens: number; unknown?: boolean }>;
+  };
+  // Chart share rows follow the chart metric; table sorting is independent.
+  const byChartMetric = useCallback(
+    (a: { cost: number; tokens: number }, b: { cost: number; tokens: number }) =>
+      chartMode === "cost" ? b.cost - a.cost || b.tokens - a.tokens : b.tokens - a.tokens || b.cost - a.cost,
+    [chartMode],
+  );
+  const byBreakdownMetric = useCallback(
+    (a: { cost: number; tokens: number; unknown?: boolean }, b: { cost: number; tokens: number; unknown?: boolean }) =>
+      compareUsage(a, b, { metric: breakdownSort.metric, direction: "descending" }),
+    [breakdownSort.metric],
+  );
+  const sortBreakdown = (metric: MetricMode) => {
+    setBreakdownSort((current) => nextUsageSort(current, metric));
+    setBreakdownPage(1);
   };
   const modelBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
@@ -1128,31 +1206,34 @@ function UsageDashboard() {
       current.tokens += row.processedTokens;
       map.set(key, current);
     }
-    return [...map.values()].sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
+    return [...map.values()];
   }, [rows]);
 
   // Projects can be worked on from several agents and providers, so a row keeps
-  // the dominant one by cost for its badge instead of claiming a single owner.
+  // the dominant one by the active metric for its badge instead of claiming a
+  // single owner.
   const projectBreakdown = useMemo(() => {
-    const map = new Map<string, BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> }>();
+    const map = new Map<string, BreakdownRow & { byAgent: Map<string, { name: string; cost: number; tokens: number; unknown?: boolean }> }>();
     for (const row of rows) {
-      const current: BreakdownRow & { byAgent: Map<string, { name: string; cost: number }> } = map.get(row.project) ?? {
+      const current: BreakdownRow & { byAgent: Map<string, { name: string; cost: number; tokens: number; unknown?: boolean }> } = map.get(row.project) ?? {
         key: row.project, label: row.project, agent: row.agentName, agentId: row.agentId,
         provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0,
-        byAgent: new Map<string, { name: string; cost: number }>(),
+        byAgent: new Map<string, { name: string; cost: number; tokens: number; unknown?: boolean }>(),
       };
       current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
-      const agent = current.byAgent.get(row.agentId) ?? { name: row.agentName, cost: 0 };
+      const agent = current.byAgent.get(row.agentId) ?? { name: row.agentName, cost: 0, tokens: 0, unknown: false };
       agent.cost += row.costUsd;
+      agent.tokens += row.processedTokens;
+      agent.unknown = agent.unknown || row.pricingStatus === "unknown";
       current.byAgent.set(row.agentId, agent);
       map.set(row.project, current);
     }
     return [...map.values()].map((item) => {
       const ranked = [...item.byAgent.entries()]
-        .map(([id, value]) => ({ id, name: value.name, cost: value.cost }))
-        .sort((a, b) => b.cost - a.cost);
+        .map(([id, value]) => ({ id, ...value }))
+        .sort(byBreakdownMetric);
       const [dominant, ...others] = ranked;
       return {
         ...item,
@@ -1160,8 +1241,8 @@ function UsageDashboard() {
         agent: dominant?.name ?? item.agent,
         otherAgents: others,
       };
-    }).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
-  }, [rows]);
+    });
+  }, [rows, byBreakdownMetric]);
 
   const dayBreakdown = useMemo(() => {
     const map = new Map<string, BreakdownRow>();
@@ -1221,14 +1302,20 @@ function UsageDashboard() {
   const activeModelProviders = data.modelProviders.filter((item) => usedProviderIds.has(item.id));
   const activeProviders = chartGroup === "agent" ? activeAgents : activeModelProviders;
   // A single dimension control (next to the chart) drives both the chart and
-  // the cost rows so the agent/provider tabs never repeat.
-  const costDimension = chartGroup;
-  const costDimensions = costDimension === "agent" ? activeAgents : activeModelProviders;
-  const providerTotals = costDimensions.map((item) => ({
-    ...item,
-    cost: rows.filter((row) => (costDimension === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.costUsd, 0),
-    tokens: rows.filter((row) => (costDimension === "agent" ? row.agentId : row.modelProviderId) === item.id).reduce((sum, row) => sum + row.processedTokens, 0),
-  })).sort((a, b) => b.cost - a.cost || b.tokens - a.tokens);
+  // the share rows so the agent/provider tabs never repeat; the shared
+  // cost/tokens metric sets their sort order and primary value the same way.
+  const shareDimension = chartGroup;
+  const shareDimensions = shareDimension === "agent" ? activeAgents : activeModelProviders;
+  const providerTotals = shareDimensions.map((item) => {
+    const dimensionRows = rows.filter((row) => (shareDimension === "agent" ? row.agentId : row.modelProviderId) === item.id);
+    return {
+      ...item,
+      cost: dimensionRows.reduce((sum, row) => sum + row.costUsd, 0),
+      tokens: dimensionRows.reduce((sum, row) => sum + row.processedTokens, 0),
+      unknown: dimensionRows.some((row) => row.pricingStatus === "unknown"),
+    };
+  }).sort(byChartMetric);
+  const metricTotal = chartMode === "cost" ? totals.cost : totals.processed;
   const visibleMachines = data.machines.filter((item) => machine === "all" || item.id === machine);
   const visibleSources = data.sources.filter((source) => machine === "all" || source.machineId === machine);
   const sourceIssueMessage = getSourceIssueMessage(visibleMachines, visibleSources);
@@ -1247,9 +1334,10 @@ function UsageDashboard() {
     sources: visibleSources,
     hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
-  const breakdown = breakdownMode === "model" ? modelBreakdown
+  const breakdownRows = breakdownMode === "model" ? modelBreakdown
     : breakdownMode === "project" ? projectBreakdown
     : dayBreakdown;
+  const breakdown = [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort));
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const activeDays = new Set(rows.map((row) => row.day)).size;
   const visibleProviderLimits = providerLimits.filter((limit) => isLimitVisibleOnMachine(limit, machine));
@@ -1352,7 +1440,7 @@ function UsageDashboard() {
                 {!stackedView && (
                   <div className="mt-7 min-h-0 flex-1 space-y-6 overflow-y-auto pr-3">
                     {providerTotals.map((item) => (
-                      <ProviderCostRow key={item.id} item={item} total={totals.cost} />
+                      <ProviderShareRow key={item.id} item={item} mode={chartMode} total={metricTotal} />
                     ))}
                   </div>
                 )}
@@ -1413,7 +1501,7 @@ function UsageDashboard() {
                   <div className={`overflow-hidden ${CARD_CLASSES}`}>
                     {providerTotals.map((item) => (
                       <div key={item.id} className="border-t border-border/60 px-4 py-3.5 first:border-t-0">
-                        <ProviderCostRow item={item} total={totals.cost} />
+                        <ProviderShareRow item={item} mode={chartMode} total={metricTotal} />
                       </div>
                     ))}
                   </div>
@@ -1440,7 +1528,7 @@ function UsageDashboard() {
 
             {(!stackedView || mobileSection === "breakdown") && (
             <section>
-              <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
                 <h2 className="text-sm font-semibold">Breakdown</h2>
                 <ToggleGroup
                   value={breakdownMode}
@@ -1452,55 +1540,49 @@ function UsageDashboard() {
 
               {compactView ? (
                 <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                  <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
+                    <span>Sort by</span>
+                    <div className="flex items-center gap-3" role="group" aria-label="Breakdown sorting">
+                      <UsageSortButton metric="tokens" sort={breakdownSort} onSort={sortBreakdown} />
+                      <UsageSortButton metric="cost" sort={breakdownSort} onSort={sortBreakdown} />
+                    </div>
+                  </div>
                   {paginatedBreakdown.items.map((row) => (
-                    <div key={row.key} className="border-t border-border/60 px-3.5 py-3 first:border-t-0">
-                      <div className="flex items-baseline justify-between gap-3">
-                        <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
-                          {breakdownMode === "model" && (
-                            <ProviderLogo id={modelLogoId(row.label)} size="sm" />
-                          )}
-                          <span className="truncate">{row.label}</span>
-                        </span>
-                        <span className="shrink-0 text-sm font-medium tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></span>
+                    <div key={row.key} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
+                      <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                        {breakdownMode === "model" && <ProviderLogo id={modelLogoId(row.label)} size="sm" />}
+                        <span className="truncate" title={row.label}>{row.label}</span>
                       </div>
-                      <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
-                        {breakdownMode !== "day" && (
-                          <RowBadge>
-                            <ProviderLogo id={row.agentId} name={row.agent} size="sm" />
-                            <span className="max-w-[110px] truncate">{row.agent}</span>
-                            {row.otherAgents && row.otherAgents.length > 0 && (
-                              <span
-                                className="shrink-0 tabular-nums text-foreground/70"
-                                title={row.otherAgents.map((item) => `${item.name} ${money(item.cost)}`).join(" · ")}
-                              >
-                                +{row.otherAgents.length}
-                              </span>
-                            )}
-                          </RowBadge>
-                        )}
-                        <RowBadge>
-                          <span className="tabular-nums text-foreground/80">{compact(row.tokens)}</span>
-                          <span>tokens</span>
-                        </RowBadge>
-                        <span className="ml-auto shrink-0 text-[11px] tabular-nums text-muted-foreground">{row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`}</span>
+                      {breakdownMode !== "day" && (
+                        <div className="mt-1.5 text-xs">
+                          <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
+                        </div>
+                      )}
+                      <div className="mt-3 grid grid-cols-2 gap-4">
+                        <BreakdownValue metric="tokens" row={row} totals={totals} />
+                        <div className="text-right">
+                          <BreakdownValue metric="cost" row={row} totals={totals} />
+                        </div>
                       </div>
                     </div>
                   ))}
                 </div>
               ) : (
                 <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
-                  <table className="w-full border-collapse text-sm" style={{ minWidth: breakdownMode === "day" ? 520 : 640 }}>
+                  <table className="w-full border-collapse text-sm" aria-label="Usage breakdown" style={{ minWidth: breakdownMode === "day" ? 440 : 600 }}>
                     <thead>
                       <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
-                        <th className="px-4 py-2.5 text-left font-medium">
+                        <th scope="col" className="px-4 py-2.5 text-left font-medium">
                           {breakdownMode === "model" ? "Model" : breakdownMode === "project" ? "Project" : "Day"}
                         </th>
                         {breakdownMode !== "day" && (
-                          <th className="px-4 py-2.5 text-left font-medium">Agent</th>
+                          <th scope="col" className="px-4 py-2.5 text-left font-medium">Agent</th>
                         )}
-                        <th className="px-4 py-2.5 text-right font-medium">Cost</th>
-                        <th className="px-4 py-2.5 text-right font-medium">Share</th>
-                        <th className="px-4 py-2.5 text-right font-medium">Tokens</th>
+                        {(["tokens", "cost"] as const).map((metric) => (
+                          <th key={metric} scope="col" aria-sort={breakdownSort.metric === metric ? breakdownSort.direction : undefined} className="px-3 py-1 text-right font-medium">
+                            <UsageSortButton metric={metric} sort={breakdownSort} onSort={sortBreakdown} />
+                          </th>
+                        ))}
                       </tr>
                     </thead>
                     <tbody>
@@ -1518,18 +1600,21 @@ function UsageDashboard() {
                           </td>
                           {breakdownMode !== "day" && (
                             <td className="px-4 py-3">
-                              <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} />
+                              <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
                             </td>
                           )}
-                          <td className="px-4 py-3 text-right tabular-nums"><span title={row.unknown ? "Some usage has no recorded cost or known catalog rate; totals exclude that usage." : undefined}>{row.unknown && row.cost === 0 ? "Unknown" : <><CostValue value={row.cost} />{row.unknown ? "+" : ""}</>}</span></td>
-                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{row.unknown && row.cost === 0 ? "—" : `${row.unknown ? "+" : ""}${percentage(row.cost, totals.cost)}`}</td>
-                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(row.tokens)}</td>
+                          <td className="px-4 py-3 align-top text-right">
+                            <BreakdownValue metric="tokens" row={row} totals={totals} />
+                          </td>
+                          <td className="px-4 py-3 align-top text-right">
+                            <BreakdownValue metric="cost" row={row} totals={totals} />
+                          </td>
                         </tr>
                       ))}
                     </tbody>
-                   </table>
-                 </div>
-               )}
+                  </table>
+                </div>
+              )}
 
                {breakdown.length > BREAKDOWN_PAGE_SIZE && (
                  <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs tabular-nums text-muted-foreground sm:justify-end">

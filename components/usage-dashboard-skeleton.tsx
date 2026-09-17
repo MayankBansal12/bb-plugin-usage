@@ -1,4 +1,5 @@
 import { useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { Icon } from "@/components/ui/icon";
 import { ToggleGroupPreview } from "@/components/ui/toggle-group";
 
 // The theme exposes its colors as complete color-mix() values rather than HSL
@@ -331,9 +332,9 @@ export function UsageDashboardSkeleton() {
           </div>
         </section>
 
-        {/* breakdown: real heading, real toggle, real column headers */}
+        {/* Match the fixed metric columns and default token sort. */}
         <section>
-          <div className="flex items-center justify-between gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
             <Label className="text-sm font-semibold">Breakdown</Label>
             <ToggleGroupPreview
               value="model"
@@ -346,65 +347,73 @@ export function UsageDashboardSkeleton() {
           </div>
 
           <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
-            {/* wide layouts: the real table header */}
-            <table className="hidden w-full border-collapse text-sm sm:table">
-              <thead>
-                <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
-                  <th className="px-4 py-2.5 text-left font-medium">Model</th>
-                  <th className="px-4 py-2.5 text-left font-medium">Agent</th>
-                  <th className="px-4 py-2.5 text-right font-medium">Cost</th>
-                  <th className="px-4 py-2.5 text-right font-medium">Share</th>
-                  <th className="px-4 py-2.5 text-right font-medium">Tokens</th>
-                </tr>
-              </thead>
-              <tbody>
+            {compactView ? (
+              <div>
+                <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
+                  <span>Sort by</span>
+                  <div className="flex items-center gap-3" aria-hidden="true">
+                    <span className="inline-flex min-h-8 items-center gap-1.5 px-1 font-medium text-foreground [@media(pointer:coarse)]:min-h-11">Tokens <Icon name="ArrowDown" className="size-3.5" /></span>
+                    <span className="inline-flex min-h-8 items-center gap-1.5 px-1 font-medium [@media(pointer:coarse)]:min-h-11">Cost <Icon name="ArrowUpDown" className="size-3.5" /></span>
+                  </div>
+                </div>
                 {[0, 1, 2, 3, 4].map((row) => (
-                  <tr key={row} className="border-b border-border/60 last:border-0">
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
-                        <Shimmer className="h-3.5 w-40 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-2">
-                        <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
-                        <Shimmer className="h-3.5 w-20 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
-                      </div>
-                    </td>
-                    <td className="px-4 py-3">
-                      <Shimmer className="ml-auto h-3.5 w-16 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
-                    </td>
-                    <td className="px-4 py-3">
-                      <Shimmer className="ml-auto h-3.5 w-12 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
-                    </td>
-                    <td className="px-4 py-3">
-                      <Shimmer className="ml-auto h-3.5 w-12 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-
-            {/* narrow layouts: the stacked card rows */}
-            <div className="sm:hidden">
-              {[0, 1, 2, 3, 4].map((row) => (
-                <div key={row} className="border-t border-border/60 px-3.5 py-3 first:border-t-0">
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="flex min-w-0 flex-1 items-center gap-2">
+                  <div key={row} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
+                    <div className="flex items-center gap-2">
                       <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
                       <Shimmer className="h-3.5 w-full max-w-[150px] rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
                     </div>
-                    <Shimmer className="h-3.5 w-14 shrink-0 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
+                    <Shimmer className="mt-1.5 h-4 w-24 rounded" />
+                    <div className="mt-3 grid grid-cols-2 gap-4">
+                      {[0, 1].map((metric) => (
+                        <div key={metric} className={metric === 1 ? "justify-self-end" : ""}>
+                          <Shimmer className={`h-5 w-16 rounded ${metric === 1 ? "ml-auto" : ""}`} />
+                          <Shimmer className="mt-0.5 h-4 w-24 rounded" />
+                        </div>
+                      ))}
+                    </div>
                   </div>
-                  <div className="mt-2 flex items-center gap-2">
-                    <Shimmer className="h-[22px] w-24 rounded-md" />
-                    <Shimmer className="h-[22px] w-20 rounded-md" />
-                    <Shimmer className="ml-auto h-3 w-10 rounded" />
-                  </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            ) : (
+              <table className="w-full border-collapse text-sm">
+                <thead>
+                  <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
+                    <th className="px-4 py-2.5 text-left font-medium">Model</th>
+                    <th className="px-4 py-2.5 text-left font-medium">Agent</th>
+                    <th className="px-3 py-1 text-right font-medium text-foreground">
+                      <span className="inline-flex min-h-8 items-center gap-1.5 px-1 [@media(pointer:coarse)]:min-h-11">Tokens <Icon name="ArrowDown" className="size-3.5" aria-hidden="true" /></span>
+                    </th>
+                    <th className="px-3 py-1 text-right font-medium">
+                      <span className="inline-flex min-h-8 items-center gap-1.5 px-1 [@media(pointer:coarse)]:min-h-11">Cost <Icon name="ArrowUpDown" className="size-3.5" aria-hidden="true" /></span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {[0, 1, 2, 3, 4].map((row) => (
+                    <tr key={row} className="border-b border-border/60 last:border-0">
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
+                          <Shimmer className="h-3.5 w-40 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
+                        </div>
+                      </td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-2">
+                          <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
+                          <Shimmer className="h-3.5 w-20 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
+                        </div>
+                      </td>
+                      {[0, 1].map((metric) => (
+                        <td key={metric} className="px-4 py-3">
+                          <Shimmer className="ml-auto h-5 w-16 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
+                          <Shimmer className="ml-auto mt-0.5 h-4 w-24 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
           </div>
         </section>
       </main>
