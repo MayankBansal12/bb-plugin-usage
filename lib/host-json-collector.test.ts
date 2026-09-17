@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
@@ -37,6 +37,16 @@ async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath
   expect(script.length).toBeLessThan(9_000);
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024 });
   return extractHostJsonScan(stdout.replace(/\n/g, "\r\n"));
+}
+
+function codexRollout(id: string, inputTokens: number, timestamp = "2026-08-09T12:00:01Z") {
+  return [
+    { type: "session_meta", payload: { id, cwd: "/work/project", prompt: "private prompt" } },
+    { type: "turn_context", payload: { model: "gpt-5.6-sol" } },
+    { timestamp, type: "event_msg", payload: { type: "token_count", info: {
+      last_token_usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 5 },
+    } } },
+  ].map((value) => JSON.stringify(value)).join("\n");
 }
 
 afterEach(async () => {
@@ -82,6 +92,145 @@ describe("host JSON usage collector", () => {
     expect(partial.rows).toEqual(first.rows);
   });
 
+  it("collects archived-only Codex homes and profiles while preserving account attribution", async () => {
+    const directory = await temporaryDirectory();
+    const home = join(directory, ".codex");
+    const roots = [join(home, "sessions"), join(home, "archived_sessions")];
+    const accountRoot = join(directory, ".codex-profiles");
+    const cachePath = join(directory, "cache.json");
+    for (const [root, tokens] of [
+      [roots[1]!, 100],
+      [join(accountRoot, "work", "archived_sessions", "nested"), 200],
+      [join(accountRoot, "personal", "archived_sessions"), 300],
+    ] as const) {
+      await mkdir(root, { recursive: true });
+      await writeFile(join(root, "rollout-session.jsonl"), codexRollout("same-id-in-separate-accounts", tokens));
+      await writeFile(join(root, "unrelated.jsonl"), codexRollout("ignored", 999));
+    }
+    const first = await scan("codex", roots, cachePath, { accountRoot });
+    expect(first).toMatchObject({ fileCount: 3, changedFileCount: 3, failureCount: 0 });
+    expect(first.rows).toHaveLength(3);
+    expect(first.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ uncachedInputTokens: 100 }),
+      expect.objectContaining({ account: "work", uncachedInputTokens: 200 }),
+      expect.objectContaining({ account: "personal", uncachedInputTokens: 300 }),
+    ]));
+    expect(first.rows.find((row) => row.uncachedInputTokens === 100)?.account).toBeUndefined();
+    const second = await scan("codex", roots, cachePath, { accountRoot });
+    expect(second).toMatchObject({ changedFileCount: 0, reusedFileCount: 3, failureCount: 0 });
+    expect(second.rows).toEqual(first.rows);
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toContain("same-id-in-separate-accounts");
+    expect(cache).not.toContain("private prompt");
+    expect(cache).not.toContain(directory);
+  });
+
+  it.each([undefined, "work"])("preserves Codex usage through archive and restore moves (profile: %s)", async (account) => {
+    const directory = await temporaryDirectory();
+    const accountRoot = join(directory, ".codex-profiles");
+    const defaultHome = join(directory, ".codex");
+    const home = account ? join(accountRoot, account) : defaultHome;
+    const roots = [join(defaultHome, "sessions"), join(defaultHome, "archived_sessions")];
+    const cachePath = join(directory, "cache.json");
+    const active = join(home, "sessions", "rollout-session.jsonl");
+    const archived = join(home, "archived_sessions", "rollout-session.jsonl");
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await mkdir(join(home, "archived_sessions"), { recursive: true });
+    await writeFile(active, codexRollout("move-session", 100));
+    const first = await scan("codex", roots, cachePath, { accountRoot });
+    await rename(active, archived);
+    const moved = await scan("codex", roots, cachePath, { accountRoot });
+    expect(moved).toMatchObject({ fileCount: 1, changedFileCount: 1, failureCount: 0 });
+    expect(moved.rows).toEqual(first.rows);
+    expect(Object.keys(JSON.parse(await readFile(cachePath, "utf8")).files)).toHaveLength(1);
+    expect((await scan("codex", roots, cachePath, { accountRoot })).reusedFileCount).toBe(1);
+    await rename(archived, active);
+    expect((await scan("codex", roots, cachePath, { accountRoot })).rows).toEqual(first.rows);
+    await appendFile(active, "\n" + JSON.stringify({
+      timestamp: "2026-08-09T12:00:02Z", type: "event_msg", payload: { type: "token_count", info: {
+        last_token_usage: { input_tokens: 50, output_tokens: 2 },
+      } },
+    }));
+    const continued = await scan("codex", roots, cachePath, { accountRoot });
+    expect(continued.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 150, outputTokens: 7 })]);
+    expect(continued.rows[0]?.account).toBe(account);
+  });
+
+  it("counts overlapping Codex rollout copies once without combining distinct sessions", async () => {
+    const directory = await temporaryDirectory();
+    const roots = [join(directory, "sessions"), join(directory, "archived_sessions")];
+    const cachePath = join(directory, "cache.json");
+    for (const root of roots) await mkdir(root, { recursive: true });
+    const active = join(roots[0]!, "rollout-live.jsonl");
+    await writeFile(active, codexRollout("shared-session", 100));
+    await writeFile(join(roots[1]!, "rollout-renamed-copy.jsonl"), codexRollout("shared-session", 50));
+    await writeFile(join(roots[1]!, "rollout-live.jsonl"), codexRollout("distinct-session", 200));
+    const first = await scan("codex", roots, cachePath);
+    expect(first.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 300, outputTokens: 10 })]);
+    const cache = JSON.parse(await readFile(cachePath, "utf8"));
+    expect((Object.values(cache.files) as Array<{ rows: Array<{ uncachedInputTokens: number }> }>).map((entry) => entry.rows[0]!.uncachedInputTokens).sort((a, b) => a - b))
+      .toEqual([50, 100, 200]);
+    const second = await scan("codex", roots, cachePath);
+    expect(second.reusedFileCount).toBe(3);
+    expect(second.rows).toEqual(first.rows);
+    await appendFile(active, "\n" + codexRollout("shared-session", 75, "2026-08-10T12:00:00Z"));
+    const extended = await scan("codex", roots, cachePath);
+    expect(extended.rows.map((row) => row.uncachedInputTokens)).toEqual([300, 75]);
+    expect((await scan("codex", roots, cachePath)).rows).toEqual(extended.rows);
+  });
+
+  it("deduplicates Codex archive copies by rollout filename when session metadata is absent", async () => {
+    const directory = await temporaryDirectory();
+    const roots = [join(directory, "sessions"), join(directory, "archived_sessions")];
+    for (const root of roots) await mkdir(root, { recursive: true });
+    const active = join(roots[0]!, "rollout-legacy.jsonl");
+    await writeFile(active, codexRollout("legacy", 100).split("\n").slice(1).join("\n"));
+    await copyFile(active, join(roots[1]!, "rollout-legacy.jsonl"));
+    const result = await scan("codex", roots, join(directory, "cache.json"));
+    expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 100, outputTokens: 5 })]);
+  });
+
+  it("does not double-count moved Codex usage when a failed root retains the old cache entry", async () => {
+    const directory = await temporaryDirectory();
+    const roots = [join(directory, "sessions"), join(directory, "archived_sessions")];
+    for (const root of roots) await mkdir(root, { recursive: true });
+    const cachePath = join(directory, "cache.json");
+    const active = join(roots[0]!, "rollout-session.jsonl");
+    await writeFile(active, codexRollout("moved", 100));
+    const first = await scan("codex", roots, cachePath);
+    await rename(active, join(roots[1]!, "rollout-session.jsonl"));
+    await rm(roots[0]!, { recursive: true });
+    await writeFile(roots[0]!, "not a directory");
+    const partial = await scan("codex", roots, cachePath);
+    expect(partial.failureCount).toBe(1);
+    expect(partial.rows).toEqual(first.rows);
+    await rm(roots[0]!);
+    const recovered = await scan("codex", roots, cachePath);
+    expect(recovered.failureCount).toBe(0);
+    expect(recovered.rows).toEqual(first.rows);
+    expect(Object.keys(JSON.parse(await readFile(cachePath, "utf8")).files)).toHaveLength(1);
+  });
+
+  it("reparses the old Codex cache before merging newly discovered archive copies", async () => {
+    const directory = await temporaryDirectory();
+    const roots = [join(directory, "sessions"), join(directory, "archived_sessions")];
+    for (const root of roots) await mkdir(root, { recursive: true });
+    const cachePath = join(directory, "cache.json");
+    const active = join(roots[0]!, "rollout-session.jsonl");
+    await writeFile(active, codexRollout("upgrade-session", 100));
+    const first = await scan("codex", roots, cachePath);
+    const cache = JSON.parse(await readFile(cachePath, "utf8"));
+    cache.version = 5;
+    for (const entry of Object.values(cache.files) as Array<{ rows: Array<{ eventKey?: string }> }>) {
+      for (const row of entry.rows) delete row.eventKey;
+    }
+    await writeFile(cachePath, JSON.stringify(cache));
+    await copyFile(active, join(roots[1]!, "rollout-session.jsonl"));
+    const upgraded = await scan("codex", roots, cachePath);
+    expect(upgraded).toMatchObject({ changedFileCount: 2, reusedFileCount: 0, failureCount: 0 });
+    expect(upgraded.rows).toEqual(first.rows);
+  });
+
   it("attributes sessions under the account root to each Codex profile", async () => {
     const directory = await temporaryDirectory();
     const home = join(directory, "home");
@@ -118,10 +267,10 @@ describe("host JSON usage collector", () => {
     expect(second.rows).toEqual(first.rows);
   });
 
-  it("does not double-count a profile home linked to the primary Codex home", async () => {
+  it.each(["sessions", "archived_sessions"])("does not double-count a linked Codex profile (%s)", async (sessionDirectory) => {
     const directory = await temporaryDirectory();
     const home = join(directory, "home");
-    const root = join(home, ".codex", "sessions");
+    const root = join(home, ".codex", sessionDirectory);
     const accountRoot = join(home, ".codex-profiles");
     const cachePath = join(directory, "cache", "codex.json");
     await mkdir(root, { recursive: true });
@@ -429,7 +578,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(5);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {

@@ -74,7 +74,7 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { piSessionRoots: string; primeSessionRoots: string };
+type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string };
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
@@ -443,9 +443,12 @@ function reconcileMachines(db: Database, machineIds: string[]) {
 }
 
 export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+  if (agentId === "codex") {
+    const homes = [...new Set([`${home}/.codex`, ...configuredRoots(settings.codexHomes ?? "", home)])];
+    return homes.flatMap((root) => [`${root}/sessions`, `${root}/archived_sessions`]);
+  }
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
-  return agentId === "codex" ? [`${home}/.codex/sessions`]
-    : agentId === "claude" ? [`${home}/.claude/projects`]
+  return agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
@@ -508,7 +511,10 @@ async function syncJsonAgent(
       machineId: machine.id,
       machineName: machine.name,
     });
-    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...roots);
+    // Preserve the original Codex source identity as archive and custom roots
+    // are added, so reconciliation keeps history whose logs are no longer present.
+    const sourceRoots = agentId === "codex" ? [`${home}/.codex/sessions`] : roots;
+    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...sourceRoots);
     upsertSourceEvents(db, {
       id: sourceId,
       rootReference: opaqueId(...roots),
@@ -960,6 +966,12 @@ function abortableDelay(ms: number, signal: AbortSignal) {
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
+    codexHomes: {
+      type: "string",
+      label: "Extra Codex homes",
+      description: "Optional semicolon-separated Codex home directories. Scans sessions and archived_sessions in each. The default ~/.codex and ~/.codex-profiles/* homes are always scanned.",
+      default: "",
+    },
     piSessionRoots: {
       type: "string",
       label: "Extra Pi session roots",
