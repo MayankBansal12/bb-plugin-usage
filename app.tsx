@@ -415,8 +415,10 @@ function UsageChart({
   compactView?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const touchStartRef = useRef<{ pointerId: number; clientX: number; clientY: number } | null>(null);
   const [measuredWidth, setMeasuredWidth] = useState(980);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [touchPinned, setTouchPinned] = useState(false);
   const width = Math.max(compactView ? 240 : 360, measuredWidth);
   const height = compactView ? 250 : 322;
   const inset = compactView
@@ -434,6 +436,17 @@ function UsageChart({
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    if (!touchPinned) return;
+    const dismissOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && containerRef.current?.contains(event.target)) return;
+      setHoverIndex(null);
+      setTouchPinned(false);
+    };
+    document.addEventListener("pointerdown", dismissOutside);
+    return () => document.removeEventListener("pointerdown", dismissOutside);
+  }, [touchPinned]);
 
   for (const record of records) {
     const dimensionId = groupBy === "agent" ? record.agentId : record.modelProviderId;
@@ -489,16 +502,45 @@ function UsageChart({
   const tooltipOnRight = tooltipLeft < width * 0.6;
 
   return (
-    <div ref={containerRef} className="relative min-w-0 overflow-hidden">
+    <div ref={containerRef} className="relative min-w-0 select-none overflow-hidden">
       <svg
         width={width}
         height={height}
         className="block max-w-full touch-pan-y"
         role="img"
         aria-label={`Daily ${mode} by ${groupBy}`}
-        onPointerMove={(event) => updateHoverFromClientX(event.clientX)}
-        onPointerDown={(event) => updateHoverFromClientX(event.clientX)}
-        onPointerLeave={() => setHoverIndex(null)}
+        onPointerMove={(event) => {
+          if (event.pointerType === "touch") return;
+          setTouchPinned(false);
+          updateHoverFromClientX(event.clientX);
+        }}
+        onPointerDown={(event) => {
+          if (event.pointerType === "touch") {
+            touchStartRef.current = {
+              pointerId: event.pointerId,
+              clientX: event.clientX,
+              clientY: event.clientY,
+            };
+            return;
+          }
+          setTouchPinned(false);
+          updateHoverFromClientX(event.clientX);
+        }}
+        onPointerUp={(event) => {
+          const start = touchStartRef.current;
+          if (event.pointerType !== "touch" || start?.pointerId !== event.pointerId) return;
+          touchStartRef.current = null;
+          if (Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 8) return;
+          updateHoverFromClientX(event.clientX);
+          setTouchPinned(true);
+        }}
+        onPointerCancel={(event) => {
+          if (touchStartRef.current?.pointerId === event.pointerId) touchStartRef.current = null;
+        }}
+        onPointerLeave={(event) => {
+          if (event.pointerType === "touch") return;
+          setHoverIndex(null);
+        }}
       >
         <defs>
           <clipPath id="usage-chart-clip">
