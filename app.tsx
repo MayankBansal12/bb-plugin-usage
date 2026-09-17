@@ -649,7 +649,7 @@ function ProviderShareRow({
   mode,
   total,
 }: {
-  item: { id: string; name: string; cost: number; tokens: number; unknown?: boolean };
+  item: { id: string; name: string; cost: number; tokens: number; unknown?: boolean; cacheRate?: CacheHitRateGroup };
   mode: MetricMode;
   total: number;
 }) {
@@ -680,10 +680,10 @@ function ProviderShareRow({
       </div>
       <div className="mt-2 text-xs text-muted-foreground">
         {mode === "cost"
-          ? <>{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</>
+          ? <>{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens{item.cacheRate && <> · <CacheRateValue item={item.cacheRate} /> cache hit</>}</>
           : item.unknown && item.cost === 0
-            ? <>{percentage(item.tokens, total)} of tokens · <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">cost unknown</span></>
-            : <>{percentage(item.tokens, total)} of tokens · <PricedCost cost={item.cost} unknown={item.unknown} /></>}
+            ? <>{percentage(item.tokens, total)} of tokens · <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">cost unknown</span>{item.cacheRate && <> · <CacheRateValue item={item.cacheRate} /> cache hit</>}</>
+            : <>{percentage(item.tokens, total)} of tokens · <PricedCost cost={item.cost} unknown={item.unknown} />{item.cacheRate && <> · <CacheRateValue item={item.cacheRate} /> cache hit</>}</>}
       </div>
     </div>
   );
@@ -1283,9 +1283,16 @@ function UsageDashboard() {
     };
   }, [rows, range]);
 
+  const agentCacheHitRates = useMemo(() => new Map(
+    cacheHitRateGroups(rows, "agent").map((item) => [item.agentId, item]),
+  ), [rows]);
+  const modelCacheHitRates = useMemo(() => new Map(
+    cacheHitRateGroups(rows, "model").map((item) => [`${item.agentId}\0${item.model}`, item]),
+  ), [rows]);
+
   type BreakdownRow = {
     key: string; label: string; agent: string; agentId: string; provider: string; providerId: string;
-    cost: number; tokens: number; unknown?: boolean;
+    cost: number; tokens: number; unknown?: boolean; cacheRate?: CacheHitRateGroup;
     // Only project rows fold several agents into one badge; the folded ones are
     // listed here so the `+N` suffix can name them on hover.
     otherAgents?: Array<{ id: string; name: string; cost: number; tokens: number; unknown?: boolean }>;
@@ -1309,14 +1316,19 @@ function UsageDashboard() {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
       const key = `${row.agentId}:${row.modelProviderId}:${row.model}`;
-      const current: BreakdownRow = map.get(key) ?? { key, label: row.model === "codex-unknown" ? "Unknown" : row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
+      const current: BreakdownRow = map.get(key) ?? {
+        key, label: row.model === "codex-unknown" ? "Unknown" : row.model,
+        agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName,
+        providerId: row.modelProviderId, cost: 0, tokens: 0,
+        cacheRate: modelCacheHitRates.get(`${row.agentId}\0${row.model}`),
+      };
       current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
       map.set(key, current);
     }
     return [...map.values()];
-  }, [rows]);
+  }, [rows, modelCacheHitRates]);
 
   // Projects can be worked on from several agents and providers, so a row keeps
   // the dominant one by the active metric for its badge instead of claiming a
@@ -1435,6 +1447,7 @@ function UsageDashboard() {
       cost: dimensionRows.reduce((sum, row) => sum + row.costUsd, 0),
       tokens: dimensionRows.reduce((sum, row) => sum + row.processedTokens, 0),
       unknown: dimensionRows.some((row) => row.pricingStatus === "unknown"),
+      cacheRate: shareDimension === "agent" ? agentCacheHitRates.get(item.id) : undefined,
     };
   }).sort(byChartMetric);
   const metricTotal = chartMode === "cost" ? totals.cost : totals.processed;
@@ -1788,6 +1801,9 @@ function UsageDashboard() {
                             )}
                           </div>
                         </div>
+                        {breakdownMode === "model" && row.cacheRate && (
+                          <div className="mt-1.5 text-[11px] leading-4 text-muted-foreground"><CacheRateValue item={row.cacheRate} /> cache hit</div>
+                        )}
                         <div className="mt-2.5 grid grid-cols-2 gap-3 border-t border-border/40 pt-2.5">
                           <BreakdownValue metric="tokens" row={row} totals={totals} compactView />
                           <div className="min-w-0 border-l border-border/40 pl-3 text-right">
@@ -1807,14 +1823,15 @@ function UsageDashboard() {
                   <table
                     className={`w-full border-collapse text-sm ${stackedView ? "table-fixed" : ""}`}
                     aria-label="Usage breakdown"
-                    style={stackedView ? undefined : { minWidth: breakdownMode === "day" ? 440 : 600 }}
+                    style={stackedView ? undefined : { minWidth: breakdownMode === "day" ? 440 : breakdownMode === "model" ? 700 : 600 }}
                   >
                     {stackedView && (
                       <colgroup>
-                        <col style={{ width: breakdownMode === "day" ? "40%" : "35%" }} />
-                        {breakdownMode !== "day" && <col style={{ width: "25%" }} />}
-                        <col style={{ width: breakdownMode === "day" ? "30%" : "20%" }} />
-                        <col style={{ width: breakdownMode === "day" ? "30%" : "20%" }} />
+                        <col style={{ width: breakdownMode === "day" ? "40%" : breakdownMode === "model" ? "30%" : "35%" }} />
+                        {breakdownMode !== "day" && <col style={{ width: breakdownMode === "model" ? "22%" : "25%" }} />}
+                        {breakdownMode === "model" && <col style={{ width: "16%" }} />}
+                        <col style={{ width: breakdownMode === "day" ? "30%" : breakdownMode === "model" ? "16%" : "20%" }} />
+                        <col style={{ width: breakdownMode === "day" ? "30%" : breakdownMode === "model" ? "16%" : "20%" }} />
                       </colgroup>
                     )}
                     <thead>
@@ -1824,6 +1841,9 @@ function UsageDashboard() {
                         </th>
                         {breakdownMode !== "day" && (
                           <th scope="col" className="px-4 py-2.5 text-left font-medium">Agent</th>
+                        )}
+                        {breakdownMode === "model" && (
+                          <th scope="col" className="px-4 py-2.5 text-right font-medium">Cache hit</th>
                         )}
                         {(["tokens", "cost"] as const).map((metric) => (
                           <th key={metric} scope="col" aria-sort={breakdownSort.metric === metric ? breakdownSort.direction : undefined} className="px-3 py-1 text-right font-medium">
@@ -1853,7 +1873,10 @@ function UsageDashboard() {
                               <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
                             </td>
                           )}
-                          <td className="px-4 py-3 text-right">
+                          {breakdownMode === "model" && (
+                            <td className="px-4 py-3 text-right">{row.cacheRate && <CacheRateValue item={row.cacheRate} />}</td>
+                          )}
+                          <td className="px-4 py-3 align-top text-right">
                             <BreakdownValue metric="tokens" row={row} totals={totals} />
                           </td>
                           <td className="px-4 py-3 text-right">
