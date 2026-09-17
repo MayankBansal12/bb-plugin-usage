@@ -17,7 +17,7 @@ export type HostJsonScanInput = {
   sinceDay: string;
   // Directory whose immediate subdirectories are per-account agent homes
   // (e.g. ~/.codex-profiles/<name> for extra Codex accounts). Each
-  // <name>/sessions tree is scanned and its rows carry `account: <name>`.
+  // home's sessions and archived_sessions trees carry `account: <name>`.
   accountRoot?: string;
 };
 
@@ -79,8 +79,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const scanBegin = "__BB_USAGE_SCAN_BEGIN__";
   const scanEnd = "__BB_USAGE_SCAN_END__";
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
-  // v6 (dsh only): replace repeated attempt samples and reject missing fork cuts.
-  const cacheVersion = input.agentId === "dsh" ? 6 : 5;
+  // v6 (dsh): replace repeated attempt samples and reject missing fork cuts.
+  // v6 (codex): retain hashed session/bucket identities across archive moves and copies.
+  const cacheVersion = input.agentId === "dsh" || input.agentId === "codex" ? 6 : 5;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -192,12 +193,13 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     if (!raw.eventKey) return;
     const prior = target.get(raw.eventKey);
     if (!prior) {
-      target.set(raw.eventKey, raw);
+      target.set(raw.eventKey, { ...raw });
       return;
     }
     // Claude currently repeats the same final counters on every content-block
     // row. Maxima also handle a partially-written/incremental row safely
-    // without multiplying one API response's usage.
+    // without multiplying one API response's usage. Codex rows hold session
+    // bucket totals; maxima merge an older archive copy with a continued log.
     prior.uncachedInputTokens = Math.max(prior.uncachedInputTokens, raw.uncachedInputTokens);
     prior.cachedInputTokens = Math.max(prior.cachedInputTokens, raw.cachedInputTokens);
     prior.cacheWriteTokens = Math.max(prior.cacheWriteTokens, raw.cacheWriteTokens);
@@ -326,6 +328,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     const events = new Map<string, CachedUsageRow>();
     const fileAccount = accountByPath.get(filePath);
     let codexModel = "codex-unknown";
+    let codexSessionId = path.basename(filePath);
     // Session-scoped project, learned from the first record that carries a
     // working directory and reused for later rows in the same file.
     let sessionProject = "Unknown";
@@ -356,6 +359,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
 
       if (input.agentId === "codex") {
         const payload = object(value.payload);
+        if (value.type === "session_meta" && payload) codexSessionId = text(payload.id, codexSessionId);
         if ((value.type === "turn_context" || value.type === "session_meta") && payload) {
           codexModel = text(payload.model, codexModel);
           if (typeof payload.cwd === "string") sessionProject = projectName(payload.cwd);
@@ -579,6 +583,14 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       // A zero final sample still replaces earlier usage, but creates no row.
       if (row.uncachedInputTokens + row.cachedInputTokens + row.cacheWriteTokens + row.outputTokens > 0) add(rows, row);
     }
+    if (input.agentId === "codex") {
+      return [...rows.values()].map((row) => ({
+        ...row,
+        eventKey: crypto.createHash("sha256").update(JSON.stringify([
+          "codex", codexSessionId, row.account ?? null, row.day, row.modelProviderId, row.model, row.project,
+        ])).digest("hex"),
+      }));
+    }
     return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
   }
 
@@ -617,6 +629,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
       const files: string[] = [];
       await walk(path.join(accountRoot, entry.name, "sessions"), files);
+      await walk(path.join(accountRoot, entry.name, "archived_sessions"), files);
       for (const filePath of files) accountByPath.set(filePath, entry.name);
       accountDiscovered.push(...files);
     }

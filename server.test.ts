@@ -82,6 +82,24 @@ function commandTextFor(command: string, stagedFiles: Map<string, string>) {
 }
 
 describe("JSON agent roots", () => {
+  it("includes active and archived Codex sessions", () => {
+    expect(jsonAgentRoots("/home/user", "codex", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.codex/sessions",
+      "/home/user/.codex/archived_sessions",
+    ]);
+  });
+
+  it("scans both session directories in each configured Codex home", () => {
+    expect(jsonAgentRoots("/home/user", "codex", {
+      piSessionRoots: "", primeSessionRoots: "",
+      codexHomes: "~/.codex/; ~/custom-codex/; /mnt/codex\n~/custom-codex",
+    })).toEqual([
+      "/home/user/.codex/sessions", "/home/user/.codex/archived_sessions",
+      "/home/user/custom-codex/sessions", "/home/user/custom-codex/archived_sessions",
+      "/mnt/codex/sessions", "/mnt/codex/archived_sessions",
+    ]);
+  });
+
   it("points Antigravity at the provider bridge's own usage log", () => {
     expect(jsonAgentRoots("/home/user", "antigravity", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.antigravity-acp/usage.jsonl",
@@ -492,7 +510,7 @@ describe("sync RPC", () => {
       .map((command) => scanInputFromCommand(commandTextFor(command, stagedFiles)))
       .find((input) => input?.agentId === "codex");
     expect(codexScan).toMatchObject({
-      roots: ["/home/user/.codex/sessions"],
+      roots: ["/home/user/.codex/sessions", "/home/user/.codex/archived_sessions"],
       accountRoot: "/home/user/.codex-profiles",
     });
 
@@ -1593,13 +1611,13 @@ describe("retained usage through the real sync path", () => {
   // Drives the unmodified plugin factory end-to-end through its public sync()
   // RPC (like the Antigravity regression test above); the mutable `state`
   // object lets each subsequent sync serve a different pi scan.
-  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number }, targetAgent = "pi") {
+  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string }, targetAgent = "pi") {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown; dashboard: () => Promise<{ sync: { running: boolean } }> } | undefined;
     const commandsByTerminalId = new Map<string, string>();
     const stagedFiles = new Map<string, string>();
     const bb = {
-      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      settings: { define: vi.fn(() => ({ get: async () => ({ codexHomes: state.codexHomes ?? "", piSessionRoots: "", primeSessionRoots: "" }) })) },
       storage: {
         database: vi.fn(() => db),
         migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
@@ -1651,6 +1669,31 @@ describe("retained usage through the real sync path", () => {
   afterEach(() => resetPricingCatalog());
   const totals = (db: Database) => db.prepare(`SELECT COUNT(*) count, SUM(processed_tokens) tokens,
     SUM(cost_usd) cost FROM usage_events`).get();
+
+  it("preserves the existing Codex source and missing history as archive and custom roots are added", async () => {
+    setPricingCatalog(catalog(1000), "codex-archive-v1");
+    const state = { rows: [piRow(), piRow({ account: "work" })], failureCount: 0, codexHomes: "" };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      const legacySourceId = createHash("sha256")
+        .update(["host-1", "codex", "host-json-scan-v1", "/home/user/.codex/sessions"].join("\0")).digest("hex");
+      expect(db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='codex'").all())
+        .toEqual([{ id: legacySourceId }]);
+      const previousRootReference = db.prepare("SELECT root_reference ref FROM usage_sources WHERE source_id=?").get(legacySourceId);
+      state.codexHomes = "~/custom-codex";
+      state.rows = [piRow({ project: "archived" })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 3, tokens: 4500, cost: 4.5 });
+      expect(db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='codex'").all())
+        .toEqual([{ id: legacySourceId }]);
+      expect(db.prepare("SELECT root_reference ref FROM usage_sources WHERE source_id=?").get(legacySourceId))
+        .not.toEqual(previousRootReference);
+      expect(db.prepare("SELECT DISTINCT source_id id FROM usage_event_sources").all()).toEqual([{ id: legacySourceId }]);
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 3, tokens: 4500, cost: 4.5 });
+    } finally { db.close(); }
+  });
 
   it.each([0, 1])("retains smaller and missing buckets across nonempty and empty scans (failures: %s)", async (failureCount) => {
     setPricingCatalog(catalog(1000), "retention-v1");

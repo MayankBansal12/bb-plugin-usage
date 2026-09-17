@@ -19,7 +19,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Supported data sources
 
-- Codex: `~/.codex/sessions/**/rollout-*.jsonl`, plus `~/.codex-profiles/*/sessions/**/rollout-*.jsonl` for extra Codex accounts exposed as ACP providers (e.g. by multi-account bridges); each profile reports as its own agent, `Codex (<name>)`
+- Codex: `rollout-*.jsonl` files recursively under both `sessions/` and `archived_sessions/` in `~/.codex` and each `~/.codex-profiles/<name>` home; each profile reports as its own agent, `Codex (<name>)`. Additional homes can be configured in plugin settings.
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - DeepSeek Harness: `~/.dsh/sessions/*/*/session.v3.jsonl.zstd` (Zstandard-compressed JSONL; requires Node.js 22.15+ on the machine)
 - Devin: `~/.local/share/devin/cli/sessions.db` — the Devin CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` is honored). Devin runs in BB through the `acp-devin` provider and writes no JSONL session logs.
@@ -34,6 +34,8 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Account Pooler limits: non-secret account summaries from the enabled BB `account-pool` plugin’s `account.list` RPC, including Codex limit windows and Claude five-hour, weekly, and model-family limits. API key accounts show that subscription limits are unavailable. This adds quota cards, not per-account token or cost attribution. Pool refresh failures retain the last successful snapshot with a warning; an absent or disabled pool plugin needs no configuration.
 
 JSON-log collection requires Node.js on each enrolled machine. Logs are streamed and reduced to usage metadata on that machine, so large histories are not transferred through BB's file API. A metadata-only per-file cache in `~/.cache/bb-plugin-usage/json-log-scan-v1/` makes later syncs reparse only changed files. The initial 365-day scan can take longer on machines with large histories.
+
+For a custom `CODEX_HOME` outside the default locations, add the home directory to **Extra Codex homes** (`codexHomes`) in the plugin settings. Separate paths with semicolons or newlines; `~` expands to each enrolled machine's home. Both active and archived sessions are scanned, and these extra homes report under Codex. Copies of the same session within an account are counted once. The first sync after upgrading reparses Codex logs to populate session identities in the metadata cache; later syncs reuse unchanged files.
 
 Devin collection requires Node.js 22.13 or newer (for `node:sqlite`) on each enrolled machine. The session database is queried read-only and reduced to per-day token aggregates on the host; only usage metadata fields are extracted, so prompts and message content never leave the machine. A missing database reports as no data, while a database that exists but cannot be read (for example under an older Node.js) surfaces as a sync error for the Devin source only. Devin records ACU totals rather than per-request USD, so its usage shows token counts with unknown cost.
 
