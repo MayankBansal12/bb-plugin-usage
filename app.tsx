@@ -1122,7 +1122,7 @@ function UsageDashboard() {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
       const key = `${row.agentId}:${row.modelProviderId}:${row.model}`;
-      const current: BreakdownRow = map.get(key) ?? { key, label: row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
+      const current: BreakdownRow = map.get(key) ?? { key, label: row.model === "codex-unknown" ? "Unknown" : row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
       current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
