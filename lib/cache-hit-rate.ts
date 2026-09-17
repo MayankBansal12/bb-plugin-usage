@@ -3,6 +3,7 @@ export type CacheUsageRecord = {
   agentName: string;
   model: string;
   cachedInputTokens: number;
+  cacheWriteTokens: number;
   uncachedInputTokens: number;
 };
 
@@ -39,7 +40,7 @@ export function reportsCacheUsage(agentId: string) {
 }
 
 export function cacheHitRateGroups(records: CacheUsageRecord[], groupBy: "agent" | "model"): CacheHitRateGroup[] {
-  const groups = new Map<string, Omit<CacheHitRateGroup, "rate" | "totalInputTokens"> & { uncachedInputTokens: number }>();
+  const groups = new Map<string, Omit<CacheHitRateGroup, "rate" | "totalInputTokens"> & { cacheWriteTokens: number; uncachedInputTokens: number }>();
   for (const record of records) {
     const key = groupBy === "agent" ? record.agentId : `${record.agentId}\0${record.model}`;
     const current = groups.get(key) ?? {
@@ -48,15 +49,17 @@ export function cacheHitRateGroups(records: CacheUsageRecord[], groupBy: "agent"
       agentName: record.agentName,
       model: groupBy === "model" ? record.model : null,
       cachedInputTokens: 0,
+      cacheWriteTokens: 0,
       uncachedInputTokens: 0,
     };
     current.cachedInputTokens += record.cachedInputTokens;
+    current.cacheWriteTokens += record.cacheWriteTokens;
     current.uncachedInputTokens += record.uncachedInputTokens;
     groups.set(key, current);
   }
 
   return [...groups.values()].map((group) => {
-    const totalInputTokens = group.cachedInputTokens + group.uncachedInputTokens;
+    const totalInputTokens = group.cachedInputTokens + group.cacheWriteTokens + group.uncachedInputTokens;
     return {
       key: group.key,
       agentId: group.agentId,
