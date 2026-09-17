@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, FX, Grok Agent, OpenCode, Pi, Prime Agent, and Antigravity.
+- Collect usage from Codex, Claude Code, DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
 - Separate the coding agent from the underlying model provider.
 - Group charts and usage shares by agent or model provider.
 - Switch the chart and provider shares between cost and tokens.
@@ -15,13 +15,16 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Filter by machine, agent, model provider, and the last 7, 30, or 90 days.
 - Show exact, alias-matched, agent-reported, and unknown pricing in the breakdown table.
 - Show Grok Build, OpenCode Go, Claude Code, Cursor, and Codex plan windows in the usage-limits section. The same subscription on several machines is one card with machine tags; different accounts stay separate cards in a horizontal grid.
+- Show every Claude and Codex account from BB’s Account Pooler with its account label, reported limit windows, and pool status. Pooled accounts stay visible under every machine filter because the pool is shared. Matching local subscriptions are combined when the account email identifies one pool account; windows from either source are kept, preferring the newer reset cycle and the higher usage within a cycle. Disabled accounts and accounts without reported limits remain visible.
 - Resolve model prices from [models.dev](https://models.dev), refreshed daily at runtime with the bundled snapshot as fallback, without inventing prices for ambiguous models.
 - Sync automatically every 15 minutes or manually from the dashboard.
 
 ## Supported data sources
 
-- Codex: `~/.codex/sessions/**/rollout-*.jsonl`
+- Codex: `rollout-*.jsonl` files recursively under both `sessions/` and `archived_sessions/` in `~/.codex` and each `~/.codex-profiles/<name>` home; each profile reports as its own agent, `Codex (<name>)`. Additional homes can be configured in plugin settings.
 - Claude Code: `~/.claude/projects/**/*.jsonl`
+- DeepSeek Harness: `~/.dsh/sessions/*/*/session.v3.jsonl.zstd` (Zstandard-compressed JSONL; requires Node.js 22.15+ on the machine)
+- Devin: `~/.local/share/devin/cli/sessions.db` — the Devin CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` is honored). Devin runs in BB through the `acp-devin` provider and writes no JSONL session logs.
 - FX: `~/.fx/usage.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`
 - Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
@@ -30,8 +33,13 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Antigravity: `~/.antigravity-acp/usage.jsonl`, written by the `bb-plugin-antigravity-acp` provider bridge (the `agy` CLI has no session log of its own in a stable, parseable shape, so the bridge is the source of truth, one line per turn it runs)
 - Grok Build limits: credit usage and reset times from the Grok billing endpoint, using the local Grok login (`~/.grok/auth.json`, respecting `GROK_HOME` and `GROK_AUTH_PATH`)
 - OpenCode Go limits: plan windows from `https://opencode.ai/zen/go/v1/usage`, authenticated with the `opencode-go` credential in `~/.local/share/opencode/auth.json` on each machine
+- Account Pooler limits: non-secret account summaries from the enabled BB `account-pool` plugin’s `account.list` RPC, including Codex limit windows and Claude five-hour, weekly, and model-family limits. API key accounts show that subscription limits are unavailable. This adds quota cards, not per-account token or cost attribution. Pool refresh failures retain the last successful snapshot with a warning; an absent or disabled pool plugin needs no configuration.
 
 JSON-log collection requires Node.js on each enrolled machine. Logs are streamed and reduced to usage metadata on that machine, so large histories are not transferred through BB's file API. A metadata-only per-file cache in `~/.cache/bb-plugin-usage/json-log-scan-v1/` makes later syncs reparse only changed files. The initial 365-day scan can take longer on machines with large histories.
+
+For a custom `CODEX_HOME` outside the default locations, add the home directory to **Extra Codex homes** (`codexHomes`) in the plugin settings. Separate paths with semicolons or newlines; `~` expands to each enrolled machine's home. Both active and archived sessions are scanned, and these extra homes report under Codex. Copies of the same session within an account are counted once. The first sync after upgrading reparses Codex logs to populate session identities in the metadata cache; later syncs reuse unchanged files.
+
+Devin collection requires Node.js 22.13 or newer (for `node:sqlite`) on each enrolled machine. The session database is queried read-only and reduced to per-day token aggregates on the host; only usage metadata fields are extracted, so prompts and message content never leave the machine. A missing database reports as no data, while a database that exists but cannot be read (for example under an older Node.js) surfaces as a sync error for the Devin source only. Devin records ACU totals rather than per-request USD, so its usage shows token counts with unknown cost.
 
 FX history follows the rolling retention of FX's local usage ledger. The plugin reads generation usage facts only; FX sessions and prompts are not scanned.
 
@@ -83,7 +91,7 @@ Ideas, fixes, and improvements are welcome.
 
 ### Cost estimates and unknown pricing
 
-Recorded and unpriced requests are kept in separate aggregate buckets so a recorded cost never suppresses estimates for other requests. Known providers use only their own catalog rates; automatic model aliases are limited to date suffixes. Unknown models remain unpriced. Costs, charts, and shares cover priced usage only. Catalog estimates use current base token rates, without context-tier adjustments or invoice reconciliation.
+Recorded and unpriced requests are kept in separate aggregate buckets so a recorded cost never suppresses estimates for other requests. Known providers use only their own catalog rates; automatic model aliases are limited to date suffixes. Rows from providers the catalog does not list — typically proxy gateways reporting bare model names — instead resolve the model against first-party vendors, trying the full name before decorated variants such as `-high` or `-expires-on-…`, then a catalog-wide unique match. Unknown models remain unpriced. Costs, charts, and shares cover priced usage only. Catalog estimates use current base token rates, without context-tier adjustments or invoice reconciliation.
 
 ### Backlog / WIP
 

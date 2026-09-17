@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
-  parseHostUsageAggregates, parseOpenCode,
+  parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
   type AgentId, type UsageRecord,
 } from "./collectors";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
@@ -14,10 +14,12 @@ import {
   extractHostJsonScan,
   type HostJsonAgentId,
 } from "./lib/host-json-collector";
+import { compressedDevinCollectorScript } from "./lib/devin-sqlite-collector";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
+import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/account-pool-limits";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -41,6 +43,7 @@ const providerLimitWindowSchema = z.object({
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
+  poolAccount: z.object({ id: z.string(), label: z.string(), status: z.string(), emptyMessage: z.string() }).optional(),
   id: z.string(),
   providerId: z.string(), providerName: z.string(),
   accountEmail: z.string().nullable(), planLabel: z.string().nullable(),
@@ -63,17 +66,21 @@ export const rpcContract = defineRpcContract({
     records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema),
     sync: syncStateSchema, notice: z.string(),
   }) },
-  providerLimits: { input: z.null(), output: z.array(providerLimitSchema) },
+  providerLimits: { input: z.null(), output: z.object({
+    limits: z.array(providerLimitSchema), accountPoolError: z.string().nullable(),
+  }) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
 });
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { piSessionRoots: string; primeSessionRoots: string };
+type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string };
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "dsh", name: "DeepSeek Harness" },
+  { id: "devin", name: "Devin" },
   { id: "fx", name: "FX" },
   { id: "grok", name: "Grok Agent" },
   { id: "opencode", name: "OpenCode" },
@@ -150,6 +157,7 @@ const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
+const DEVIN_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
@@ -343,12 +351,22 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
-    provider_name=excluded.provider_name, model=excluded.model, cost_usd=excluded.cost_usd, project=excluded.project,
-    cache_savings_usd=excluded.cache_savings_usd, processed_tokens=excluded.processed_tokens,
-    cached_input_tokens=excluded.cached_input_tokens, cache_write_tokens=excluded.cache_write_tokens,
-    uncached_input_tokens=excluded.uncached_input_tokens, output_tokens=excluded.output_tokens,
+    provider_name=excluded.provider_name, model=excluded.model, project=excluded.project,
+    cost_usd=excluded.cost_usd, cache_savings_usd=excluded.cache_savings_usd,
+    processed_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens)
+      + MAX(cache_write_tokens, excluded.cache_write_tokens)
+      + MAX(uncached_input_tokens, excluded.uncached_input_tokens)
+      + MAX(output_tokens, excluded.output_tokens),
+    cached_input_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens),
+    cache_write_tokens=MAX(cache_write_tokens, excluded.cache_write_tokens),
+    uncached_input_tokens=MAX(uncached_input_tokens, excluded.uncached_input_tokens),
+    output_tokens=MAX(output_tokens, excluded.output_tokens),
+    -- Logged costs are authoritative vendor figures: always take the newest,
+    -- so price corrections (up or down) flow through instead of freezing at
+    -- the first observed value.
+    logged_cost_usd=excluded.logged_cost_usd,
     model_provider_id=excluded.model_provider_id, model_provider_name=excluded.model_provider_name,
-    logged_cost_usd=excluded.logged_cost_usd, pricing_status=excluded.pricing_status`);
+    pricing_status=excluded.pricing_status`);
   const insertMapping = db.prepare("INSERT OR IGNORE INTO usage_event_sources (event_key, source_id) VALUES (?, ?)");
 
   db.transaction(() => {
@@ -357,7 +375,7 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       machine_name=excluded.machine_name, root_reference=excluded.root_reference, content_sha=excluded.content_sha,
       last_seen_generation=excluded.last_seen_generation, last_success_at=excluded.last_success_at, pricing_version=excluded.pricing_version`)
       .run(source.id, machine.id, machine.name, agentId, source.rootReference, source.sha256, source.generation, new Date().toISOString(), pricingRevision());
-    db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
+    // A rescan adds observed keys; absence does not erase recorded history.
     for (const row of records) {
       insertEvent.run(
         row.eventKey, row.timestamp, row.day, row.agentId, row.agentName, row.model, row.costUsd, row.cacheSavingsUsd,
@@ -366,8 +384,35 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
       );
       insertMapping.run(row.eventKey, source.id);
     }
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    // Bound retained history by age instead of scan completeness.
+    db.prepare(`DELETE FROM usage_event_sources WHERE source_id=? AND event_key IN
+      (SELECT event_key FROM usage_events WHERE day < ?)`)
+      .run(source.id, historyStartDay(agentId === "opencode" ? OPENCODE_HISTORY_DAYS : HISTORY_DAYS));
+    deleteOrphanEvents(db);
+
+    // Reprice all retained rows, including those absent from the latest scan.
+    const retained = db.prepare(`SELECT e.event_key eventKey, e.timestamp, e.day,
+      e.provider_id agentId, e.provider_name agentName, e.model_provider_id modelProviderId,
+      e.model_provider_name modelProviderName, s.machine_id machineId, s.machine_name machineName,
+      e.model, e.project, e.cost_usd costUsd, e.logged_cost_usd loggedCostUsd,
+      e.pricing_status pricingStatus, e.cache_savings_usd cacheSavingsUsd,
+      e.processed_tokens processedTokens, e.cached_input_tokens cachedInputTokens,
+      e.cache_write_tokens cacheWriteTokens, e.uncached_input_tokens uncachedInputTokens,
+      e.output_tokens outputTokens FROM usage_events e
+      JOIN usage_event_sources es ON es.event_key=e.event_key
+      JOIN usage_sources s ON s.source_id=es.source_id WHERE es.source_id=?`)
+      .all(source.id) as UsageRecord[];
+    const updatePrice = db.prepare(`UPDATE usage_events SET cost_usd=?, cache_savings_usd=?,
+      pricing_status=? WHERE event_key=?`);
+    for (const record of retained) {
+      const priced = repriceUsageRecord(record);
+      updatePrice.run(priced.costUsd, priced.cacheSavingsUsd, priced.pricingStatus, record.eventKey);
+    }
   })();
+}
+
+function deleteOrphanEvents(db: Database) {
+  db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
 }
 
 function reconcileSources(db: Database, machineId: string, agentId: AgentId, generation: string) {
@@ -378,7 +423,7 @@ function reconcileSources(db: Database, machineId: string, agentId: AgentId, gen
       db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(source.id);
       db.prepare("DELETE FROM usage_sources WHERE source_id=?").run(source.id);
     }
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    deleteOrphanEvents(db);
   })();
 }
 
@@ -393,14 +438,18 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     db.prepare(`DELETE FROM grok_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
-    db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
+    deleteOrphanEvents(db);
   })();
 }
 
 export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings: CollectorSettings) {
+  if (agentId === "codex") {
+    const homes = [...new Set([`${home}/.codex`, ...configuredRoots(settings.codexHomes ?? "", home)])];
+    return homes.flatMap((root) => [`${root}/sessions`, `${root}/archived_sessions`]);
+  }
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
-  return agentId === "codex" ? [`${home}/.codex/sessions`]
-    : agentId === "claude" ? [`${home}/.claude/projects`]
+  return agentId === "claude" ? [`${home}/.claude/projects`]
+    : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
     : agentId === "antigravity" ? [`${home}/.antigravity-acp/usage.jsonl`]
@@ -412,9 +461,9 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
     })];
 }
 
-function historyStartDay() {
+function historyStartDay(days = HISTORY_DAYS) {
   const start = new Date();
-  start.setDate(start.getDate() - HISTORY_DAYS);
+  start.setDate(start.getDate() - days);
   return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
 }
 
@@ -446,9 +495,14 @@ async function syncJsonAgent(
       roots,
       cachePath,
       sinceDay: historyStartDay(),
+      // Extra Codex accounts (BB account-limits ACP providers) keep their
+      // CODEX_HOME under ~/.codex-profiles/<name>; the scan tags their rows
+      // with the profile name so each account stays a distinct agent.
+      accountRoot: agentId === "codex" ? `${home}/.codex-profiles` : undefined,
     }), signal, {
       title: `Usage: ${agentId} scan`,
       timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
+      home,
     });
     const scan = extractHostJsonScan(output);
     if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
@@ -457,7 +511,10 @@ async function syncJsonAgent(
       machineId: machine.id,
       machineName: machine.name,
     });
-    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...roots);
+    // Preserve the original Codex source identity as archive and custom roots
+    // are added, so reconciliation keeps history whose logs are no longer present.
+    const sourceRoots = agentId === "codex" ? [`${home}/.codex/sessions`] : roots;
+    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...sourceRoots);
     upsertSourceEvents(db, {
       id: sourceId,
       rootReference: opaqueId(...roots),
@@ -482,14 +539,112 @@ async function syncJsonAgent(
   }
 }
 
+export function devinCommand(home: string) {
+  const script = compressedDevinCollectorScript({
+    agentId: "devin",
+    dbPaths: [
+      `${home}/.local/share/devin/cli/sessions.db`,
+      `${home}/Library/Application Support/devin/cli/sessions.db`,
+    ],
+    sinceDay: historyStartDay(),
+  });
+  return [
+    "if ! command -v node >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to scan Devin usage.'; exit 127",
+    "fi",
+    `node -e ${shellQuote(script)}`,
+  ].join("; ");
+}
+
+export async function syncDevin(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  home: string,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const agentId: AgentId = "devin";
+  const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const output = await executeHostCommand(bb, machine, devinCommand(home), signal, {
+      title: "Usage: Devin scan",
+      timeoutMs: DEVIN_SYNC_TIMEOUT_MS,
+    });
+    const scan = extractHostJsonScan(output);
+    if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
+    const aggregateJson = JSON.stringify(scan.rows);
+    const records = parseHostUsageAggregates(aggregateJson, agentId, {
+      machineId: machine.id,
+      machineName: machine.name,
+    });
+    const sourceId = opaqueId(machine.id, agentId, "devin-sqlite-v1");
+    upsertSourceEvents(db, {
+      id: sourceId,
+      rootReference: opaqueId("devin-cli-sessions-db"),
+      sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+      generation,
+    }, machine, agentId, records);
+    reconcileSources(db, machine.id, agentId, generation);
+
+    const complete = scan.failureCount === 0;
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
+    const error = scan.failureCount > 0
+      ? `${scan.failureCount} source problem${scan.failureCount === 1 ? "" : "s"} prevented a complete scan${scan.error ? `: ${scan.error}` : "."}`
+      : null;
+    upsertState(db, machine.id, agentId, status, recordCount, error, complete);
+    bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from Devin sessions.db (${status})`);
+  } catch (error) {
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const message = `Usage scan failed: ${errorMessage(error)}`;
+    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+    bb.log.warn(`${machine.name}/${agentId}: ${message}`);
+  }
+}
+
 function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number };
+type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number; home?: string };
 
 function heldHostCommand(command: string) {
   return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '__BB_HOST_COMMAND_DONE__' "$bb_usage_status"; while :; do sleep 3600; done`;
+}
+
+// createTerminalRequestSchema caps start.command at 10,000 characters, a
+// boundary the serialized JSONL collectors have already crossed for some
+// inputs. Oversized commands are staged on the host through files.write
+// (whose content is unbounded) and run via `sh`, so the held wrapper -- DONE
+// marker, exit code, error passthrough -- is identical either way. The
+// content-addressed name keeps parallel agent syncs from racing on one path
+// and never executes a stale script.
+const HOST_COMMAND_MAX_CHARS = 10_000;
+
+async function stageHostCommand(
+  bb: BbPluginApi,
+  machine: Machine,
+  command: string,
+  home: string | undefined,
+  signal: AbortSignal,
+) {
+  const resolvedHome = home
+    ?? (await bb.sdk.hosts.directory({ hostId: machine.id, signal })).directory;
+  const sha256 = createHash("sha256").update(command).digest("hex");
+  const path = `${resolvedHome}/.cache/bb-plugin-usage/host-command-${sha256}.sh`;
+  const result = await bb.sdk.files.write({
+    hostId: machine.id,
+    path,
+    content: command,
+    contentEncoding: "utf8",
+    createParents: true,
+    expectedSha256: null,
+    mode: 0o600,
+  });
+  const stagedSha256 = result.outcome === "written" ? result.sha256 : result.currentSha256;
+  if (stagedSha256 !== sha256) throw new Error("the staged command file did not verify");
+  return `sh ${shellQuote(path)}`;
 }
 
 function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["terminals"]["output"]>>) {
@@ -504,12 +659,24 @@ export async function runHostCommand(
   signal: AbortSignal,
   options: HostCommandOptions,
 ) {
+  let startCommand = heldHostCommand(command);
+  if (startCommand.length > HOST_COMMAND_MAX_CHARS) {
+    // An oversized command can never be submitted, so a staging failure is
+    // the real error; sending the inline command anyway would only reproduce
+    // the contract's 10,000-character rejection.
+    const staged = await stageHostCommand(bb, machine, command, options.home, signal)
+      .catch((error) => {
+        throw new Error(`${options.title} could not stage its command on ${machine.name}: ${errorMessage(error)}`);
+      });
+    startCommand = heldHostCommand(staged);
+  }
+  signal.throwIfAborted();
   const terminal = await bb.sdk.terminals.create({
     scope: { kind: "host_path", hostId: machine.id, cwd: null },
     cols: 120,
     rows: 24,
     title: options.title,
-    start: { mode: "command", command: heldHostCommand(command) },
+    start: { mode: "command", command: startCommand },
   });
   try {
     const deadline = Date.now() + options.timeoutMs;
@@ -799,6 +966,12 @@ function abortableDelay(ms: number, signal: AbortSignal) {
 
 export default async function plugin(bb: BbPluginApi) {
   const settings = bb.settings.define({
+    codexHomes: {
+      type: "string",
+      label: "Extra Codex homes",
+      description: "Optional semicolon-separated Codex home directories. Scans sessions and archived_sessions in each. The default ~/.codex and ~/.codex-profiles/* homes are always scanned.",
+      default: "",
+    },
     piSessionRoots: {
       type: "string",
       label: "Extra Pi session roots",
@@ -849,12 +1022,14 @@ export default async function plugin(bb: BbPluginApi) {
         await Promise.all([
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "prime", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "thaura", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncDevin(bb, db, machine, home, timeoutSignal(DEVIN_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
           syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
           syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
@@ -886,19 +1061,26 @@ export default async function plugin(bb: BbPluginApi) {
     }
   };
 
-  let providerLimitsRequest: Promise<Array<z.infer<typeof providerLimitSchema>>> | null = null;
+  const loadAccountPoolLimits = createAccountPoolLimitsLoader(bb);
+  let providerLimitsRequest: Promise<z.infer<typeof rpcContract.providerLimits.output>> | null = null;
   const readProviderLimits = async () => {
     if (providerLimitsRequest) return providerLimitsRequest;
     providerLimitsRequest = (async () => {
-      const machines = await loadMachines();
-      const connectedMachineIds = new Set(
-        machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
-      );
-      return groupProviderLimits([
-        ...await loadProviderLimits(bb, machines, db),
-        ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
-        ...loadStoredGrokLimits(db, connectedMachineIds),
+      const [local, pool] = await Promise.all([
+        (async () => {
+          const machines = await loadMachines();
+          const connectedMachineIds = new Set(
+            machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
+          );
+          return groupProviderLimits([
+            ...await loadProviderLimits(bb, machines, db),
+            ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
+            ...loadStoredGrokLimits(db, connectedMachineIds),
+          ]);
+        })(),
+        loadAccountPoolLimits(),
       ]);
+      return { limits: mergeAccountPoolLimits(local, pool.limits), accountPoolError: pool.error };
     })();
     try {
       return await providerLimitsRequest;
@@ -918,13 +1100,19 @@ export default async function plugin(bb: BbPluginApi) {
       const sync = syncCoordinator.snapshot();
       const modelProviders = db.prepare(`SELECT model_provider_id id, MAX(model_provider_name) name
         FROM usage_events GROUP BY model_provider_id ORDER BY name`).all() as Array<{ id: string; name: string }>;
+      // Agents not in the static list (e.g. per-account Codex profiles) still
+      // need a filter entry or the dashboard would hide their records.
+      const knownAgentIds = new Set<string>(AGENTS.map((agent) => agent.id));
+      const extraAgents = (db.prepare(`SELECT provider_id id, MAX(provider_name) name
+        FROM usage_events GROUP BY provider_id ORDER BY name`).all() as Array<{ id: string; name: string }>)
+        .filter((agent) => !knownAgentIds.has(agent.id));
       return {
         mode: "live" as const,
         generatedAt: new Date().toISOString(),
         lastSyncedAt: sync.completedAt,
         pricingVersion: pricingVersion(),
         machines,
-        agents: [...AGENTS],
+        agents: [...AGENTS, ...extraAgents],
         modelProviders,
         records,
         sources,

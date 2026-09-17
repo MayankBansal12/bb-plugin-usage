@@ -1,7 +1,8 @@
 import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./server";
 import Database from "better-sqlite3";
+import { createHash, randomBytes } from "node:crypto";
 import { gunzipSync, gzipSync } from "node:zlib";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
 
 vi.mock("@bb/plugin-sdk", () => ({
@@ -9,9 +10,10 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  dashboardRecordsSql, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  openCodeCommand, openCodeSql, runHostCommand, syncOpenCode, syncOpenCodeGo,
+  rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
+  openCodeCommand, openCodeSql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
+import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -31,10 +33,82 @@ function fakeHostScanOutput(agentId: string, rows: Array<Record<string, unknown>
   return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
 }
 
+// The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
+// where the gzipped payload is the generated collector script with
+// agentId/roots baked in as a literal object — decode it the same way
+// to tell which JSON-agent sync this particular terminal is for.
+function agentIdFromCommand(command: string): string | null {
+  // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
+  // the closing quote of the base64 argument — the rest of the call
+  // (,'base64')) has its single quotes mangled by shellQuote's bash
+  // escaping (' becomes '"'"') once this is embedded in the full
+  // command, so anchoring on that literal text would never match here.
+  const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+  if (!outer) return null;
+  const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+  // Inner layer: the collector function is invoked as
+  // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
+  // encodedInput is JSON.stringify(input) base64'd separately from the
+  // gzip layer above.
+  const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+  if (!inner) return null;
+  const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
+  return input.agentId ?? null;
+}
+
+function hostFileWriteMock(stagedFiles: Map<string, string>) {
+  return vi.fn(async (args: { path: string; content: string; expectedSha256?: string | null }) => {
+    const currentContent = stagedFiles.get(args.path);
+    const currentSha256 = currentContent === undefined
+      ? null
+      : createHash("sha256").update(currentContent).digest("hex");
+    if (args.expectedSha256 !== undefined && args.expectedSha256 !== currentSha256) {
+      return { outcome: "conflict" as const, currentSha256 };
+    }
+    stagedFiles.set(args.path, args.content);
+    return {
+      outcome: "written" as const,
+      sha256: createHash("sha256").update(args.content).digest("hex"),
+      sizeBytes: args.content.length,
+    };
+  });
+}
+
+// Oversized commands reach the terminal as `sh '<staged path>'`; resolve that
+// back to the staged file contents before decoding which agent it belongs to.
+function commandTextFor(command: string, stagedFiles: Map<string, string>) {
+  const stagedPath = command.match(/sh '([^']+\.sh)'/)?.[1];
+  return (stagedPath ? stagedFiles.get(stagedPath) : undefined) ?? command;
+}
+
 describe("JSON agent roots", () => {
+  it("includes active and archived Codex sessions", () => {
+    expect(jsonAgentRoots("/home/user", "codex", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.codex/sessions",
+      "/home/user/.codex/archived_sessions",
+    ]);
+  });
+
+  it("scans both session directories in each configured Codex home", () => {
+    expect(jsonAgentRoots("/home/user", "codex", {
+      piSessionRoots: "", primeSessionRoots: "",
+      codexHomes: "~/.codex/; ~/custom-codex/; /mnt/codex\n~/custom-codex",
+    })).toEqual([
+      "/home/user/.codex/sessions", "/home/user/.codex/archived_sessions",
+      "/home/user/custom-codex/sessions", "/home/user/custom-codex/archived_sessions",
+      "/mnt/codex/sessions", "/mnt/codex/archived_sessions",
+    ]);
+  });
+
   it("points Antigravity at the provider bridge's own usage log", () => {
     expect(jsonAgentRoots("/home/user", "antigravity", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.antigravity-acp/usage.jsonl",
+    ]);
+  });
+
+  it("points DeepSeek Harness at its compressed session root", () => {
+    expect(jsonAgentRoots("/home/user", "dsh", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.dsh/sessions",
     ]);
   });
 
@@ -114,31 +188,8 @@ describe("sync RPC", () => {
     // RPC and asserts a row actually lands in the database for Antigravity.
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
-
-    // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
-    // where the gzipped payload is the generated collector script with
-    // agentId/roots baked in as a literal object — decode it the same way
-    // to tell which JSON-agent sync this particular terminal is for.
-    function agentIdFromCommand(command: string): string | null {
-      // Outer layer: eval(gunzip(base64(<script source>))). Match only up to
-      // the closing quote of the base64 argument — the rest of the call
-      // (,'base64')) has its single quotes mangled by shellQuote's bash
-      // escaping (' becomes '"'"') once this is embedded in the full
-      // command, so anchoring on that literal text would never match here.
-      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
-      if (!outer) return null;
-      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
-      // Inner layer: the collector function is invoked as
-      // (function hostJsonCollector(encodedInput, dependencies) {...})("<base64 JSON>", {...}) —
-      // encodedInput is JSON.stringify(input) base64'd separately from the
-      // gzip layer above.
-      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
-      if (!inner) return null;
-      const input = JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string };
-      return input.agentId ?? null;
-    }
-
     const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
 
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
@@ -156,6 +207,7 @@ describe("sync RPC", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
+        files: { write: hostFileWriteMock(stagedFiles) },
         terminals: {
           create: vi.fn(async (input: { start: { command: string } }) => {
             const id = `terminal-${commandsByTerminalId.size}`;
@@ -164,7 +216,7 @@ describe("sync RPC", () => {
           }),
           get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
           output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandsByTerminalId.get(args.terminalId) ?? "";
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
             const agentId = agentIdFromCommand(command);
             const text = agentId === "antigravity"
               ? fakeHostScanOutput("antigravity", [{
@@ -200,6 +252,288 @@ describe("sync RPC", () => {
       "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'antigravity'",
     ).get();
     expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    // The terminal contract caps start.command at 10,000 characters; every
+    // collector command must fit, whether inline or staged through files.write.
+    for (const command of commandsByTerminalId.values()) {
+      expect(command.length).toBeLessThanOrEqual(10_000);
+    }
+
+    db.close();
+  });
+
+  it("stages an oversized collector script through files.write and still records its rows", async () => {
+    // A huge configured session root inflates the serialized scan input enough
+    // that the compressed collector command no longer fits the terminal's
+    // 10,000-character limit, forcing the files.write staging path.
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const write = hostFileWriteMock(stagedFiles);
+
+    const bb = {
+      settings: {
+        define: vi.fn(() => ({
+          get: async () => ({ piSessionRoots: `/data/${randomBytes(6_000).toString("hex")}`, primeSessionRoots: "" }),
+        })),
+      },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === "pi"
+              ? fakeHostScanOutput("pi", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "google",
+                model: "gemini-2.5-pro",
+                loggedCostUsd: null,
+                uncachedInputTokens: 100,
+                cachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                outputTokens: 10,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'pi'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    expect(write).toHaveBeenCalled();
+    for (const command of commandsByTerminalId.values()) {
+      expect(command.length).toBeLessThanOrEqual(10_000);
+    }
+    const stagedPaths = [...stagedFiles.keys()];
+    expect(stagedPaths.every((path) => path.startsWith("/home/user/.cache/bb-plugin-usage/host-command-"))).toBe(true);
+
+    const syncState = db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'pi'",
+    ).get();
+    expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    db.close();
+  });
+
+  it("actually dispatches a DeepSeek Harness scan through syncAll, not just through direct scan() calls", async () => {
+    // Same wiring regression shape as the Antigravity test above: the agent
+    // must reach syncAll()'s Promise.all, not just AGENTS/jsonAgentRoots.
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write: hostFileWriteMock(stagedFiles) },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === "dsh"
+              ? fakeHostScanOutput("dsh", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "deepseek",
+                model: "deepseek-v4-pro",
+                loggedCostUsd: null,
+                uncachedInputTokens: 100,
+                cachedInputTokens: 0,
+                cacheWriteTokens: 0,
+                outputTokens: 20,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'dsh'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    const syncState = db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'dsh'",
+    ).get();
+    expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    db.close();
+  });
+
+  it("collects Codex profile accounts as separate dashboard agents", async () => {
+    const db = new Database(":memory:");
+    let handlers: {
+      sync: () => unknown;
+      dashboard: () => Promise<{
+        agents: Array<{ id: string; name: string }>;
+        records: Array<{ agentId: string; agentName: string; processedTokens: number }>;
+      }>;
+    } | undefined;
+
+    // Decode the generated collector script's baked-in scan input so the test
+    // can answer codex scans with profile-tagged rows and assert the scan
+    // covers the account root.
+    function scanInputFromCommand(command: string): { agentId?: string; roots?: string[]; accountRoot?: string } | null {
+      const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+      if (!outer) return null;
+      const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+      const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+      if (!inner) return null;
+      return JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8"));
+    }
+
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const day = new Date().toISOString().slice(0, 10);
+    const aggregateRow = (account?: string) => ({
+      day,
+      modelProviderId: "openai",
+      model: "gpt-5.6-sol",
+      project: "app",
+      ...(account === undefined ? {} : { account }),
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    });
+
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as typeof handlers;
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write: hostFileWriteMock(stagedFiles) },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const input = scanInputFromCommand(command);
+            const text = input?.agentId === "codex"
+              ? fakeHostScanOutput("codex", [aggregateRow(), aggregateRow("saiens")])
+              : fakeHostScanOutput(input?.agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 2 });
+    }, { timeout: 2000 });
+
+    const codexScan = [...commandsByTerminalId.values()]
+      .map((command) => scanInputFromCommand(commandTextFor(command, stagedFiles)))
+      .find((input) => input?.agentId === "codex");
+    expect(codexScan).toMatchObject({
+      roots: ["/home/user/.codex/sessions", "/home/user/.codex/archived_sessions"],
+      accountRoot: "/home/user/.codex-profiles",
+    });
+
+    const providers = db.prepare(
+      "SELECT provider_id, provider_name FROM usage_events ORDER BY provider_id",
+    ).all();
+    expect(providers).toEqual([
+      { provider_id: "codex", provider_name: "Codex" },
+      { provider_id: "codex-saiens", provider_name: "Codex (saiens)" },
+    ]);
+    expect(db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'codex'",
+    ).get()).toEqual({ status: "ready", recordCount: 2 });
+
+    const dashboard = await handlers!.dashboard();
+    expect(dashboard.agents).toEqual(expect.arrayContaining([
+      { id: "codex", name: "Codex" },
+      { id: "codex-saiens", name: "Codex (saiens)" },
+    ]));
+    expect(dashboard.records).toEqual(expect.arrayContaining([
+      expect.objectContaining({ agentId: "codex", agentName: "Codex", processedTokens: 125 }),
+      expect.objectContaining({ agentId: "codex-saiens", agentName: "Codex (saiens)", processedTokens: 125 }),
+    ]));
 
     db.close();
   });
@@ -458,6 +792,190 @@ describe("host command output", () => {
     )).rejects.toThrow("timed out");
     expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
   });
+
+  function stagedRun(text: string, overrides: { write?: unknown; directory?: unknown } = {}) {
+    const stagedFiles = new Map<string, string>();
+    const create = vi.fn(async (input: { start: { command: string } }) => ({ id: "terminal-1", status: "starting", input }));
+    const bb = {
+      sdk: {
+        files: { write: overrides.write ?? hostFileWriteMock(stagedFiles) },
+        hosts: { directory: overrides.directory ?? vi.fn(async () => ({ directory: "/resolved/home" })) },
+        terminals: {
+          create,
+          get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
+          output: vi.fn(async () => ({
+            chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
+            truncated: false,
+          })),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+    return { bb, create, stagedFiles };
+  }
+
+  it("stages oversized commands on the host and runs them with sh", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const text = "scan result\n__BB_HOST_COMMAND_DONE__:0\n";
+    const { bb, create, stagedFiles } = stagedRun(text);
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).resolves.toBe(text);
+
+    const startCommand = create.mock.calls[0]![0].start.command;
+    expect(startCommand.length).toBeLessThanOrEqual(10_000);
+    expect(startCommand).toContain("__BB_HOST_COMMAND_DONE__");
+
+    const stagedPaths = [...stagedFiles.keys()];
+    expect(stagedPaths).toHaveLength(1);
+    expect(stagedPaths[0]).toMatch(/^\/home\/user\/\.cache\/bb-plugin-usage\/host-command-[0-9a-f]{64}\.sh$/);
+    expect(stagedFiles.get(stagedPaths[0]!)).toBe(command);
+    expect(startCommand).toContain(`sh '${stagedPaths[0]}'`);
+    expect(bb.sdk.files.write).toHaveBeenCalledWith(expect.objectContaining({
+      hostId: "host-1",
+      path: stagedPaths[0],
+      content: command,
+      createParents: true,
+    }));
+    expect(bb.sdk.hosts.directory).not.toHaveBeenCalled();
+  });
+
+  it("reuses an identical staged script across concurrent runs without rewriting it", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const text = "scan result\n__BB_HOST_COMMAND_DONE__:0\n";
+    const { bb, create, stagedFiles } = stagedRun(text);
+    const storeFile = vi.spyOn(stagedFiles, "set");
+
+    const results = await Promise.all([0, 1].map(() => runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )));
+
+    expect(results).toEqual([text, text]);
+    expect(storeFile).toHaveBeenCalledOnce();
+    expect(stagedFiles.size).toBe(1);
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[0]![0].start.command).toBe(create.mock.calls[1]![0].start.command);
+    const writes = await Promise.all(vi.mocked(bb.sdk.files.write).mock.results.map((result) => result.value));
+    expect(writes.map((result) => result.outcome)).toEqual(["written", "conflict"]);
+  });
+
+  it("does not launch a terminal when cancelled during the staging write", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const controller = new AbortController();
+    const reason = new Error("Usage sync cancelled");
+    let finishWrite!: () => void;
+    const write = vi.fn(async () => {
+      await new Promise<void>((resolve) => { finishWrite = resolve; });
+      return { outcome: "written" as const, sha256: createHash("sha256").update(command).digest("hex") };
+    });
+    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    const result = runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      controller.signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    );
+    const rejection = expect(result).rejects.toBe(reason);
+    expect(write).toHaveBeenCalledOnce();
+    controller.abort(reason);
+    finishWrite();
+
+    await rejection;
+    expect(create).not.toHaveBeenCalled();
+    expect(bb.sdk.terminals.close).not.toHaveBeenCalled();
+  });
+
+  it("resolves the machine home directory for staging when the caller does not provide it", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const { bb, stagedFiles } = stagedRun("ok\n__BB_HOST_COMMAND_DONE__:0\n");
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).resolves.toContain("__BB_HOST_COMMAND_DONE__:0");
+
+    expect(bb.sdk.hosts.directory).toHaveBeenCalledWith({ hostId: "host-1", signal: expect.any(AbortSignal) });
+    expect([...stagedFiles.keys()][0]).toMatch(/^\/resolved\/home\/\.cache\/bb-plugin-usage\/host-command-/);
+  });
+
+  it.each([
+    { outcome: "conflict" as const, currentSha256: "mismatch" },
+    { outcome: "written" as const, sha256: "wrong", sizeBytes: 1 },
+  ])("surfaces the staging error when the staged file cannot be verified (%s)", async (result) => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const write = vi.fn(async () => result);
+    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    // An oversized command cannot be submitted inline either, so the staging
+    // failure is reported instead of creating a terminal the host must reject.
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).rejects.toThrow("Usage test could not stage its command on Machine: the staged command file did not verify");
+
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the staging error when the host file write throws", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const write = vi.fn(async () => { throw new Error("host.write_file unsupported"); });
+    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).rejects.toThrow("Usage test could not stage its command on Machine: host.write_file unsupported");
+
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("surfaces staged command diagnostics and exit codes identically", async () => {
+    const command = `printf '%s' '${"x".repeat(11_000)}'`;
+    const { bb } = stagedRun("__BB_USAGE_ERROR__:collector broke\n__BB_HOST_COMMAND_DONE__:1\n");
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
+    )).rejects.toThrow("collector broke");
+  });
+
+  it("keeps commands under the limit inline without touching the files API", async () => {
+    const write = vi.fn();
+    const { bb } = stagedRun("small\n__BB_HOST_COMMAND_DONE__:0\n", { write });
+
+    await expect(runHostCommand(
+      bb,
+      { id: "host-1", name: "Machine" },
+      "printf small",
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+    )).resolves.toContain("small");
+    expect(write).not.toHaveBeenCalled();
+  });
 });
 
 describe("OpenCode query", () => {
@@ -599,6 +1117,205 @@ describe("OpenCode query", () => {
     expect(asLocal.getHours()).toBe(0);
     expect(asLocal.getMinutes()).toBe(0);
     expect(openCodeSql()).not.toContain("'start of day', '-89 days')");
+    db.close();
+  });
+});
+
+describe("Devin collector sync", () => {
+  function usageDb() {
+    const db = new Database(":memory:");
+    db.exec(`
+      CREATE TABLE usage_events (
+        event_key TEXT PRIMARY KEY, timestamp TEXT NOT NULL, day TEXT NOT NULL,
+        provider_id TEXT NOT NULL, provider_name TEXT NOT NULL, model TEXT NOT NULL,
+        cost_usd REAL NOT NULL, cache_savings_usd REAL NOT NULL, processed_tokens INTEGER NOT NULL,
+        cached_input_tokens INTEGER NOT NULL, cache_write_tokens INTEGER NOT NULL,
+        uncached_input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+        model_provider_id TEXT NOT NULL DEFAULT 'unknown', model_provider_name TEXT NOT NULL DEFAULT 'Unknown',
+        logged_cost_usd REAL, pricing_status TEXT NOT NULL DEFAULT 'unknown', project TEXT NOT NULL DEFAULT 'Unknown'
+      );
+      CREATE TABLE usage_sources (
+        source_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, machine_name TEXT NOT NULL,
+        provider_id TEXT NOT NULL, root_reference TEXT NOT NULL, content_sha TEXT NOT NULL,
+        last_seen_generation TEXT NOT NULL, last_success_at TEXT NOT NULL, pricing_version TEXT
+      );
+      CREATE TABLE usage_event_sources (event_key TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY (event_key, source_id));
+      CREATE TABLE usage_sync_state (
+        machine_id TEXT NOT NULL, provider_id TEXT NOT NULL, status TEXT NOT NULL, last_attempt_at TEXT,
+        last_success_at TEXT, record_count INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY (machine_id, provider_id)
+      );
+    `);
+    return db;
+  }
+
+  function decodeCollectorInput(command: string) {
+    const outer = command.match(/Buffer\.from\("([A-Za-z0-9+/=]+)"/);
+    if (!outer) return null;
+    const source = gunzipSync(Buffer.from(outer[1]!, "base64")).toString("utf8");
+    const inner = source.match(/\}\)\("([A-Za-z0-9+/=]+)"/);
+    if (!inner) return null;
+    return JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8")) as { agentId?: string; dbPaths?: string[] };
+  }
+
+  it("targets the Devin CLI session database through a node collector", () => {
+    const command = devinCommand("/home/user");
+    expect(command).toContain("command -v node");
+    expect(command).toContain("node -e");
+    const input = decodeCollectorInput(command);
+    expect(input).toMatchObject({
+      agentId: "devin",
+      dbPaths: [
+        "/home/user/.local/share/devin/cli/sessions.db",
+        "/home/user/Library/Application Support/devin/cli/sessions.db",
+      ],
+    });
+  });
+
+  it("stores scanned Devin aggregates and reports ready", async () => {
+    const db = usageDb();
+    const info = vi.fn();
+    const bb = { log: { info, warn: vi.fn() } } as unknown as BbPluginApi;
+    const output = fakeHostScanOutput("devin", [{
+      day: new Date().toISOString().slice(0, 10),
+      modelProviderId: "devin",
+      model: "swe-2-max",
+      project: "project-a",
+      loggedCostUsd: null,
+      uncachedInputTokens: 150,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 30,
+    }]);
+
+    await syncDevin(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => output,
+    );
+
+    const event = db.prepare("SELECT provider_id, provider_name, model, project, processed_tokens, pricing_status FROM usage_events").get();
+    expect(event).toEqual({
+      provider_id: "devin", provider_name: "Devin", model: "swe-2-max",
+      project: "project-a", processed_tokens: 245, pricing_status: "unknown",
+    });
+    expect(db.prepare("SELECT status, record_count recordCount FROM usage_sync_state").get())
+      .toEqual({ status: "ready", recordCount: 1 });
+    db.close();
+  });
+
+  it("reports no-data when the host scan finds no Devin session database", async () => {
+    const db = usageDb();
+    const bb = { log: { info: vi.fn(), warn: vi.fn() } } as unknown as BbPluginApi;
+
+    await syncDevin(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => fakeHostScanOutput("devin", []),
+    );
+
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get())
+      .toEqual({ status: "no-data", recordCount: 0, error: null });
+    db.close();
+  });
+
+  it("retains prior usage and isolates a failed Devin scan to its source state", async () => {
+    const db = usageDb();
+    db.prepare("INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens) VALUES ('devin-event', '2026-08-09T00:00:00Z', '2026-08-09', 'devin', 'Devin', 'swe-2-max', 0, 0, 60, 0, 0, 40, 20)").run();
+    db.prepare("INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id, root_reference, content_sha, last_seen_generation, last_success_at) VALUES ('devin-source', 'host-1', 'Machine', 'devin', 'ref', 'sha', 'gen', '2026-08-09T00:00:00Z')").run();
+    db.prepare("INSERT INTO usage_event_sources (event_key, source_id) VALUES ('devin-event', 'devin-source')").run();
+    const warn = vi.fn();
+    const bb = { log: { info: vi.fn(), warn } } as unknown as BbPluginApi;
+
+    await syncDevin(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => { throw new Error("Node.js is required to scan Devin usage."); },
+    );
+
+    expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 1 });
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get()).toEqual({
+      status: "unavailable",
+      recordCount: 1,
+      error: "Usage scan failed: Node.js is required to scan Devin usage.",
+    });
+    expect(warn).toHaveBeenCalledWith("Machine/devin: Usage scan failed: Node.js is required to scan Devin usage.");
+    db.close();
+  });
+
+  it("dispatches a Devin scan through syncAll like the JSON agents", async () => {
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as { sync: () => unknown };
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write: hostFileWriteMock(stagedFiles) },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const agentId = decodeCollectorInput(commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles))?.agentId;
+            const text = agentId === "devin"
+              ? fakeHostScanOutput("devin", [{
+                day: new Date().toISOString().slice(0, 10),
+                modelProviderId: "devin",
+                model: "swe-2-max",
+                project: "project-a",
+                loggedCostUsd: null,
+                uncachedInputTokens: 150,
+                cachedInputTokens: 60,
+                cacheWriteTokens: 5,
+                outputTokens: 30,
+              }])
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+
+    await vi.waitFor(() => {
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'devin'").get();
+      expect(row).toBeTruthy();
+    }, { timeout: 2000 });
+
+    expect(db.prepare(
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'devin'",
+    ).get()).toEqual({ status: "ready", recordCount: 1 });
     db.close();
   });
 });
@@ -808,5 +1525,263 @@ describe("Grok limit snapshots", () => {
     await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([]);
     db.close();
+  });
+});
+
+
+describe("Account Pooler limits RPC integration", () => {
+  it.each(["local@example.com", "pool@example.com"])("preserves local limits for %s on pool failures and missing observations", async (localEmail) => {
+    const db = new Database(":memory:");
+    let read: (() => Promise<unknown>) | undefined;
+    const poolAccounts = [{
+      id: "pool-account", provider: "codex", kind: "oauth", label: "Pooled Codex",
+      email: "pool@example.com", subscriptionType: null, enabled: true, status: "ready", error: null,
+      observedAt: 1789300800000, fiveHourUtilization: null, fiveHourResetAt: null,
+      sevenDayUtilization: null, sevenDayResetAt: null, familyWeekly: {},
+      limitWindows: [{ slot: "primary", windowMinutes: 10080, utilization: 0.17, resetAt: 1789905600000, status: null }],
+    }];
+    const callRpc = vi.fn().mockResolvedValue(poolAccounts);
+    const hosts = vi.fn().mockResolvedValue([]);
+    const bb = {
+      settings: { define: vi.fn() },
+      storage: {
+        database: () => db,
+        migrate: (_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); },
+      },
+      rpc: { register: (_contract: unknown, handlers: { providerLimits: () => Promise<unknown> }) => { read = handlers.providerLimits; } },
+      sdk: {
+        hosts: { list: hosts },
+        plugins: {
+          list: vi.fn().mockResolvedValue({ plugins: [{ id: "account-pool", enabled: true }] }), callRpc,
+        },
+        system: { usageLimits: vi.fn().mockResolvedValue({ codex: {
+          status: "ok", accountEmail: localEmail, planLabel: "Pro",
+          windows: [{ label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" }],
+        } }) },
+      },
+      background: { service: vi.fn() },
+      log: { debug: vi.fn(), warn: vi.fn() },
+    } as unknown as BbPluginApi;
+    try {
+      await plugin(bb);
+      const first = rpcContract.providerLimits.output.parse(await read!());
+      expect(first.accountPoolError).toBeNull();
+      expect(first.limits).toHaveLength(1);
+      expect(first.limits[0]).toMatchObject({
+        poolAccount: { label: "Pooled Codex" }, machines: [],
+        windows: [{ label: "Weekly", usedPercent: 17 }],
+      });
+      hosts.mockResolvedValue([{ id: "laptop", name: "Laptop", status: "connected" }]);
+      callRpc.mockRejectedValue(new Error("Pool temporarily unavailable"));
+      const next = rpcContract.providerLimits.output.parse(await read!());
+      expect(next.accountPoolError).toContain("last reported");
+      expect(next.limits).toHaveLength(localEmail === "pool@example.com" ? 1 : 2);
+      expect(next.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
+        { label: localEmail === "pool@example.com" ? "Weekly" : "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
+      ]);
+      expect(next.limits.some((limit) => limit.poolAccount?.id === "pool-account")).toBe(true);
+
+      callRpc.mockResolvedValue([{ ...poolAccounts[0], observedAt: null, limitWindows: [] }]);
+      const unobserved = rpcContract.providerLimits.output.parse(await read!());
+      expect(unobserved.accountPoolError).toBeNull();
+      expect(unobserved.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
+        { label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("retained usage through the real sync path", () => {
+  const DAY = new Date().toISOString().slice(0, 10);
+  const catalog = (rate: number) => ({ openai: { id: "openai", name: "OpenAI", models: {
+    "gpt-test": { id: "gpt-test", cost: { input: rate, output: rate, cache_read: 0, cache_write: 0 } },
+  } } });
+  function piRow(overrides: Record<string, unknown> = {}) {
+    return { day: DAY, modelProviderId: "openai", model: "gpt-test", project: "proj", loggedCostUsd: null,
+      uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500, ...overrides };
+  }
+  function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number) {
+    const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows };
+    const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
+    return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+  }
+
+  // Drives the unmodified plugin factory end-to-end through its public sync()
+  // RPC (like the Antigravity regression test above); the mutable `state`
+  // object lets each subsequent sync serve a different pi scan.
+  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string }, targetAgent = "pi") {
+    const db = new Database(":memory:");
+    let handlers: { sync: () => unknown; dashboard: () => Promise<{ sync: { running: boolean } }> } | undefined;
+    const commandsByTerminalId = new Map<string, string>();
+    const stagedFiles = new Map<string, string>();
+    const bb = {
+      settings: { define: vi.fn(() => ({ get: async () => ({ codexHomes: state.codexHomes ?? "", piSessionRoots: "", primeSessionRoots: "" }) })) },
+      storage: {
+        database: vi.fn(() => db),
+        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
+      },
+      rpc: {
+        register: vi.fn((_contract: unknown, registered: unknown) => {
+          handlers = registered as typeof handlers;
+        }),
+      },
+      sdk: {
+        hosts: {
+          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
+          directory: vi.fn(async () => ({ directory: "/home/user" })),
+        },
+        files: { write: hostFileWriteMock(stagedFiles) },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => {
+            const id = `terminal-${commandsByTerminalId.size}`;
+            commandsByTerminalId.set(id, input.start.command);
+            return { id, status: "starting" };
+          }),
+          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
+          output: vi.fn(async (args: { terminalId: string }) => {
+            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
+            const agentId = agentIdFromCommand(command);
+            const text = agentId === targetAgent
+              ? fakeHostScanOutputWith(targetAgent, state.rows, state.failureCount)
+              : fakeHostScanOutput(agentId ?? "codex", []);
+            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
+          }),
+          close: vi.fn(async () => undefined),
+        },
+      },
+      realtime: { publish: vi.fn() },
+      background: { service: vi.fn() },
+      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await plugin(bb);
+    expect(handlers?.sync()).toEqual({ ok: true });
+    await vi.waitFor(async () => expect((await handlers!.dashboard()).sync.running).toBe(false));
+    return { db, syncAgain: async () => {
+      handlers!.sync();
+      await vi.waitFor(async () => expect((await handlers!.dashboard()).sync.running).toBe(false));
+    } };
+  }
+
+
+  afterEach(() => resetPricingCatalog());
+  const totals = (db: Database) => db.prepare(`SELECT COUNT(*) count, SUM(processed_tokens) tokens,
+    SUM(cost_usd) cost FROM usage_events`).get();
+
+  it("preserves the existing Codex source and missing history as archive and custom roots are added", async () => {
+    setPricingCatalog(catalog(1000), "codex-archive-v1");
+    const state = { rows: [piRow(), piRow({ account: "work" })], failureCount: 0, codexHomes: "" };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      const legacySourceId = createHash("sha256")
+        .update(["host-1", "codex", "host-json-scan-v1", "/home/user/.codex/sessions"].join("\0")).digest("hex");
+      expect(db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='codex'").all())
+        .toEqual([{ id: legacySourceId }]);
+      const previousRootReference = db.prepare("SELECT root_reference ref FROM usage_sources WHERE source_id=?").get(legacySourceId);
+      state.codexHomes = "~/custom-codex";
+      state.rows = [piRow({ project: "archived" })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 3, tokens: 4500, cost: 4.5 });
+      expect(db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='codex'").all())
+        .toEqual([{ id: legacySourceId }]);
+      expect(db.prepare("SELECT root_reference ref FROM usage_sources WHERE source_id=?").get(legacySourceId))
+        .not.toEqual(previousRootReference);
+      expect(db.prepare("SELECT DISTINCT source_id id FROM usage_event_sources").all()).toEqual([{ id: legacySourceId }]);
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 3, tokens: 4500, cost: 4.5 });
+    } finally { db.close(); }
+  });
+
+  it.each([0, 1])("retains smaller and missing buckets across nonempty and empty scans (failures: %s)", async (failureCount) => {
+    setPricingCatalog(catalog(1000), "retention-v1");
+    const state = { rows: [piRow(), piRow({ project: "second" })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.failureCount = failureCount;
+      state.rows = [piRow({ uncachedInputTokens: 300, outputTokens: 100 })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.rows = [piRow({ uncachedInputTokens: 2000 })];
+      state.failureCount = 0;
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 4000, cost: 4 });
+    } finally { db.close(); }
+  });
+
+  it("sums and prices the retained buckets when old logs disappear and new usage changes the mix", async () => {
+    setPricingCatalog(catalog(1000), "mix-v1");
+    const state = { rows: [piRow()], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      state.rows = [piRow({ uncachedInputTokens: 300, outputTokens: 1000 })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 2000, cost: 2 });
+      expect(db.prepare(`SELECT processed_tokens total, uncached_input_tokens + cached_input_tokens
+        + cache_write_tokens + output_tokens buckets FROM usage_events`).get()).toEqual({ total: 2000, buckets: 2000 });
+    } finally { db.close(); }
+  });
+
+  it("applies catalog increases and decreases to both observed and missing retained rows", async () => {
+    setPricingCatalog(catalog(1000), "prices-v1");
+    const state = { rows: [piRow(), piRow({ project: "missing" })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      state.rows = [piRow()];
+      setPricingCatalog(catalog(2000), "prices-v2");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 6 });
+      setPricingCatalog(catalog(500), "prices-v3");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 1.5 });
+      state.rows = [];
+      setPricingCatalog(catalog(1000), "prices-v4");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+    } finally { db.close(); }
+  });
+
+  it("lets logged-cost corrections flow through at unchanged token counts", async () => {
+    setPricingCatalog(catalog(1000), "logged-v1");
+    const state = { rows: [piRow({ loggedCostUsd: 2 })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      state.rows = [piRow({ loggedCostUsd: 1 })];
+      await syncAgain();
+      expect(db.prepare("SELECT cost_usd cost, logged_cost_usd logged, pricing_status status FROM usage_events").get())
+        .toEqual({ cost: 1, logged: 1, status: "logged" });
+    } finally { db.close(); }
+  });
+
+  it("uses the logged fallback when catalog pricing disappears", async () => {
+    setPricingCatalog(catalog(1000), "fallback-v1");
+    const state = { rows: [piRow({ loggedCostUsd: 0.5 })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state, "dsh");
+    try {
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+      setPricingCatalog({}, "fallback-v2");
+      await syncAgain();
+      expect(db.prepare("SELECT cost_usd cost, pricing_status status FROM usage_events").get())
+        .toEqual({ cost: 0.5, status: "logged" });
+    } finally { db.close(); }
+  });
+
+  it("bounds preserved history by age even when the next scan is empty", async () => {
+    setPricingCatalog(catalog(1000), "age-v1");
+    const state = { rows: [piRow()], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state);
+    try {
+      db.prepare("UPDATE usage_events SET day='2000-01-01'").run();
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 0, tokens: null, cost: null });
+      expect(db.prepare("SELECT COUNT(*) count FROM usage_event_sources").get()).toEqual({ count: 0 });
+    } finally { db.close(); }
   });
 });

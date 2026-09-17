@@ -1,7 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits } from "./provider-limits";
+import { clampPercent, formatLimitReset, formatLimitValue, groupProviderLimits, maskEmailAddresses } from "./provider-limits";
 
 describe("provider limit presentation", () => {
+  it.each([
+    ["emelie@gmail.com", "e···e@g···l.com"],
+    ["person@example.com", "p···n@e···e.com"],
+    ["jonathan@gmail.com", "j···n@g···l.com"],
+    ["averylongaccountname@averylongcompanyname.com", "a···e@a···e.com"],
+    ["amy@example.com", "a···y@e···e.com"],
+    ["ab@example.com", "a···@e···e.com"],
+    ["a@example.com", "···@e···e.com"],
+    ["Work <person+dev@example.com>", "Work <p···v@e···e.com>"],
+    ["Failed for person@example.com and other@example.org", "Failed for p···n@e···e.com and o···r@e···e.org"],
+    ["person@team.example.co.uk", "p···n@t···o.uk"],
+    ["a@x.io", "···@···.io"],
+    ["person@例子.公司", "p···n@例···.公司"],
+    ["Failed for person@example.com.", "Failed for p···n@e···e.com."],
+    ["p****n@e*****e.com", "p···n@e···e.com"],
+    ["p...n@e...e.com", "p···n@e···e.com"],
+    ["person@localhost", "p···n@l···t"],
+    ["Personal account", "Personal account"],
+    ["p···n@e···e.com", "p···n@e···e.com"],
+  ])("masks email addresses in account labels and diagnostics: %s", (value, expected) => {
+    expect(maskEmailAddresses(value)).toBe(expected);
+    expect(maskEmailAddresses(expected)).toBe(expected);
+  });
+
   it("clamps percentages to the progress range", () => {
     expect(clampPercent(-4)).toBe(0);
     expect(clampPercent(42.4)).toBe(42.4);
