@@ -679,39 +679,14 @@ function ProviderShareRow({
   );
 }
 
-function CacheHitRateRow({ item }: { item: CacheHitRateGroup }) {
-  const ratePercent = item.rate === null ? null : item.rate * 100;
+function CacheRateValue({ item }: { item: CacheHitRateGroup }) {
   return (
-    <div className="px-4 py-3.5 sm:px-5">
-      <div className="flex items-center gap-3">
-        {item.model
-          ? <ProviderLogo id={modelLogoId(item.model)} size="md" />
-          : <ProviderLogo id={item.agentId} name={item.agentName} size="md" />}
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-medium" title={item.model ?? item.agentName}>{item.model ?? item.agentName}</div>
-          <div className="mt-0.5 truncate text-xs text-muted-foreground">
-            {item.model ? item.agentName : `${compact(item.cachedInputTokens)} cached of ${compact(item.totalInputTokens)} input tokens`}
-          </div>
-        </div>
-        <div
-          className="shrink-0 text-sm font-semibold tabular-nums"
-          title={item.rate === null ? "This agent does not report cache usage, or no input tokens were recorded." : "Token-weighted cached input share"}
-        >
-          {ratePercent === null ? "Unknown" : `${ratePercent.toFixed(1)}%`}
-        </div>
-      </div>
-      <div className="mt-2.5 h-1.5 overflow-hidden rounded-full bg-muted">
-        <div
-          className="h-full rounded-full bg-amber-500 transition-[width] duration-500 ease-out motion-reduce:transition-none"
-          style={{ width: `${ratePercent ?? 0}%`, minWidth: ratePercent && ratePercent > 0 ? 3 : 0 }}
-        />
-      </div>
-      {item.model && (
-        <div className="mt-2 text-xs text-muted-foreground">
-          {item.rate === null ? "Cache usage unavailable" : `${compact(item.cachedInputTokens)} cached of ${compact(item.totalInputTokens)} input tokens`}
-        </div>
-      )}
-    </div>
+    <span
+      className="font-medium tabular-nums"
+      title={item.rate === null ? "This agent does not report cache usage, or no input tokens were recorded." : "Cache reads divided by cache reads, cache writes, and uncached input"}
+    >
+      {item.rate === null ? "Unknown" : `${(item.rate * 100).toFixed(1)}%`}
+    </span>
   );
 }
 
@@ -1069,6 +1044,7 @@ function UsageDashboard() {
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [cacheHitRateMode, setCacheHitRateMode] = useState<CacheHitRateMode>("agent");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
+  const [cacheHitRatePage, setCacheHitRatePage] = useState(1);
   const [breakdownPage, setBreakdownPage] = useState(1);
   const [breakdownHover, setBreakdownHover] = useState<string | null>(null);
   const [syncRequested, setSyncRequested] = useState(false);
@@ -1309,6 +1285,7 @@ function UsageDashboard() {
   const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
   const cacheHitRates = useMemo(() => cacheHitRateGroups(rows, cacheHitRateMode), [rows, cacheHitRateMode]);
 
+  useEffect(() => setCacheHitRatePage(1), [cacheHitRateMode, machine, range]);
   useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
   useEffect(() => {
@@ -1385,6 +1362,7 @@ function UsageDashboard() {
     sources: visibleSources,
     hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
+  const paginatedCacheHitRates = paginateItems(cacheHitRates, cacheHitRatePage, BREAKDOWN_PAGE_SIZE);
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
   const breakdownGroupLabel = breakdownMode === "model" ? "models" : breakdownMode === "project" ? "projects" : "days";
   const donutBesideTable = contentWidth >= 1060;
@@ -1393,7 +1371,7 @@ function UsageDashboard() {
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day`, values: dailySeries.processed, color: FALLBACK_PROVIDER_COLORS[0] },
-    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of input · ${compact(totals.cacheWrites)} writes`, values: dailySeries.cached, color: FALLBACK_PROVIDER_COLORS[1] },
+    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached + totals.cacheWrites)} hit rate · ${compact(totals.cacheWrites)} writes`, values: dailySeries.cached, color: FALLBACK_PROVIDER_COLORS[1] },
     { label: "Output", value: compact(totals.output), detail: "Includes reasoning tokens", values: dailySeries.output, color: FALLBACK_PROVIDER_COLORS[2] },
     { label: "Cache savings", value: money(totals.cacheSavings), detail: totals.cost > 0 ? `${(totals.cacheSavings / totals.cost).toFixed(1)}× the raw token cost` : `Price sheet ${data.pricingVersion}`, cost: totals.cacheSavings, values: dailySeries.cacheSavings, color: FALLBACK_PROVIDER_COLORS[3] },
   ];
@@ -1577,7 +1555,7 @@ function UsageDashboard() {
               <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
                 <div>
                   <h2 className="text-sm font-semibold">Cache hit rate</h2>
-                  <p className="mt-1 text-xs text-muted-foreground">Token-weighted cached input share; cache writes are excluded.</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Cache reads ÷ total input; cache creation counts as a miss.</p>
                 </div>
                 <ToggleGroup
                   value={cacheHitRateMode}
@@ -1586,18 +1564,67 @@ function UsageDashboard() {
                   options={[{ value: "agent", label: "Agent" }, { value: "model", label: "Model" }]}
                 />
               </div>
-              <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
-                <div className="max-h-[480px] overflow-y-auto">
-                  {cacheHitRates.map((item, index) => (
-                    <div
-                      key={item.key}
-                      className={index > 0 ? "border-t border-border/60" : undefined}
-                    >
-                      <CacheHitRateRow item={item} />
+              {compactView ? (
+                <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                  {paginatedCacheHitRates.items.map((item) => (
+                    <div key={item.key} className="border-t border-border/60 px-3.5 py-3 first:border-t-0">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                          <ProviderLogo id={item.model ? modelLogoId(item.model) : item.agentId} name={item.model ? undefined : item.agentName} size="sm" />
+                          <span className="truncate">{item.model ?? item.agentName}</span>
+                        </span>
+                        <CacheRateValue item={item} />
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {item.model && <RowBadge><ProviderLogo id={item.agentId} name={item.agentName} size="sm" />{item.agentName}</RowBadge>}
+                        <RowBadge><span className="tabular-nums text-foreground/80">{compact(item.cachedInputTokens)}</span> cached</RowBadge>
+                        <RowBadge><span className="tabular-nums text-foreground/80">{compact(item.totalInputTokens)}</span> input</RowBadge>
+                      </div>
                     </div>
                   ))}
                 </div>
-              </div>
+              ) : (
+                <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
+                  <table className="w-full border-collapse text-sm" style={{ minWidth: cacheHitRateMode === "model" ? 680 : 560 }}>
+                    <thead>
+                      <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
+                        <th className="px-4 py-2.5 text-left font-medium">{cacheHitRateMode === "model" ? "Model" : "Agent"}</th>
+                        {cacheHitRateMode === "model" && <th className="px-4 py-2.5 text-left font-medium">Agent</th>}
+                        <th className="px-4 py-2.5 text-right font-medium">Hit rate</th>
+                        <th className="px-4 py-2.5 text-right font-medium">Cached input</th>
+                        <th className="px-4 py-2.5 text-right font-medium">Input tokens</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paginatedCacheHitRates.items.map((item) => (
+                        <tr key={item.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
+                          <td className="px-4 py-3 font-medium">
+                            <span className="inline-flex min-w-0 items-center gap-2">
+                              <ProviderLogo id={item.model ? modelLogoId(item.model) : item.agentId} name={item.model ? undefined : item.agentName} size="sm" />
+                              <span className="truncate">{item.model ?? item.agentName}</span>
+                            </span>
+                          </td>
+                          {cacheHitRateMode === "model" && <td className="px-4 py-3"><AgentCell agentId={item.agentId} agent={item.agentName} mode="tokens" /></td>}
+                          <td className="px-4 py-3 text-right"><CacheRateValue item={item} /></td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(item.cachedInputTokens)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(item.totalInputTokens)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {cacheHitRates.length > BREAKDOWN_PAGE_SIZE && (
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs tabular-nums text-muted-foreground sm:justify-end">
+                  <span>{paginatedCacheHitRates.rangeStart}–{paginatedCacheHitRates.rangeEnd} of {paginatedCacheHitRates.totalItems}</span>
+                  <button type="button" aria-label="Previous cache hit rate page" title="Previous page" disabled={!paginatedCacheHitRates.canPrevious} onClick={() => setCacheHitRatePage(paginatedCacheHitRates.page - 1)} className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40">
+                    <Icon name="ChevronLeft" className="size-3.5" aria-hidden="true" />
+                  </button>
+                  <button type="button" aria-label="Next cache hit rate page" title="Next page" disabled={!paginatedCacheHitRates.canNext} onClick={() => setCacheHitRatePage(paginatedCacheHitRates.page + 1)} className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40">
+                    <Icon name="ChevronRight" className="size-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
             </section>
             </>
             )}
