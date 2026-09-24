@@ -536,18 +536,7 @@ function UsageChart({
             const lowerLine = smoothPath(lowerPoints, inset.top, inset.top + chartHeight).replace(/^M/, "L");
             const area = `${upperLine} ${lowerLine} Z`;
             return (
-              <g key={item.id}>
-                <path d={area} fill={`url(#usage-area-${item.id})`} />
-                <path
-                  d={upperLine}
-                  fill="none"
-                  stroke={providerColor(item.id)}
-                  strokeWidth="2.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  vectorEffect="non-scaling-stroke"
-                />
-              </g>
+              <path key={item.id} d={area} fill={`url(#usage-area-${item.id})`} />
             );
           })}
           <path
@@ -559,6 +548,19 @@ function UsageChart({
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           />
+          {/* Paint lower boundaries last so a zero-height layer cannot cover them. */}
+          {[...stackedSeries].reverse().map((item) => (
+            <path
+              key={item.id}
+              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
+              fill="none"
+              stroke={providerColor(item.id)}
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
         </g>
 
         {hoverIndex !== null && (
@@ -572,7 +574,7 @@ function UsageChart({
               strokeWidth="1"
               vectorEffect="non-scaling-stroke"
             />
-            {stackedSeries.map((item) => (
+            {stackedSeries.filter((item) => item.values[hoverIndex] > 0).map((item) => (
               <circle
                 key={item.id}
                 cx={x(hoverIndex)}
