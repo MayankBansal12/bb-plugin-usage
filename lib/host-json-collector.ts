@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { z } from "zod";
 import type { AgentId, HostUsageAggregate } from "../collectors";
+import { hostJsonCollectorSource } from "./host-scripts.generated";
 
 // Agents collected by walking JSONL session logs. "devin" is excluded: its
 // usage lives in a SQLite database handled by devin-sqlite-collector.ts.
@@ -64,7 +65,7 @@ const scanResultSchema = z.object({
   rows: z.array(aggregateSchema),
 });
 
-// This function is serialized and executed by Node.js on the enrolled host. Keep
+// This function is compiled by generate:collectors and executed on the host. Keep
 // every runtime dependency inside the function or pass it through `dependencies`.
 async function hostJsonCollector(encodedInput: string, dependencies: CollectorDependencies) {
   const { buffer, fs, path, crypto, readline, zlib } = dependencies;
@@ -721,7 +722,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
 export function hostJsonCollectorScript(input: HostJsonScanInput) {
   const encodedInput = Buffer.from(JSON.stringify(input)).toString("base64");
   const dependencies = "{buffer:require('node:buffer').Buffer,fs:require('node:fs'),path:require('node:path'),crypto:require('node:crypto'),readline:require('node:readline'),zlib:require('node:zlib')}";
-  return `(${hostJsonCollector.toString()})(${JSON.stringify(encodedInput)},${dependencies}).catch((error)=>{process.stderr.write('__BB_USAGE_ERROR__:'+String(error?.message??error).replace(/[\\r\\n]+/g,' ').slice(0,300)+'\\n');process.exitCode=1;});`;
+  return `(${hostJsonCollectorSource})(${JSON.stringify(encodedInput)},${dependencies}).catch((error)=>{process.stderr.write('__BB_USAGE_ERROR__:'+String(error?.message??error).replace(/[\\r\\n]+/g,' ').slice(0,300)+'\\n');process.exitCode=1;});`;
 }
 
 export function compressedHostJsonCollectorScript(input: HostJsonScanInput) {

@@ -1,11 +1,13 @@
 {
   "name": "bb-plugin-usage",
-  "version": "0.3.15",
+  "version": "0.3.16",
   "type": "module",
   "scripts": {
-    "build": "bb plugin build",
+    "build": "npm run generate:collectors && bb plugin build",
+    "generate:collectors": "node scripts/generate-host-scripts.mjs",
     "check": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/generate-host-scripts.mjs --check && vitest run",
+    "test:built": "node --test scripts/verify-built-collectors.mjs",
     "test:tz:la": "TZ=America/Los_Angeles vitest run",
     "test:tz:akl": "TZ=Pacific/Auckland vitest run"
   },

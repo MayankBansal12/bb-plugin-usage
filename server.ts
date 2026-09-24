@@ -467,7 +467,7 @@ function historyStartDay(days = HISTORY_DAYS) {
   return `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
 }
 
-function jsonAgentCommand(input: Parameters<typeof compressedHostJsonCollectorScript>[0]) {
+export function jsonAgentCommand(input: Parameters<typeof compressedHostJsonCollectorScript>[0]) {
   const script = compressedHostJsonCollectorScript(input);
   return [
     "if ! command -v node >/dev/null 2>&1",
