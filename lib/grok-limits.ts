@@ -1,8 +1,9 @@
 import { z } from "zod";
 import type { ProviderLimitWindow } from "./provider-limits";
+import { normalizeGrokBillingSource } from "./host-scripts.generated";
 
 // Contract: xai-org/grok-build, xai-grok-shell/src/extensions/billing.rs.
-// Kept self-contained because this function also runs on the enrolled host.
+// Compiled by generate:collectors; keep self-contained for the enrolled host.
 export function normalizeGrokBilling(payload: unknown): ProviderLimitWindow[] {
   const data = payload as { config?: Record<string, any> | null };
   if (!data || !Object.prototype.hasOwnProperty.call(data, "config")) throw new Error("Grok billing response had an unexpected shape.");
@@ -49,7 +50,7 @@ export function grokLimitsCommand() {
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const normalize = ${normalizeGrokBilling.toString()};
+const normalize = ${normalizeGrokBillingSource};
 (async () => {
   const authPath = process.env.GROK_AUTH_PATH || path.join(process.env.GROK_HOME || path.join(require('node:os').homedir(), '.grok'), 'auth.json');
   let store;

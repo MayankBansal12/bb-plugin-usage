@@ -76,7 +76,16 @@ npm install
 npm run check
 npm test
 npm run build
+npm run test:built
 ```
+
+Host collector functions stay in TypeScript, but run as standalone JavaScript on
+enrolled machines. `npm run generate:collectors` compiles their source into the
+checked-in `lib/host-scripts.generated.ts` strings before BB bundles the server.
+This prevents bundler helpers from leaking into remote commands. Regenerate and
+commit that file when changing a host function; `npm test` checks it is current.
+`npm run test:built` executes the commands from `dist/server.js` in fresh Node
+processes, so production-only packaging failures are covered too.
 
 Install the local build and start development mode:
 

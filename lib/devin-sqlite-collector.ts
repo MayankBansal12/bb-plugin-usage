@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { gzipSync } from "node:zlib";
 import type { HostUsageAggregate } from "../collectors";
+import { devinSqliteCollectorSource } from "./host-scripts.generated";
 
 export type DevinScanInput = {
   agentId: "devin";
@@ -18,7 +19,7 @@ type CollectorDependencies = {
   loadSqlite: () => typeof import("node:sqlite");
 };
 
-// This function is serialized and executed by Node.js on the enrolled host. Keep
+// This function is compiled by generate:collectors and executed on the host. Keep
 // every runtime dependency inside the function or pass it through `dependencies`.
 // The output reuses the host-json-collector wire format (gzipped scan JSON between
 // __BB_USAGE_SCAN_BEGIN__/END markers) so the plugin server decodes it with
@@ -197,7 +198,7 @@ async function devinSqliteCollector(encodedInput: string, dependencies: Collecto
 export function devinCollectorScript(input: DevinScanInput) {
   const encodedInput = Buffer.from(JSON.stringify(input)).toString("base64");
   const dependencies = "{buffer:require('node:buffer').Buffer,fs:require('node:fs'),path:require('node:path'),zlib:require('node:zlib'),loadSqlite:function(){return require('node:sqlite');}}";
-  return `(${devinSqliteCollector.toString()})(${JSON.stringify(encodedInput)},${dependencies}).catch((error)=>{process.stderr.write('__BB_USAGE_ERROR__:'+String(error?.message??error).replace(/[\\r\\n]+/g,' ').slice(0,300)+'\\n');process.exitCode=1;});`;
+  return `(${devinSqliteCollectorSource})(${JSON.stringify(encodedInput)},${dependencies}).catch((error)=>{process.stderr.write('__BB_USAGE_ERROR__:'+String(error?.message??error).replace(/[\\r\\n]+/g,' ').slice(0,300)+'\\n');process.exitCode=1;});`;
 }
 
 export function compressedDevinCollectorScript(input: DevinScanInput) {
