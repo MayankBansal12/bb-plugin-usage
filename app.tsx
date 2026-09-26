@@ -785,7 +785,7 @@ function ProviderLimits({
         <span className="text-xs text-muted-foreground">Current plan windows</span>
       </div>
       {error && (
-        <p className="mt-2 text-xs text-destructive" role="alert">{maskEmailAddresses(error)}</p>
+        <p className="mt-2 text-xs text-destructive [overflow-wrap:anywhere]" role="alert">{maskEmailAddresses(error)}</p>
       )}
       {loading && limits.length === 0 ? (
         <ProviderLimitsSkeleton columns={availableColumns} />
@@ -842,9 +842,9 @@ function ProviderLimits({
                 )}
                 <div className="min-w-0 self-start pt-0.5">
                   {limit.error && (
-                    <div className="mb-2 flex items-start gap-1.5">
+                    <div className="mb-2 flex min-w-0 items-start gap-1.5">
                       <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-                      <p className="text-[10px] leading-4 text-destructive/90">
+                      <p className="min-w-0 flex-1 text-[10px] leading-4 text-destructive/90 [overflow-wrap:anywhere]">
                         {maskEmailAddresses(limit.poolAccount
                           ? `Account Pooler couldn’t refresh ${limit.providerName} limits: ${limit.error}`
                           : limit.status === "error"
