@@ -18,17 +18,19 @@ export type AmpUsageAggregate = {
 
 export type AmpUsageScanInput = {
   cachePath: string;
+  deviceIdPath: string;
   sinceDay: string;
 };
 
 export type AmpUsageScanResult = {
   agentId: "amp";
+  localInstallationId: string | null;
   threadCount: number;
   changedThreadCount: number;
   reusedThreadCount: number;
   failureCount: number;
   error: string | null;
-  threads: Array<{ threadId: string; updated: string; rows: AmpUsageAggregate[] }>;
+  threads: Array<{ threadId: string; updated: string; initialInstallationId: string | null; rows: AmpUsageAggregate[] }>;
 };
 
 type CollectorDependencies = {
@@ -55,6 +57,7 @@ const aggregateSchema = z.object({
 });
 const scanResultSchema = z.object({
   agentId: z.literal("amp"),
+  localInstallationId: z.string().min(1).nullable(),
   threadCount: z.number().int().nonnegative(),
   changedThreadCount: z.number().int().nonnegative(),
   reusedThreadCount: z.number().int().nonnegative(),
@@ -63,6 +66,7 @@ const scanResultSchema = z.object({
   threads: z.array(z.object({
     threadId: z.string().regex(/^T-[A-Za-z0-9-]+$/),
     updated: z.string(),
+    initialInstallationId: z.string().min(1).nullable(),
     rows: z.array(aggregateSchema),
   })),
 });
@@ -76,10 +80,10 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as AmpUsageScanInput;
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid Amp usage history boundary.");
 
-  type ThreadResult = { threadId: string; updated: string; rows: AmpUsageAggregate[] };
+  type ThreadResult = AmpUsageScanResult["threads"][number];
   type Cache = { version: number; threads: Record<string, ThreadResult> };
   const failures: string[] = [];
-  const cacheVersion = 2;
+  const cacheVersion = 3;
   let cache: Cache = { version: cacheVersion, threads: {} };
   try {
     const parsed = JSON.parse(await fs.promises.readFile(input.cachePath, "utf8")) as Cache;
@@ -97,6 +101,18 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
   function object(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
   }
+
+  function installationId(value: unknown) {
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  }
+
+  // Read on every scan, not from the thread cache: reinstalling or copying a
+  // cache must not turn the collecting installation into a thread's origin.
+  let localInstallationId: string | null = null;
+  try {
+    const device = object(JSON.parse(await fs.promises.readFile(input.deviceIdPath, "utf8")));
+    localInstallationId = installationId(device?.installationID);
+  } catch { /* Usage remains available under other / unknown environments. */ }
 
   function count(value: unknown) {
     const numeric = typeof value === "number" ? value : NaN;
@@ -188,6 +204,7 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
       nextThreads[listedThread.id] = {
         threadId: listedThread.id,
         updated: listedThread.updated,
+        initialInstallationId: installationId(object(initial?.platform)?.installationID),
         rows: [...aggregates.values()].sort((a, b) => a.day.localeCompare(b.day) || a.model.localeCompare(b.model)),
       };
       changedThreadCount += 1;
@@ -208,6 +225,7 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
 
   const result: AmpUsageScanResult = {
     agentId: "amp",
+    localInstallationId,
     threadCount: listed.length,
     changedThreadCount,
     reusedThreadCount,

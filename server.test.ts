@@ -43,8 +43,8 @@ function fakeAmpScanOutput(rows: Array<Record<string, unknown>>) {
   const threadId = "T-01a0aa94-f1e7-7610-a400-f8054fe02ad5";
   const scan = {
     agentId: "amp", threadCount: 1, changedThreadCount: 1, reusedThreadCount: 0,
-    failureCount: 0, error: null,
-    threads: [{ threadId, updated: "2026-09-16T12:00:00Z", rows: rows.map((row) => ({ threadId, ...row })) }],
+    failureCount: 0, error: null, localInstallationId: "test-installation",
+    threads: [{ threadId, updated: "2026-09-16T12:00:00Z", initialInstallationId: "test-installation", rows: rows.map((row) => ({ threadId, ...row })) }],
   };
   const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
   return `__BB_AMP_USAGE_SCAN_BEGIN__\n${encoded}\n__BB_AMP_USAGE_SCAN_END__\n__BB_HOST_COMMAND_DONE__:0\n`;

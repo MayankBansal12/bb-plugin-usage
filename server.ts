@@ -304,6 +304,16 @@ const openCodeGoFingerprintMigration = `
 ALTER TABLE opencode_go_limits ADD COLUMN account_fingerprint TEXT;`;
 const codexAttributionMigration = `ALTER TABLE usage_sources ADD COLUMN attribution TEXT;`;
 
+const ampMachineMigration = `
+CREATE TABLE amp_installations (
+  installation_id TEXT NOT NULL, machine_id TEXT NOT NULL,
+  PRIMARY KEY (installation_id, machine_id)
+);
+CREATE TABLE amp_thread_origins (
+  source_id TEXT PRIMARY KEY, installation_id TEXT
+);`;
+const AMP_OTHER_MACHINE = { id: "amp-other", name: "Amp: Other / unknown environment" };
+
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
 }
@@ -732,6 +742,7 @@ function reconcileMachines(db: Database, machineIds: string[]) {
     db.prepare(`DELETE FROM grok_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limits WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     db.prepare(`DELETE FROM opencode_go_limit_state WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
+    db.prepare(`DELETE FROM amp_installations WHERE machine_id NOT IN (${placeholders})`).run(...machineIds);
     deleteOrphanEvents(db);
   })();
 }
@@ -787,6 +798,7 @@ export function jsonAgentCommand(input: Parameters<typeof compressedHostJsonColl
 export function ampUsageCommand(home: string) {
   const script = compressedAmpUsageCollectorScript({
     cachePath: `${home}/.cache/bb-plugin-usage/amp-thread-scan-v1.json`,
+    deviceIdPath: `${home}/.local/share/amp/device-id.json`,
     sinceDay: historyStartDay(),
   });
   return [
@@ -819,6 +831,14 @@ export async function syncAmp(
     const scan = extractAmpUsageScan(output);
     if (scan.agentId !== agentId) throw new Error(`Amp usage scan returned ${scan.agentId} data.`);
 
+    // Keep prior installations after a reinstall so historical origins still
+    // resolve. Identical IDs observed on several hosts are ambiguous, not a
+    // reason to pick whichever host happened to scan first.
+    if (scan.localInstallationId) {
+      db.prepare("INSERT OR IGNORE INTO amp_installations (installation_id, machine_id) VALUES (?, ?)")
+        .run(opaqueId(scan.localInstallationId), machine.id);
+    }
+
     // A partial scan must not delete a thread whose export failed. Mark prior
     // sources seen first; complete scans still reconcile threads no longer in
     // the account or retention window.
@@ -832,14 +852,20 @@ export async function syncAmp(
         machineName: machine.name,
       });
       const aggregateJson = JSON.stringify(thread.rows);
+      const sourceId = opaqueId(machine.id, agentId, thread.threadId);
       upsertSourceEvents(db, {
-        id: opaqueId(machine.id, agentId, thread.threadId),
+        id: sourceId,
         rootReference: opaqueId("amp-thread", thread.threadId),
         sha256: createHash("sha256").update(aggregateJson).digest("hex"),
         generation,
       }, machine, agentId, records);
+      db.prepare(`INSERT INTO amp_thread_origins (source_id, installation_id) VALUES (?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET installation_id=excluded.installation_id`)
+        .run(sourceId, thread.initialInstallationId ? opaqueId(thread.initialInstallationId) : null);
     }
     reconcileSources(db, machine.id, agentId, generation);
+    db.prepare(`DELETE FROM amp_thread_origins WHERE source_id NOT IN
+      (SELECT source_id FROM usage_sources WHERE provider_id='amp')`).run();
 
     const recordCount = countForMachine(db, machine.id, agentId);
     const complete = scan.failureCount === 0;
@@ -1425,9 +1451,17 @@ export function loadStoredOpenCodeGoLimits(
 // of it. This query only bounds retention -- it fetches one extra day of slack
 // and the dashboard applies the exact range in the viewer's timezone.
 export function dashboardRecordsSql() {
-  return `WITH canonical AS (
-      SELECT e.*, MIN(s.machine_id) machine_id FROM usage_events e
+  return `WITH amp_machines AS (
+      SELECT installation_id, MIN(machine_id) machine_id FROM amp_installations
+      GROUP BY installation_id HAVING COUNT(*)=1
+    ), canonical AS (
+      SELECT e.*, CASE WHEN e.provider_id='amp'
+        THEN CASE WHEN COUNT(DISTINCT ao.installation_id)=1 THEN COALESCE(MIN(am.machine_id), '${AMP_OTHER_MACHINE.id}')
+          ELSE '${AMP_OTHER_MACHINE.id}' END
+        ELSE MIN(s.machine_id) END machine_id FROM usage_events e
       JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
+      LEFT JOIN amp_thread_origins ao ON e.provider_id='amp' AND ao.source_id=s.source_id
+      LEFT JOIN amp_machines am ON am.installation_id=ao.installation_id
       GROUP BY e.event_key
     ) SELECT day, provider_id agentId, provider_name agentName,
     model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model, project,
@@ -1489,7 +1523,23 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, codexAttributionMigration]);
+  // The early Amp fork shipped migration 9 before upstream used that index
+  // for Codex. Preserve that installation's order across upgrades and restarts.
+  let ampFirst = false;
+  if (db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='usage_metadata'").get()) {
+    ampFirst = Boolean(db.prepare("SELECT value FROM usage_metadata WHERE key='amp_first_migration'").get());
+    if (!ampFirst
+      && db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='amp_installations'").get()
+      && !db.prepare("SELECT name FROM pragma_table_info('usage_sources') WHERE name='attribution'").get()) {
+      db.prepare("INSERT INTO usage_metadata (key, value) VALUES ('amp_first_migration', '1')").run();
+      ampFirst = true;
+    }
+  }
+  const attributionMigrations = ampFirst
+    ? [ampMachineMigration, codexAttributionMigration]
+    // Some Codex-lineage installs retain Amp tables from an earlier fork.
+    : [codexAttributionMigration, ampMachineMigration.replaceAll("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ")];
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, ...attributionMigrations]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -1601,8 +1651,9 @@ export default async function plugin(bb: BbPluginApi) {
   bb.rpc.register(rpcContract, {
     async dashboard() {
       const machines = await loadMachines();
-      const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
+      const displayMachines = rows.some((row) => row.machineId === AMP_OTHER_MACHINE.id) ? [...machines, AMP_OTHER_MACHINE] : machines;
+      const machineNames = new Map(displayMachines.map((machine) => [machine.id, machine.name]));
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
         last_success_at lastSuccessAt, record_count recordCount, error FROM usage_sync_state ORDER BY machine_id, provider_id`).all() as SourceState[];
@@ -1620,13 +1671,16 @@ export default async function plugin(bb: BbPluginApi) {
         generatedAt: new Date().toISOString(),
         lastSyncedAt: sync.completedAt,
         pricingVersion: pricingVersion(),
-        machines,
+        machines: displayMachines,
         agents: [...AGENTS, ...extraAgents],
         modelProviders,
         records,
         sources,
         sync,
-        notice: "Prompts and message content are never stored.",
+        notice: "Prompts and message content are never stored."
+          + (records.some((row) => row.agentId === "amp")
+            ? " Amp usage is attributed to each thread's initial machine, not where later messages ran. Unmatched installations appear under Other / unknown environment."
+            : ""),
       };
     },
     providerLimits: readProviderLimits,
