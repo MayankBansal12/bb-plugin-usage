@@ -16,7 +16,7 @@ async function temporaryDirectory() {
 }
 
 async function runScan(directory: string, cachePath: string, timezone?: string) {
-  const script = compressedAmpUsageCollectorScript({ cachePath, sinceDay: "2026-09-01" });
+  const script = compressedAmpUsageCollectorScript({ cachePath, deviceIdPath: join(directory, "device-id.json"), sinceDay: "2026-09-01" });
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], {
     env: { ...process.env, PATH: `${join(directory, "bin")}:${process.env.PATH}`, ...(timezone ? { TZ: timezone } : {}) },
     maxBuffer: 2 * 1024 * 1024,
@@ -44,6 +44,32 @@ afterEach(async () => {
 });
 
 describe("Amp usage collector", () => {
+  it("keeps initial installation identity separate from the collecting installation and rebuilds old caches", async () => {
+    const directory = await temporaryDirectory();
+    const cachePath = join(directory, "amp.json");
+    const threadId = "T-initial-machine";
+    await writeFile(join(directory, "device-id.json"), JSON.stringify({ installationID: "collecting-installation" }));
+    await writeFile(cachePath, JSON.stringify({ version: 2, threads: {
+      [threadId]: { threadId, updated: "2026-09-16T12:00:00Z", rows: [] },
+    } }));
+    await fakeAmp(directory, [{ id: threadId, updated: "2026-09-16T12:00:00Z" }], {
+      id: threadId,
+      env: { initial: { hostname: "same-hostname", platform: { installationID: "initial-installation" } } },
+      messages: [{ usage: { model: "muse-spark", timestamp: "2026-09-16T12:00:00Z", inputTokens: 3, outputTokens: 2 } }],
+    });
+    const first = await runScan(directory, cachePath);
+    expect(first).toMatchObject({ localInstallationId: "collecting-installation", changedThreadCount: 1 });
+    expect(first.threads[0]).toMatchObject({ initialInstallationId: "initial-installation", rows: [expect.objectContaining({ outputTokens: 2 })] });
+
+    await writeFile(join(directory, "device-id.json"), JSON.stringify({ installationID: "new-installation" }));
+    const cached = await runScan(directory, cachePath);
+    expect(cached).toMatchObject({ localInstallationId: "new-installation", reusedThreadCount: 1 });
+    expect(cached.threads).toEqual(first.threads);
+
+    await rm(join(directory, "device-id.json"));
+    expect(await runScan(directory, cachePath)).toMatchObject({ localInstallationId: null, failureCount: 0 });
+  });
+
   it("reduces thread exports to token metadata and reuses a content-free cache", async () => {
     const directory = await temporaryDirectory();
     const cachePath = join(directory, "cache", "amp.json");
