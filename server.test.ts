@@ -1843,6 +1843,18 @@ describe("retained usage through the real sync path", () => {
     return { day: DAY, modelProviderId: "openai", model: "gpt-test", project: "proj", loggedCostUsd: null,
       uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500, ...overrides };
   }
+  function insertRetainedCodexBucket(db: Database.Database, project: string, tokens = 1500) {
+    const source = db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='codex'").get() as { id: string };
+    const key = `codex:host-1:${DAY}:openai:gpt-test:${project}`;
+    db.prepare(`INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model,
+      cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens,
+      uncached_input_tokens, output_tokens, model_provider_id, model_provider_name,
+      logged_cost_usd, pricing_status, project)
+      VALUES (?, ?, ?, 'codex', 'Codex', 'gpt-test', ?, 0, ?, 0, 0, ?, 500,
+        'openai', 'OpenAI', NULL, 'estimated', ?)`).run(key, `${DAY}T00:00:00.000Z`, DAY, tokens / 1000, tokens, tokens - 500, project);
+    db.prepare("INSERT INTO usage_event_sources (event_key, source_id) VALUES (?, ?)").run(key, source.id);
+    return key;
+  }
   function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number, homes?: Array<{ homeTag: string; account: string }>) {
     const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows, homes };
     const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
@@ -2006,6 +2018,22 @@ describe("retained usage through the real sync path", () => {
     } finally { db.close(); }
   });
 
+  it("renames tagged Codex history when the account label contains a colon", async () => {
+    setPricingCatalog(catalog(1000), "codex-colon-label-v1");
+    const tag = codexHomeTag("/profiles/a");
+    const state = { rows: [piRow({ account: "team:old", homeTag: tag })], failureCount: 0,
+      codexProfileHomes: "team:old=/profiles/a" };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      state.codexProfileHomes = "team:new=/profiles/a";
+      state.rows = [piRow({ account: "team:new", homeTag: tag })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events").all())
+        .toEqual([{ providerId: "codex-team:new" }]);
+    } finally { db.close(); }
+  });
+
   it("moves a formerly unlabeled configured Codex home's rows when it gains a label", async () => {
     setPricingCatalog(catalog(1000), "codex-label-grant-v1");
     const state = {
@@ -2144,6 +2172,51 @@ describe("retained usage through the real sync path", () => {
       expect(totals(db)).toEqual({ count: 2, tokens: 2500, cost: 2.5 });
       expect(db.prepare("SELECT event_key k FROM usage_events WHERE event_key='codex:host-1:" + DAY + ":openai:gpt-test:proj'").all())
         .toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it("drops a retained stable-source bucket after two homes split its usage", async () => {
+    setPricingCatalog(catalog(1000), "codex-stable-split-v1");
+    const main = codexHomeTag("/home/user/.codex");
+    const extra = codexHomeTag("/profiles/codex");
+    const state = { rows: [
+      piRow({ homeTag: main }),
+      piRow({ homeTag: extra, uncachedInputTokens: 500, outputTokens: 500 }),
+    ], failureCount: 0, codexProfileHomes: "/profiles/codex",
+      homes: [{ homeTag: main, account: "" }, { homeTag: extra, account: "" }] };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      const key = insertRetainedCodexBucket(db, "proj");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 2500, cost: 2.5 });
+      expect(db.prepare("SELECT event_key FROM usage_events WHERE event_key=?").all(key)).toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it("keeps independent retained history when only one tagged sibling exists", async () => {
+    setPricingCatalog(catalog(1000), "codex-single-sibling-v1");
+    const extra = codexHomeTag("/profiles/codex");
+    const state = { rows: [piRow({ homeTag: extra, uncachedInputTokens: 500, outputTokens: 500 })],
+      failureCount: 0, codexProfileHomes: "/profiles/codex",
+      homes: [{ homeTag: codexHomeTag("/home/user/.codex"), account: "" }, { homeTag: extra, account: "" }] };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      insertRetainedCodexBucket(db, "proj");
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 2500, cost: 2.5 });
+    } finally { db.close(); }
+  });
+
+  it("reattributes a retained bucket whose project looks like a home tag", async () => {
+    setPricingCatalog(catalog(1000), "codex-hex-project-v1");
+    const project = "deadbeeff00d";
+    const state = { rows: [piRow({ project, homeTag: codexHomeTag("/home/user/.codex") })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      const key = insertRetainedCodexBucket(db, project);
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+      expect(db.prepare("SELECT event_key FROM usage_events WHERE event_key=?").all(key)).toEqual([]);
     } finally { db.close(); }
   });
 
