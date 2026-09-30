@@ -150,6 +150,17 @@ describe("proxy provider fallback", () => {
     expect(resolvePricing("codebuddy", "glm-5.1-ioa")).toMatchObject({ modelProviderId: "codebuddy", status: "unknown", price: null });
   });
 
+  it("stays unpriced when builtin and catalog vendors disagree", () => {
+    setPricingCatalog({
+      codebuddy: { name: "CodeBuddy", models: { "deepseek-v4.1-flash-ioa": { id: "deepseek-v4.1-flash-ioa" } } },
+      zai: catalogProvider({ "deepseek-v4.1-flash": { input: 1, output: 2 } }, "Z.ai"),
+    }, "test");
+
+    // builtinPrices already carries a DeepSeek rate for this model, so the
+    // first-party pass is ambiguous; the catalog pass must not crown Z.ai.
+    expect(resolvePricing("codebuddy", "deepseek-v4.1-flash-ioa")).toMatchObject({ modelProviderId: "codebuddy", status: "unknown", price: null });
+  });
+
   it("does not use a builtin vendor rate for an undecorated routed-provider model", () => {
     setPricingCatalog({
       "ollama-cloud": { name: "Ollama Cloud", models: { "deepseek-v4.1-flash": { id: "deepseek-v4.1-flash" } } },
