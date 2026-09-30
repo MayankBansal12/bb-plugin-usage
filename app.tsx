@@ -732,6 +732,10 @@ function CacheRateValue({ item }: { item: CacheHitRateGroup }) {
   );
 }
 
+function RowBadge({ children }: { children: React.ReactNode }) {
+  return <span className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">{children}</span>;
+}
+
 function ChartLegend({ providers }: { providers: Array<{ id: string; name: string }> }) {
   if (providers.length === 0) return null;
   return (
