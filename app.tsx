@@ -1636,6 +1636,7 @@ function UsageDashboard() {
                       </div>
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         {item.model && <RowBadge><ProviderLogo id={item.agentId} name={item.agentName} size="sm" />{item.agentName}</RowBadge>}
+                        {item.model && item.modelProviderName && <RowBadge>{item.modelProviderName}</RowBadge>}
                         <RowBadge><span className="tabular-nums text-foreground/80">{compact(item.cachedInputTokens)}</span> cached</RowBadge>
                         <RowBadge><span className="tabular-nums text-foreground/80">{compact(item.totalInputTokens)}</span> input</RowBadge>
                       </div>
@@ -1663,7 +1664,12 @@ function UsageDashboard() {
                               <span className="truncate">{item.model ?? item.agentName}</span>
                             </span>
                           </td>
-                          {cacheHitRateMode === "model" && <td className="px-4 py-3"><AgentCell agentId={item.agentId} agent={item.agentName} mode="tokens" /></td>}
+                          {cacheHitRateMode === "model" && (
+                            <td className="px-4 py-3">
+                              <AgentCell agentId={item.agentId} agent={item.agentName} mode="tokens" />
+                              {item.modelProviderName && <div className="mt-0.5 text-xs text-muted-foreground">{item.modelProviderName}</div>}
+                            </td>
+                          )}
                           <td className="px-4 py-3 text-right"><CacheRateValue item={item} /></td>
                           <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(item.cachedInputTokens)}</td>
                           <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(item.totalInputTokens)}</td>
