@@ -104,6 +104,18 @@ describe("JSON agent roots", () => {
     ]);
   });
 
+  it("resolves extra roots on each enrolled host while retaining defaults", () => {
+    const settings = { piSessionRoots: "", primeSessionRoots: "", codexProfileHomes: "",
+      extraUsageRoots: '{"codebuddy":["~/custom buddy/projects","/shared/logs","~/custom buddy/projects"],"cursor":["~/cursor-work/usage.jsonl"]}' };
+    expect(jsonAgentRoots("/home/alice", "codebuddy", settings)).toEqual([
+      "/home/alice/.codebuddy/projects", "/home/alice/custom buddy/projects", "/shared/logs",
+    ]);
+    expect(jsonAgentRoots("/home/bob", "cursor", settings)).toEqual([
+      "/home/bob/.cursor/usage.jsonl", "/home/bob/cursor-work/usage.jsonl",
+    ]);
+    expect(() => jsonAgentRoots("/home/u", "codebuddy", { ...settings, extraUsageRoots: '{"codebuddy":["relative"]}' })).toThrow(/absolute paths/);
+    expect(() => jsonAgentRoots("/home/u", "codebuddy", { ...settings, extraUsageRoots: '[]' })).toThrow(/JSON object/);
+  });
   it("points Antigravity at the provider bridge's own usage log", () => {
     expect(jsonAgentRoots("/home/user", "antigravity", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.antigravity-acp/usage.jsonl",
@@ -181,7 +193,7 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it("actually dispatches an Antigravity scan through syncAll, not just through direct scan() calls", async () => {
+  it.each(["antigravity", "codebuddy", "cursor"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
     // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
@@ -222,8 +234,8 @@ describe("sync RPC", () => {
           output: vi.fn(async (args: { terminalId: string }) => {
             const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
             const agentId = agentIdFromCommand(command);
-            const text = agentId === "antigravity"
-              ? fakeHostScanOutput("antigravity", [{
+            const text = agentId === targetAgent
+              ? fakeHostScanOutput(targetAgent, [{
                 day: new Date().toISOString().slice(0, 10),
                 modelProviderId: "google",
                 model: "gemini-4-ultra-preview",
@@ -248,13 +260,13 @@ describe("sync RPC", () => {
     expect(handlers?.sync()).toEqual({ ok: true });
 
     await vi.waitFor(() => {
-      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'antigravity'").get();
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = ?").get(targetAgent);
       expect(row).toBeTruthy();
     }, { timeout: 2000 });
 
     const syncState = db.prepare(
-      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'antigravity'",
-    ).get();
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = ?",
+    ).get(targetAgent);
     expect(syncState).toEqual({ status: "ready", recordCount: 1 });
 
     // The terminal contract caps start.command at 10,000 characters; every

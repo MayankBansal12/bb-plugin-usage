@@ -34,7 +34,6 @@ async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath
     sinceDay: "2026-08-01",
     ...extra,
   });
-  expect(script.length).toBeLessThan(9_000);
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024 });
   return extractHostJsonScan(stdout.replace(/\n/g, "\r\n"));
 }

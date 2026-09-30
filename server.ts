@@ -74,11 +74,13 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string };
+type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string; extraUsageRoots?: string };
 
 const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "codebuddy", name: "CodeBuddy" },
+  { id: "cursor", name: "Cursor Agent" },
   { id: "dsh", name: "DeepSeek Harness" },
   { id: "devin", name: "Devin" },
   { id: "fx", name: "FX" },
@@ -448,7 +450,9 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
     return homes.flatMap((root) => [`${root}/sessions`, `${root}/archived_sessions`]);
   }
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
-  return agentId === "claude" ? [`${home}/.claude/projects`]
+  const defaults = agentId === "claude" ? [`${home}/.claude/projects`]
+    : agentId === "codebuddy" ? [`${home}/.codebuddy/projects`]
+    : agentId === "cursor" ? [`${home}/.cursor/usage.jsonl`]
     : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
@@ -459,6 +463,15 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
       const defaultPrimeAgentRoot = `${home}/.prime/agent`;
       return root !== defaultPrimeAgentRoot && !resolvedPrimeRoots.includes(root);
     })];
+  let extra;
+  try { extra = JSON.parse(settings.extraUsageRoots?.trim() || "{}"); }
+  catch { throw new Error("Extra usage roots must be valid JSON."); }
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("Extra usage roots must be a JSON object.");
+  const roots = extra[agentId] ?? [];
+  if (!Array.isArray(roots) || !roots.every((root) => typeof root === "string" && /^(\/|~\/|[A-Za-z]:[\\/])/.test(root))) {
+    throw new Error("Extra usage roots must contain arrays of absolute paths or ~/ paths.");
+  }
+  return [...new Set([...defaults, ...roots.map((root: string) => normalizeRoot(expandHome(root, home)))])];
 }
 
 function historyStartDay(days = HISTORY_DAYS) {
@@ -1003,6 +1016,12 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Optional semicolon-separated absolute session directories. The default ~/.prime/agent/sessions and its recursive-agent artifacts are always scanned.",
       default: "",
     },
+    extraUsageRoots: {
+      type: "string",
+      label: "Extra usage log roots",
+      description: 'JSON object of agent IDs to arrays of absolute or ~/ log paths, e.g. {"codebuddy":["~/custom-buddy/projects"],"cursor":["~/custom-cursor/usage.jsonl"]}. Defaults are always scanned; paths resolve on each enrolled machine.',
+      default: "{}",
+    },
   });
   const db = bb.storage.database();
   bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration]);
@@ -1041,6 +1060,8 @@ export default async function plugin(bb: BbPluginApi) {
         await Promise.all([
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "codebuddy", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "cursor", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),

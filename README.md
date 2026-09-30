@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
+- Collect usage from Codex, Claude Code, CodeBuddy, Cursor Agent (opt-in token hook), DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
 - Separate the coding agent from the underlying model provider.
 - Group charts and usage shares by agent or model provider.
 - Switch the chart and provider shares between cost and tokens.
@@ -23,6 +23,8 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 - Codex: `rollout-*.jsonl` files recursively under both `sessions/` and `archived_sessions/` in `~/.codex` and each `~/.codex-profiles/<name>` home; each profile reports as its own agent, `Codex (<name>)`. Additional homes can be configured in plugin settings.
 - Claude Code: `~/.claude/projects/**/*.jsonl`
+- CodeBuddy: `~/.codebuddy/projects/**/*.jsonl`. Also honors `CODEBUDDY_CONFIG_DIR` when available in the host scan environment. Counts assistant/API response usage, including tool-call responses; copied messages are deduplicated. Turn summaries, credits, and tool results are not counted.
+- Cursor Agent: `~/.cursor/usage.jsonl`, written by the opt-in [token hook](docs/additional-agent-usage.md#cursor-agent-hook). Requires a Cursor CLI version that supplies token counters to `afterAgentResponse`; this records future usage, not historical `store.db` conversations.
 - DeepSeek Harness: `~/.dsh/sessions/*/*/session.v3.jsonl.zstd` (Zstandard-compressed JSONL; requires Node.js 22.15+ on the machine)
 - Devin: `~/.local/share/devin/cli/sessions.db` — the Devin CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` is honored). Devin runs in BB through the `acp-devin` provider and writes no JSONL session logs.
 - FX: `~/.fx/usage.jsonl`
@@ -30,7 +32,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
 - Prime Agent: root sessions in `~/.prime/agent/sessions/*.jsonl` and recursive-agent sessions under `~/.prime/agent/session-artifacts/**/*.jsonl`, plus optional custom session directories in plugin settings
 - OpenCode: assistant-message usage from the last 90 days, recorded by `opencode db` (v1) or the read-only local database (v2)
-- Antigravity: `~/.antigravity-acp/usage.jsonl`, written by the `bb-plugin-antigravity-acp` provider bridge (the `agy` CLI has no session log of its own in a stable, parseable shape, so the bridge is the source of truth, one line per turn it runs)
+- Antigravity: `~/.antigravity-acp/usage.jsonl`, written by a compatible provider bridge. This is not produced by every `agy` ACP adapter; native agy conversation databases are not a supported token source. See [provider coverage and limitations](docs/additional-agent-usage.md).
 - Grok Build limits: credit usage and reset times from the Grok billing endpoint, using the local Grok login (`~/.grok/auth.json`, respecting `GROK_HOME` and `GROK_AUTH_PATH`)
 - OpenCode Go limits: plan windows from `https://opencode.ai/zen/go/v1/usage`, authenticated with the `opencode-go` credential in `~/.local/share/opencode/auth.json` on each machine
 - Account Pooler limits: non-secret account summaries from the enabled BB `account-pool` plugin’s `account.list` RPC, including Codex limit windows and Claude five-hour, weekly, and model-family limits. API key accounts show that subscription limits are unavailable. This adds quota cards, not per-account token or cost attribution. Pool refresh failures retain the last successful snapshot with a warning; an absent or disabled pool plugin needs no configuration.
@@ -52,6 +54,8 @@ OpenCode Go limit collection requires `curl` plus either `jq` or Node.js on the 
 The plugin never stores prompts or message content. It stores timestamps, agent/model identifiers, token buckets, pricing status, and aggregate cost. To break usage down by project it also records the working directory's final segment (the project folder name, e.g. `bb-plugin-usage`) for agents that log one; the full directory path is never stored or transferred. FX uses the spend recorded in its local usage ledger, OpenCode, Pi, and Prime prefer positive agent-recorded costs and fall back to standard API-rate estimates, and other agents use standard API-rate estimates when models.dev can resolve a model, then agent-reported cost when available. They are not subscription-billing totals.
 
 Missing log roots are treated as normal “no data” results. Offline machines, unreadable files, malformed collector output, missing runtime tools, query failures, and timeouts are retained as per-agent sync states so available history remains visible with an error notice.
+
+For relocated JSON/JSONL logs, **Extra usage log roots** (`extraUsageRoots`) accepts a JSON object mapping collector IDs to arrays of absolute paths or `~/` paths. Defaults remain enabled, and `~/` expands on each enrolled host. For example: `{"codebuddy":["~/buddy-work/projects"],"cursor":["~/cursor-work/usage.jsonl"]}`. This also works for other JSON collectors such as `claude`, `pi`, or `antigravity`. Configure Codex account separation with the existing `codexProfileHomes` setting instead. A provider-private environment variable or wrapper is not automatically visible to BB's host scan: use explicit roots in that case. No executable installation directory is assumed.
 
 ![Usage by provider](https://5kas5z928t.ufs.sh/f/wBHVA4PQTleAX0mk1Ywqs8NZT3UMHvygFezBaGYxK2w6S1In)
 
