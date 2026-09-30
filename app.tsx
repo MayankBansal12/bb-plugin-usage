@@ -10,7 +10,9 @@ import { ToggleGroup } from "@/components/ui/toggle-group";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { ProviderLimitsSkeleton, UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
+import { BreakdownDonut } from "@/components/breakdown-donut";
 import { paginateItems } from "@/lib/pagination";
+import { buildBreakdownDonut } from "@/lib/breakdown-donut";
 import { compareUsage, nextUsageSort, type MetricMode, type UsageSort } from "@/lib/usage-sort";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
@@ -497,12 +499,6 @@ function UsageChart({
         onPointerLeave={() => setHoverIndex(null)}
       >
         <defs>
-          {providers.map((provider) => (
-            <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
-              <stop offset="0%" stopColor={providerColor(provider.id)} stopOpacity="0.16" />
-              <stop offset="100%" stopColor={providerColor(provider.id)} stopOpacity="0" />
-            </linearGradient>
-          ))}
           <clipPath id="usage-chart-clip">
             <rect x={inset.left} y={inset.top} width={chartWidth} height={chartHeight} />
           </clipPath>
@@ -535,10 +531,21 @@ function UsageChart({
             const upperLine = smoothPath(upperPoints, inset.top, inset.top + chartHeight);
             const lowerLine = smoothPath(lowerPoints, inset.top, inset.top + chartHeight).replace(/^M/, "L");
             const area = `${upperLine} ${lowerLine} Z`;
-            return (
-              <path key={item.id} d={area} fill={`url(#usage-area-${item.id})`} />
-            );
+            return <path key={item.id} d={area} fill={providerColor(item.id)} fillOpacity="0.26" />;
           })}
+          {/* Hairline gaps keep collapsed bands' boundaries readable without becoming per-series lines. */}
+          {stackedSeries.map((item) => (
+            <path
+              key={item.id}
+              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
+              fill="none"
+              stroke="var(--background)"
+              strokeWidth="1"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
           <path
             d={smoothPath(dailyTotals.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
             fill="none"
@@ -548,19 +555,6 @@ function UsageChart({
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           />
-          {/* Paint lower boundaries last so a zero-height layer cannot cover them. */}
-          {[...stackedSeries].reverse().map((item) => (
-            <path
-              key={item.id}
-              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
-              fill="none"
-              stroke={providerColor(item.id)}
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          ))}
         </g>
 
         {hoverIndex !== null && (
@@ -574,17 +568,20 @@ function UsageChart({
               strokeWidth="1"
               vectorEffect="non-scaling-stroke"
             />
-            {stackedSeries.filter((item) => item.values[hoverIndex] > 0).map((item) => (
-              <circle
+            {stackedSeries.flatMap((item) => {
+              const value = item.values[hoverIndex];
+              if (value <= 0) return [];
+              const midpoint = (item.lowerValues[hoverIndex] + item.upperValues[hoverIndex]) / 2;
+              return <circle
                 key={item.id}
                 cx={x(hoverIndex)}
-                cy={y(item.upperValues[hoverIndex])}
+                cy={y(midpoint)}
                 r="3.5"
                 fill={providerColor(item.id)}
                 stroke="var(--background)"
                 strokeWidth="1.5"
-              />
-            ))}
+              />;
+            })}
           </g>
         )}
 
@@ -1034,6 +1031,7 @@ function UsageDashboard() {
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
   const [breakdownPage, setBreakdownPage] = useState(1);
+  const [breakdownHover, setBreakdownHover] = useState<string | null>(null);
   const [syncRequested, setSyncRequested] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);
@@ -1260,6 +1258,17 @@ function UsageDashboard() {
 
   const days = useMemo(() => rangeDays(range), [range]);
 
+  // Hooks must run before the early returns below, so the donut memo lives
+  // here even though `breakdown` is only consumed after them.
+  const breakdownRows = breakdownMode === "model" ? modelBreakdown
+    : breakdownMode === "project" ? projectBreakdown
+    : dayBreakdown;
+  const breakdown = useMemo(
+    () => [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort)),
+    [breakdownRows, breakdownSort],
+  );
+  const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
+
   useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
   useEffect(() => {
@@ -1336,11 +1345,9 @@ function UsageDashboard() {
     sources: visibleSources,
     hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
-  const breakdownRows = breakdownMode === "model" ? modelBreakdown
-    : breakdownMode === "project" ? projectBreakdown
-    : dayBreakdown;
-  const breakdown = [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort));
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
+  const breakdownGroupLabel = breakdownMode === "model" ? "models" : breakdownMode === "project" ? "projects" : "days";
+  const donutBesideTable = contentWidth >= 1060;
   const activeDays = new Set(rows.map((row) => row.day)).size;
   const visibleProviderLimits = providerLimits.filter((limit) => isLimitVisibleOnMachine(limit, machine));
 
@@ -1542,6 +1549,9 @@ function UsageDashboard() {
 
               {compactView ? (
                 <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                  <div className="flex justify-center border-b border-border/60 px-3.5 py-4">
+                    <BreakdownDonut donut={breakdownDonut} rows={breakdown} mode={breakdownSort.metric} groupLabel={breakdownGroupLabel} hoveredKey={breakdownHover} onHoverKey={setBreakdownHover} formatValue={breakdownSort.metric === "cost" ? (value) => <CostValue value={value} /> : (value) => compact(value)} />
+                  </div>
                   <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
                     <span>Sort by</span>
                     <div className="flex items-center gap-3" role="group" aria-label="Breakdown sorting">
@@ -1550,8 +1560,9 @@ function UsageDashboard() {
                     </div>
                   </div>
                   {paginatedBreakdown.items.map((row) => (
-                    <div key={row.key} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
+                    <div key={row.key} className={`border-b border-border/60 px-3.5 py-3 transition-colors last:border-b-0 ${breakdownHover === row.key ? "bg-muted/30" : ""}`} onMouseEnter={() => setBreakdownHover(row.key)} onMouseLeave={() => setBreakdownHover(null)}>
                       <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                        <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: breakdownDonut.colorByKey.get(row.key) }} />
                         {breakdownMode === "model" && <ProviderLogo id={modelLogoId(row.label)} size="sm" />}
                         <span className="truncate" title={row.label}>{row.label}</span>
                       </div>
@@ -1570,7 +1581,11 @@ function UsageDashboard() {
                   ))}
                 </div>
               ) : (
-                <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
+                <div className={`mt-3 ${CARD_CLASSES} ${donutBesideTable ? "flex items-stretch" : ""}`}>
+                  <div className={`flex shrink-0 items-center justify-center px-5 py-4 ${donutBesideTable ? "border-r border-border/60" : "border-b border-border/60"}`}>
+                    <BreakdownDonut donut={breakdownDonut} rows={breakdown} mode={breakdownSort.metric} groupLabel={breakdownGroupLabel} hoveredKey={breakdownHover} onHoverKey={setBreakdownHover} formatValue={breakdownSort.metric === "cost" ? (value) => <CostValue value={value} /> : (value) => compact(value)} />
+                  </div>
+                  <div className="min-w-0 flex-1 overflow-x-auto">
                   <table className="w-full border-collapse text-sm" aria-label="Usage breakdown" style={{ minWidth: breakdownMode === "day" ? 440 : 600 }}>
                     <thead>
                       <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
@@ -1589,16 +1604,19 @@ function UsageDashboard() {
                     </thead>
                     <tbody>
                       {paginatedBreakdown.items.map((row) => (
-                        <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
+                        <tr key={row.key} className={`border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0 ${breakdownHover === row.key ? "bg-muted/20" : ""}`} onMouseEnter={() => setBreakdownHover(row.key)} onMouseLeave={() => setBreakdownHover(null)}>
                           <td className="px-4 py-3 font-medium">
-                            {breakdownMode === "model" ? (
-                              <span className="inline-flex min-w-0 items-center gap-2">
+                            <span className="inline-flex min-w-0 items-center gap-2">
+                              <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: breakdownDonut.colorByKey.get(row.key) }} />
+                              {breakdownMode === "model" ? (
+                                <>
                                 <ProviderLogo id={modelLogoId(row.label)} size="sm" />
                                 <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
-                              </span>
-                            ) : (
+                                </>
+                              ) : (
                               <span className="truncate" title={row.label}>{row.label}</span>
-                            )}
+                              )}
+                            </span>
                           </td>
                           {breakdownMode !== "day" && (
                             <td className="px-4 py-3">
@@ -1615,6 +1633,7 @@ function UsageDashboard() {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 </div>
               )}
 
