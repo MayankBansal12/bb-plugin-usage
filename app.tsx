@@ -533,6 +533,19 @@ function UsageChart({
             const area = `${upperLine} ${lowerLine} Z`;
             return <path key={item.id} d={area} fill={providerColor(item.id)} fillOpacity="0.26" />;
           })}
+          {/* Hairline gaps keep collapsed bands' boundaries readable without becoming per-series lines. */}
+          {stackedSeries.map((item) => (
+            <path
+              key={item.id}
+              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
+              fill="none"
+              stroke="var(--background)"
+              strokeWidth="1"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
           <path
             d={smoothPath(dailyTotals.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
             fill="none"
@@ -542,19 +555,6 @@ function UsageChart({
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           />
-          {/* Paint lower boundaries last so a zero-height layer cannot cover them. */}
-          {[...stackedSeries].reverse().map((item) => (
-            <path
-              key={item.id}
-              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
-              fill="none"
-              stroke={providerColor(item.id)}
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          ))}
         </g>
 
         {hoverIndex !== null && (
