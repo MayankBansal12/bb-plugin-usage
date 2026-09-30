@@ -1,6 +1,7 @@
 export type CacheUsageRecord = {
   agentId: string;
   agentName: string;
+  modelProviderId: string;
   model: string;
   cachedInputTokens: number;
   cacheWriteTokens: number;
@@ -11,6 +12,7 @@ export type CacheHitRateGroup = {
   key: string;
   agentId: string;
   agentName: string;
+  modelProviderId: string | null;
   model: string | null;
   cachedInputTokens: number;
   totalInputTokens: number;
@@ -42,11 +44,12 @@ export function reportsCacheUsage(agentId: string) {
 export function cacheHitRateGroups(records: CacheUsageRecord[], groupBy: "agent" | "model"): CacheHitRateGroup[] {
   const groups = new Map<string, Omit<CacheHitRateGroup, "rate" | "totalInputTokens"> & { cacheWriteTokens: number; uncachedInputTokens: number }>();
   for (const record of records) {
-    const key = groupBy === "agent" ? record.agentId : `${record.agentId}\0${record.model}`;
+    const key = groupBy === "agent" ? record.agentId : `${record.agentId}\0${record.modelProviderId}\0${record.model}`;
     const current = groups.get(key) ?? {
       key,
       agentId: record.agentId,
       agentName: record.agentName,
+      modelProviderId: groupBy === "model" ? record.modelProviderId : null,
       model: groupBy === "model" ? record.model : null,
       cachedInputTokens: 0,
       cacheWriteTokens: 0,
@@ -64,6 +67,7 @@ export function cacheHitRateGroups(records: CacheUsageRecord[], groupBy: "agent"
       key: group.key,
       agentId: group.agentId,
       agentName: group.agentName,
+      modelProviderId: group.modelProviderId,
       model: group.model,
       cachedInputTokens: group.cachedInputTokens,
       totalInputTokens,
