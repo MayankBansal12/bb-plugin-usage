@@ -152,7 +152,12 @@ function hasRoutedProviderDecoration(providerId: string, model: string) {
     modelIds.some((modelId) => pattern.test(modelId)));
 }
 
-function matchViaFirstParty(modelIds: string[]): PricingResult | null {
+// "No vendor matched" falls through to the catalog pass, but "more than one
+// vendor matched" must not: the catalog would see only its own candidates and
+// happily resolve a price that first-party matching already proved ambiguous.
+const AMBIGUOUS = Symbol("ambiguous");
+
+function matchViaFirstParty(modelIds: string[]): PricingResult | typeof AMBIGUOUS | null {
   const providers = activeProviders();
   for (const modelId of modelIds) {
     const matches: PricingResult[] = [];
@@ -170,7 +175,7 @@ function matchViaFirstParty(modelIds: string[]): PricingResult | null {
       const price = builtin?.models[modelId];
       if (price) matches.push({ modelProviderId: vendorId, modelProviderName: builtin.name ?? providerName(vendorId), price: { ...price }, status: "models-dev-alias" });
     }
-    if (matches.length > 0) return matches.length === 1 ? matches[0]! : null;
+    if (matches.length > 0) return matches.length === 1 ? matches[0]! : AMBIGUOUS;
   }
   return null;
 }
@@ -206,7 +211,8 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
   if (provider || builtinPrices[modelProviderId]) {
     if (hasRoutedProviderDecoration(modelProviderId, model)) {
       const modelIds = proxyModelIds(modelProviderId, model);
-      const inferred = matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
+      const firstParty = matchViaFirstParty(modelIds);
+      const inferred = firstParty === AMBIGUOUS ? null : (firstParty ?? uniqueCatalogMatch(modelIds));
       if (inferred) return inferred;
     }
     return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
@@ -217,7 +223,8 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
   // name variants, then a catalog-wide unique exact match.
   if (modelProviderId !== "unknown") {
     const modelIds = proxyModelIds(modelProviderId, model);
-    const inferred = matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
+    const firstParty = matchViaFirstParty(modelIds);
+    const inferred = firstParty === AMBIGUOUS ? null : (firstParty ?? uniqueCatalogMatch(modelIds));
     return inferred ?? { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
   }
 
