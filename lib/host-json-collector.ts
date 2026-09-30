@@ -83,8 +83,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // v6 (dsh): replace repeated attempt samples and reject missing fork cuts.
   // v6 (codex): retain hashed session/bucket identities across archive moves and copies.
   // v6 (copilot): add session summaries.
+  // v7 (copilot): uncached input subtracts cache reads and writes; rows cached
+  // under v6 keep the double-counted values and must be reparsed.
   // All agents share this version so existing caches migrate consistently.
-  const cacheVersion = 6;
+  const cacheVersion = 7;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "copilot", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
