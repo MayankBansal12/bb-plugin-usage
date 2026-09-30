@@ -464,12 +464,12 @@ function codexAttributionSnapshot(stored: string | null | undefined, current: Ma
 }
 
 type CodexBucketRow = {
-  eventKey: string; processedTokens: number; cachedInputTokens: number; cacheWriteTokens: number;
+  eventKey: string; agentId: string; processedTokens: number; cachedInputTokens: number; cacheWriteTokens: number;
   uncachedInputTokens: number; outputTokens: number; loggedCostUsd: number | null;
   costUsd: number; cacheSavingsUsd: number;
 };
 
-const codexBucketRowColumns = `e.event_key eventKey, e.processed_tokens processedTokens,
+const codexBucketRowColumns = `e.event_key eventKey, e.provider_id agentId, e.processed_tokens processedTokens,
   e.cached_input_tokens cachedInputTokens, e.cache_write_tokens cacheWriteTokens,
   e.uncached_input_tokens uncachedInputTokens, e.output_tokens outputTokens,
   e.logged_cost_usd loggedCostUsd, e.cost_usd costUsd, e.cache_savings_usd cacheSavingsUsd`;
@@ -579,6 +579,7 @@ function relabelRenamedCodexAccounts(db: Database, sourceId: string, attribution
     for (const { tag, from, to } of renames) {
       const prefix = `${from}:`;
       for (const row of staleRows.all(sourceId, prefix.length, prefix, `:${tag}`) as CodexBucketRow[]) {
+        if (row.eventKey.slice(prefix.length).split(":").length !== 6) continue;
         const stagedKey = `\0relabel:${row.eventKey}`;
         stageEvent.run(stagedKey, row.eventKey);
         stageMapping.run(stagedKey, row.eventKey);
@@ -592,13 +593,13 @@ function relabelRenamedCodexAccounts(db: Database, sourceId: string, attribution
 // Rows persisted before keys carried a home tag get one appended when their
 // label resolves to exactly one known home — configured or observed by the
 // scan — with the primary home as the fallback for the unlabeled prefix.
-// Adopted legacy rows whose label resolves to no home are upgrade leftovers:
+// Legacy rows whose label resolves to several homes are already represented
+// by tagged siblings. Adopted rows whose label resolves to no home are
+// upgrade leftovers:
 // a single tagged sibling (a renamed home still emitting the same bucket)
 // absorbs the row, while several siblings prove the old bucket merged content
 // the fresh scan already splits, so the untagged row is dropped rather than
-// double counted. Unadopted rows without a resolvable home keep their
-// six-part key: a coincidental same-bucket row under another home is its own
-// retained history, not a duplicate, and it ages out by the retention bound.
+// double counted. Other unresolvable stable-source rows retain their history.
 function normalizeCodexHomeKeys(db: Database, sourceId: string, attribution: Map<string, string>, primaryHomeTag: string, adoptedKeys: Set<string>) {
   const tagsByLabel = new Map<string, string[]>();
   for (const [tag, account] of attribution) {
@@ -614,7 +615,9 @@ function normalizeCodexHomeKeys(db: Database, sourceId: string, attribution: Map
       AND (provider_id='codex' OR provider_id LIKE 'codex-%')`);
   const rewrites: Array<{ key: string; nextKey?: string; to?: string; row: CodexBucketRow; drop?: boolean }> = [];
   for (const row of rows) {
-    if (/:[0-9a-f]{12}$/.test(row.eventKey)) continue;
+    // The account label may contain colons, but components after the agent id
+    // are URI encoded. A project can look like a twelve-character home tag.
+    if (row.eventKey.slice(row.agentId.length + 1).split(":").length !== 5) continue;
     const label = row.eventKey.startsWith("codex:") ? "" : row.eventKey.startsWith("codex-") ? row.eventKey.slice(6, row.eventKey.indexOf(":")) : null;
     if (label === null) continue;
     const candidates = label === "" ? (tagsByLabel.get("") ?? [primaryHomeTag]) : (tagsByLabel.get(label) ?? []);
@@ -622,10 +625,10 @@ function normalizeCodexHomeKeys(db: Database, sourceId: string, attribution: Map
       rewrites.push({ key: row.eventKey, nextKey: `${row.eventKey}:${candidates[0]}`, to: label ? `codex-${label}` : "codex", row });
       continue;
     }
-    if (!adoptedKeys.has(row.eventKey)) continue;
+    if (candidates.length === 0 && !adoptedKeys.has(row.eventKey)) continue;
     const siblings = taggedSiblings.all(`${row.eventKey.slice(row.eventKey.indexOf(":"))}:`, row.eventKey) as Array<{ eventKey: string }>;
     if (siblings.length === 1) {
-      rewrites.push({ key: row.eventKey, nextKey: siblings[0].eventKey, row });
+      if (adoptedKeys.has(row.eventKey)) rewrites.push({ key: row.eventKey, nextKey: siblings[0].eventKey, row });
     } else if (siblings.length > 1) {
       rewrites.push({ key: row.eventKey, row, drop: true });
     }
