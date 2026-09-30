@@ -17,6 +17,7 @@ import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
   kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
+import { codexHomeTag } from "./collectors";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getSourceIssueMessage } from "./lib/usage-view-state";
 
@@ -1842,8 +1843,8 @@ describe("retained usage through the real sync path", () => {
     return { day: DAY, modelProviderId: "openai", model: "gpt-test", project: "proj", loggedCostUsd: null,
       uncachedInputTokens: 1000, cachedInputTokens: 0, cacheWriteTokens: 0, outputTokens: 500, ...overrides };
   }
-  function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number) {
-    const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows };
+  function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number, homes?: Array<{ homeTag: string; account: string }>) {
+    const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows, homes };
     const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
     return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
   }
@@ -1851,7 +1852,7 @@ describe("retained usage through the real sync path", () => {
   // Drives the unmodified plugin factory end-to-end through its public sync()
   // RPC (like the Antigravity regression test above); the mutable `state`
   // object lets each subsequent sync serve a different pi scan.
-  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string; codexProfileHomes?: string }, targetAgent = "pi") {
+  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string; codexProfileHomes?: string; homes?: Array<{ homeTag: string; account: string }> }, targetAgent = "pi") {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown; dashboard: () => Promise<{ sync: { running: boolean } }> } | undefined;
     const commandsByTerminalId = new Map<string, string>();
@@ -1887,7 +1888,7 @@ describe("retained usage through the real sync path", () => {
             const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
             const agentId = agentIdFromCommand(command);
             const text = agentId === targetAgent
-              ? fakeHostScanOutputWith(targetAgent, state.rows, state.failureCount)
+              ? fakeHostScanOutputWith(targetAgent, state.rows, state.failureCount, state.homes)
               : fakeHostScanOutput(agentId ?? "codex", []);
             return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
           }),
@@ -1958,6 +1959,279 @@ describe("retained usage through the real sync path", () => {
       state.rows = [];
       await syncAgain();
       expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+    } finally { db.close(); }
+  });
+
+  it("keeps retained Codex history when configured profile homes change", async () => {
+    setPricingCatalog(catalog(1000), "codex-profile-config-v1");
+    const state = {
+      rows: [piRow({ account: "work" }), piRow({ account: "other" })], failureCount: 0,
+      codexProfileHomes: "work=/profiles/work; other=/profiles/other",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+
+      // Adding or removing a profile must not delete the rows another
+      // profile already retained: the scan's source identity stays stable.
+      state.codexProfileHomes = "work=/profiles/work; other=/profiles/other; spare=/profiles/spare";
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+
+      state.codexProfileHomes = "work=/profiles/work";
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+    } finally { db.close(); }
+  });
+
+  it("moves only the renamed home's rows when two homes share a label", async () => {
+    setPricingCatalog(catalog(1000), "codex-shared-label-v1");
+    const state = {
+      rows: [
+        piRow({ account: "work", homeTag: codexHomeTag("/profiles/a"), project: "A" }),
+        piRow({ account: "work", homeTag: codexHomeTag("/profiles/b"), project: "B" }),
+      ],
+      failureCount: 0, codexProfileHomes: "work=/profiles/a; work=/profiles/b",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      // Renaming one of two homes that share a label rewrites only that
+      // home's tagged buckets; the other home's retained history stays put.
+      state.codexProfileHomes = "personal=/profiles/a; work=/profiles/b";
+      state.rows = [];
+      await syncAgain();
+      expect(db.prepare("SELECT provider_id providerId, project FROM usage_events ORDER BY project").all())
+        .toEqual([{ providerId: "codex-personal", project: "A" }, { providerId: "codex-work", project: "B" }]);
+    } finally { db.close(); }
+  });
+
+  it("moves a formerly unlabeled configured Codex home's rows when it gains a label", async () => {
+    setPricingCatalog(catalog(1000), "codex-label-grant-v1");
+    const state = {
+      rows: [
+        piRow({ homeTag: codexHomeTag("/home/user/.codex"), project: "main" }),
+        piRow({ homeTag: codexHomeTag("/profiles/codex"), project: "extra" }),
+      ],
+      failureCount: 0, codexProfileHomes: "/profiles/codex",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events ORDER BY project").all())
+        .toEqual([{ providerId: "codex" }, { providerId: "codex" }]);
+
+      state.codexProfileHomes = "work=/profiles/codex";
+      state.rows = [];
+      await syncAgain();
+      expect(db.prepare("SELECT provider_id providerId, project FROM usage_events ORDER BY project").all())
+        .toEqual([{ providerId: "codex-work", project: "extra" }, { providerId: "codex", project: "main" }]);
+    } finally { db.close(); }
+  });
+
+  it("reattributes retained history when a removed Codex home returns under a new label", async () => {
+    setPricingCatalog(catalog(1000), "codex-readd-v1");
+    const state = {
+      rows: [piRow({ account: "work", homeTag: codexHomeTag("/profiles/a") })],
+      failureCount: 0, codexProfileHomes: "work=/profiles/a",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      state.codexProfileHomes = "";
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+
+      state.codexProfileHomes = "personal=/profiles/a";
+      state.rows = [piRow({ account: "personal", homeTag: codexHomeTag("/profiles/a") })];
+      await syncAgain();
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events").all())
+        .toEqual([{ providerId: "codex-personal" }]);
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+    } finally { db.close(); }
+  });
+
+  it("reattributes a convention-discovered Codex home when it is later configured", async () => {
+    setPricingCatalog(catalog(1000), "codex-convention-v1");
+    const tag = codexHomeTag("/home/user/.codex-work");
+    const state = {
+      rows: [piRow({ account: "work", homeTag: tag })],
+      failureCount: 0,
+      // The scan reports homes it observed without configuration, like a
+      // convention-discovered ~/.codex-work directory.
+      homes: [{ homeTag: tag, account: "work" }] as Array<{ homeTag: string; account: string }>,
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events").all())
+        .toEqual([{ providerId: "codex-work" }]);
+
+      // Configuring the same home under a new label must migrate its
+      // convention-era history: the snapshot remembered the home's tag.
+      state.codexProfileHomes = "personal=/home/user/.codex-work";
+      state.homes = [{ homeTag: tag, account: "personal" }];
+      state.rows = [piRow({ account: "personal", homeTag: tag })];
+      await syncAgain();
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events").all())
+        .toEqual([{ providerId: "codex-personal" }]);
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+    } finally { db.close(); }
+  });
+
+  it("folds adopted unlabeled-era rows into the renamed profile's bucket", async () => {
+    setPricingCatalog(catalog(1000), "codex-upgrade-rename-v1");
+    const tag = codexHomeTag("/profiles/a");
+    const state = {
+      rows: [piRow({ account: "personal", homeTag: tag })],
+      failureCount: 0, codexProfileHomes: "personal=/profiles/a",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      // A bucket written by the pre-tag build under a label that was renamed
+      // before the upgrade ran.
+      db.prepare(`INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model,
+          cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens,
+          uncached_input_tokens, output_tokens, model_provider_id, model_provider_name,
+          logged_cost_usd, pricing_status, project)
+        VALUES ('codex-work:host-1:${DAY}:openai:gpt-test:proj', '${DAY}T00:00:00.000Z', '${DAY}',
+          'codex-work', 'Codex (work)', 'gpt-test', 1.5, 0, 1500, 0, 0, 1000, 500, 'openai', 'OpenAI',
+          NULL, 'logged', 'proj')`).run();
+      db.prepare(`INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id,
+          root_reference, content_sha, last_seen_generation, last_success_at)
+        VALUES ('legacy-codex-src', 'host-1', 'Machine', 'codex', 'ref', 'sha', 'gen-0', 'now')`).run();
+      db.prepare(`INSERT INTO usage_event_sources (event_key, source_id)
+        VALUES ('codex-work:host-1:${DAY}:openai:gpt-test:proj', 'legacy-codex-src')`).run();
+
+      await syncAgain();
+      // The dead label's row folds into the sole tagged sibling for its
+      // bucket rather than surviving next to the renamed profile's rows.
+      expect(db.prepare("SELECT provider_id providerId, project FROM usage_events").all())
+        .toEqual([{ providerId: "codex-personal", project: "proj" }]);
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+    } finally { db.close(); }
+  });
+
+  it("drops an unlabeled-era bucket already split across several tagged homes", async () => {
+    setPricingCatalog(catalog(1000), "codex-unsplittable-v1");
+    const main = codexHomeTag("/home/user/.codex");
+    const extra = codexHomeTag("/profiles/codex");
+    const state = {
+      rows: [
+        piRow({ homeTag: main }),
+        piRow({ homeTag: extra, uncachedInputTokens: 500, outputTokens: 500 }),
+      ],
+      failureCount: 0, codexProfileHomes: "/profiles/codex",
+      homes: [{ homeTag: main, account: "" }, { homeTag: extra, account: "" }],
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      // A combined pre-tag bucket adopted from a pre-attribution source for
+      // the same (machine, day, model, project): both tagged rows already
+      // carry its content, so keeping it would double count.
+      db.prepare(`INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model,
+          cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens,
+          uncached_input_tokens, output_tokens, model_provider_id, model_provider_name,
+          logged_cost_usd, pricing_status, project)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:proj', '${DAY}T00:00:00.000Z', '${DAY}',
+          'codex', 'Codex', 'gpt-test', 1.5, 0, 1500, 0, 0, 1000, 500, 'openai', 'OpenAI',
+          NULL, 'logged', 'proj')`).run();
+      db.prepare(`INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id,
+          root_reference, content_sha, last_seen_generation, last_success_at)
+        VALUES ('legacy-codex-src', 'host-1', 'Machine', 'codex', 'ref', 'sha', 'gen-0', 'now')`).run();
+      db.prepare(`INSERT INTO usage_event_sources (event_key, source_id)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:proj', 'legacy-codex-src')`).run();
+
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 2500, cost: 2.5 });
+      expect(db.prepare("SELECT event_key k FROM usage_events WHERE event_key='codex:host-1:" + DAY + ":openai:gpt-test:proj'").all())
+        .toEqual([]);
+    } finally { db.close(); }
+  });
+
+  it("recomputes folded bucket totals from the merged columns", async () => {
+    setPricingCatalog(catalog(1000), "codex-fold-recompute-v1");
+    const main = codexHomeTag("/home/user/.codex");
+    const state = {
+      rows: [piRow({ homeTag: main, uncachedInputTokens: 900, outputTokens: 700 })],
+      failureCount: 0, homes: [{ homeTag: main, account: "" }],
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      // processed_tokens is deliberately inconsistent with the columns, as a
+      // row written by an older build could be; folding must recompute it
+      // from the merged components rather than taking MAX(processed_tokens).
+      // The merged bucket is also repriced on the folded totals: keeping the
+      // larger input cost (1.8) would understate the merged usage.
+      const sourceId = db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='codex'").get() as { id: string };
+      db.prepare(`INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model,
+          cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens,
+          uncached_input_tokens, output_tokens, model_provider_id, model_provider_name,
+          logged_cost_usd, pricing_status, project)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:proj', '${DAY}T00:00:00.000Z', '${DAY}',
+          'codex', 'Codex', 'gpt-test', 1.8, 0, 1800, 0, 0, 1000, 500, 'openai', 'OpenAI',
+          NULL, 'logged', 'proj')`).run();
+      db.prepare(`INSERT INTO usage_event_sources (event_key, source_id)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:proj', ?)`).run(sourceId.id);
+
+      await syncAgain();
+      expect(db.prepare("SELECT processed_tokens total, uncached_input_tokens in_, output_tokens out_, cost_usd cost FROM usage_events").get())
+        .toEqual({ total: 1700, in_: 1000, out_: 700, cost: 1.7 });
+    } finally { db.close(); }
+  });
+
+  it("keeps swapped Codex labels on their own history", async () => {
+    setPricingCatalog(catalog(1000), "codex-relabel-swap-v1");
+    const state = {
+      rows: [piRow({ account: "work", project: "W" }), piRow({ account: "personal", project: "P" })],
+      failureCount: 0, codexProfileHomes: "work=/profiles/a; personal=/profiles/b",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      state.codexProfileHomes = "work=/profiles/b; personal=/profiles/a";
+      state.rows = [piRow({ account: "personal", project: "W" }), piRow({ account: "work", project: "P" })];
+      await syncAgain();
+      // Home a's history followed it to personal; home b's followed it to work.
+      expect(db.prepare("SELECT provider_id providerId, project FROM usage_events ORDER BY provider_id").all())
+        .toEqual([{ providerId: "codex-personal", project: "W" }, { providerId: "codex-work", project: "P" }]);
+    } finally { db.close(); }
+  });
+
+  it("adopts retained history from Codex sources written before attribution", async () => {
+    setPricingCatalog(catalog(1000), "codex-legacy-source-v1");
+    const state = { rows: [piRow()], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      // A source written by a build whose source id embedded the profile
+      // config: upgrading used to delete its retained history with the source.
+      db.prepare(`INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model,
+          cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens,
+          uncached_input_tokens, output_tokens, model_provider_id, model_provider_name,
+          logged_cost_usd, pricing_status, project)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:legacy-proj', '${DAY}T00:00:00.000Z', '${DAY}',
+          'codex', 'Codex', 'gpt-test', 1.5, 0, 1500, 0, 0, 1000, 500, 'openai', 'OpenAI',
+          NULL, 'logged', 'legacy-proj')`).run();
+      db.prepare(`INSERT INTO usage_sources (source_id, machine_id, machine_name, provider_id,
+          root_reference, content_sha, last_seen_generation, last_success_at)
+        VALUES ('legacy-codex-src', 'host-1', 'Machine', 'codex', 'ref', 'sha', 'gen-0', 'now')`).run();
+      db.prepare(`INSERT INTO usage_event_sources (event_key, source_id)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:legacy-proj', 'legacy-codex-src')`).run();
+      // A retained bucket whose freshly-emitted twin already carries the home
+      // tag folds into it (per-column MAX) once normalized instead of doubling.
+      db.prepare(`INSERT INTO usage_events (event_key, timestamp, day, provider_id, provider_name, model,
+          cost_usd, cache_savings_usd, processed_tokens, cached_input_tokens, cache_write_tokens,
+          uncached_input_tokens, output_tokens, model_provider_id, model_provider_name,
+          logged_cost_usd, pricing_status, project)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:proj', '${DAY}T00:00:00.000Z', '${DAY}',
+          'codex', 'Codex', 'gpt-test', 1.5, 0, 1200, 0, 0, 800, 400, 'openai', 'OpenAI',
+          NULL, 'logged', 'proj')`).run();
+      db.prepare(`INSERT INTO usage_event_sources (event_key, source_id)
+        VALUES ('codex:host-1:${DAY}:openai:gpt-test:proj', 'legacy-codex-src')`).run();
+
+      await syncAgain();
+      expect(db.prepare("SELECT provider_id providerId, project FROM usage_events ORDER BY project").all())
+        .toEqual([{ providerId: "codex", project: "legacy-proj" }, { providerId: "codex", project: "proj" }]);
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      expect(db.prepare("SELECT COUNT(*) count FROM usage_sources WHERE provider_id='codex'").get())
+        .toEqual({ count: 1 });
     } finally { db.close(); }
   });
 

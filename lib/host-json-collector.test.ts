@@ -775,7 +775,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(8);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(9);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
