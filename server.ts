@@ -712,7 +712,7 @@ export async function runHostCommand(
   }
 }
 
-// OpenCode usage is collected on the enrolled HOST (via `opencode db`), so the
+// OpenCode usage is collected on the enrolled HOST, so the
 // day bucket and the 90-day cutoff MUST use the host's local timezone, not
 // UTC. Otherwise machines in a positive/negative offset see "today"'s usage
 // land in the previous/next UTC day.
@@ -746,12 +746,31 @@ GROUP BY day, modelProviderId, model, (COALESCE(json_extract(m.data, '$.cost'), 
 ORDER BY day, modelProviderId, model;`.trim();
 }
 
+// OpenCode v2 writes assistant steps to session_message instead of message and
+// does not offer `opencode db`. Query its local database read-only on the host;
+// never transfer message content, only daily token/cost aggregates.
+export function openCodeV2Sql(): string {
+  return openCodeSql()
+    .replace("FROM session\n", "FROM session_v2\n")
+    .replace("JOIN message m ON m.session_id = rs.id", "JOIN session_message m ON m.session_id = rs.id")
+    .replace("json_extract(m.data, '$.providerID')", "json_extract(m.data, '$.model.providerID')")
+    .replace("json_extract(m.data, '$.modelID')", "json_extract(m.data, '$.model.id')")
+    .replace("json_extract(m.data, '$.role') = 'assistant'", "m.type = 'assistant' AND json_type(m.data, '$.tokens') IS NOT NULL");
+}
+
 export function openCodeCommand() {
   const sql = openCodeSql();
+  const v2Sql = openCodeV2Sql();
+  const database = `\${XDG_DATA_HOME:-$HOME/.local/share}/opencode/opencode.db`;
+  const v2Query = [
+    "import json, sqlite3, sys",
+    "db = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)",
+    `rows = db.execute(${JSON.stringify(v2Sql)}).fetchall()`,
+    "print(json.dumps([dict(zip(('day', 'modelProviderId', 'model', 'loggedCostUsd', 'inputTokens', 'cachedInputTokens', 'cacheWriteTokens', 'outputTokens', 'reasoningTokens'), row)) for row in rows]))",
+  ].join("\n");
+  const v2Probe = "import sqlite3,sys; db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); sys.exit(0 if db.execute(\"select count(*) from sqlite_master where type='table' and name in ('session_message','session_v2')\").fetchone()[0] == 2 else 1)";
   return [
-    `if ! command -v opencode >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:OpenCode CLI is required to collect OpenCode usage.'; exit 127; fi`,
-    `result=$(opencode db ${shellQuote(sql)} --format json 2>&1)`,
-    `bb_usage_query_status=$?`,
+    `if command -v python3 >/dev/null 2>&1 && [ -f "${database}" ] && python3 -c ${shellQuote(v2Probe)} "${database}" >/dev/null 2>&1; then result=$(python3 -c ${shellQuote(v2Query)} "${database}" 2>&1); bb_usage_query_status=$?; else if ! command -v opencode >/dev/null 2>&1; then printf '%s\\n' '__BB_USAGE_ERROR__:OpenCode CLI is required to collect OpenCode usage.'; exit 127; fi; result=$(opencode db ${shellQuote(sql)} --format json 2>&1); bb_usage_query_status=$?; fi`,
     `if [ "$bb_usage_query_status" -ne 0 ]; then diagnostic=$(printf '%s' "$result" | tr '\\r\\n' ' ' | cut -c1-240); printf '%s%s\\n' '__BB_USAGE_ERROR__:OpenCode usage query failed' "\${diagnostic:+: $diagnostic}"; exit "$bb_usage_query_status"; fi`,
     `printf '%s\\n' '__BB_USAGE_BEGIN__'`,
     `printf '%s\\n' "$result"`,

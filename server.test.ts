@@ -1,6 +1,10 @@
 import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./server";
 import Database from "better-sqlite3";
 import { createHash, randomBytes } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
@@ -11,7 +15,7 @@ vi.mock("@bb/plugin-sdk", () => ({
 
 import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  openCodeCommand, openCodeSql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
+  openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 
@@ -979,14 +983,16 @@ describe("host command output", () => {
 });
 
 describe("OpenCode query", () => {
-  it("uses the OpenCode CLI for a 90-day aggregate without sqlite3", () => {
+  it("keeps the v1 CLI query alongside the v2 read-only database query", () => {
     const command = openCodeCommand();
     expect(command).toContain("command -v opencode");
     expect(command).toContain("opencode db");
+    expect(command).toContain("session_message");
+    expect(command).toContain("mode=ro");
     expect(command).toContain("--format json");
     expect(command).toContain("bb_usage_query_status=$?");
     expect(command).not.toMatch(/(?:^|; )status=\$\?/);
-    expect(command).not.toContain("sqlite3");
+    expect(command).not.toContain("command -v sqlite3");
     expect(command).toContain("time_created >= CAST(strftime");
     expect(command).toContain("-89 days");
     expect(command).not.toContain("-365 days");
@@ -997,6 +1003,94 @@ describe("OpenCode query", () => {
     expect(command).toContain("$.role");
     expect(command).toContain("assistant");
     expect(command).toContain("$.tokens.cache.read");
+  });
+
+  it("aggregates v2 assistant steps from the new tables without duplicating migrated v1 messages", () => {
+    const db = new Database(":memory:");
+    db.exec(`CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+      CREATE TABLE session_message (session_id TEXT, type TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE message (session_id TEXT, time_created INTEGER, data TEXT);`);
+    const now = Date.now();
+    const day = localDay(now);
+    db.prepare("INSERT INTO session_v2 VALUES (?, ?)").run("s1", now);
+    const insert = db.prepare("INSERT INTO session_message VALUES (?, ?, ?, ?)");
+    insert.run("s1", "assistant", now, JSON.stringify({ model: { providerID: "opencode-go", id: "glm-5.3-flash" },
+      cost: 0.25, tokens: { input: 10, output: 20, reasoning: 5, cache: { read: 30, write: 2 } } }));
+    // An earlier version of this step also lives in the migrated v1 table.
+    db.prepare("INSERT INTO message VALUES (?, ?, ?)").run("s1", now,
+      JSON.stringify({ role: "assistant", providerID: "opencode-go", modelID: "glm-5.3-flash",
+        cost: 0.25, tokens: { input: 10, output: 20 } }));
+    insert.run("s1", "assistant", now, JSON.stringify({ model: { providerID: "opencode-go", id: "glm-5.3-flash" },
+      cost: 0, tokens: { input: 3, output: 4, cache: { read: 6 } } }));
+    insert.run("s1", "assistant", now, JSON.stringify({ model: { providerID: "opencode-go", id: "glm-5.3-flash" }, error: {} }));
+    insert.run("s1", "model-switched", now, JSON.stringify({ model: { providerID: "opencode-go", id: "other" } }));
+    const rows = db.prepare(openCodeV2Sql()).all() as Array<Record<string, unknown>>;
+    expect(rows).toHaveLength(2); // logged and unpriced steps stay separate
+    expect(rows.map((row) => row.day)).toEqual([day, day]);
+    expect(rows.map((row) => row.loggedCostUsd)).toEqual([0, 0.25]);
+    expect(rows.map((row) => row.outputTokens)).toEqual([4, 20]);
+    expect(rows.map((row) => row.reasoningTokens)).toEqual([0, 5]);
+    db.close();
+  });
+
+  it("runs the v2 collector through the host shell without opencode db", () => {
+    const home = mkdtempSync(join(tmpdir(), "usage-opencode-v2-"));
+    try {
+      const dir = join(home, "opencode");
+      mkdirSync(dir);
+      const db = new Database(join(dir, "opencode.db"));
+      db.exec(`CREATE TABLE session_v2 (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+        CREATE TABLE session_message (session_id TEXT, type TEXT, time_created INTEGER, data TEXT);`);
+      const now = Date.now();
+      db.prepare("INSERT INTO session_v2 VALUES (?, ?)").run("s1", now);
+      db.prepare("INSERT INTO session_message VALUES (?, 'assistant', ?, ?)").run("s1", now,
+        JSON.stringify({ model: { providerID: "openai", id: "test-model" }, cost: 1.5,
+          tokens: { input: 12, output: 5, cache: { read: 9, write: 1 } } }));
+      db.close();
+      const output = execFileSync("sh", ["-c", openCodeCommand()], {
+        encoding: "utf8", env: { ...process.env, XDG_DATA_HOME: home },
+      });
+      expect(JSON.parse(extractOpenCodeJson(output))).toMatchObject([{ day: localDay(now),
+        modelProviderId: "openai", model: "test-model", loggedCostUsd: 1.5, inputTokens: 12 }]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the CLI when a v1 database has a session_message table but no session_v2", () => {
+    const home = mkdtempSync(join(tmpdir(), "usage-opencode-v1-"));
+    try {
+      const dir = join(home, "opencode");
+      const bin = join(home, "bin");
+      mkdirSync(dir);
+      mkdirSync(bin);
+      const db = new Database(join(dir, "opencode.db"));
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+        CREATE TABLE message (session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE session_message (id TEXT);`);
+      const now = Date.now();
+      db.prepare("INSERT INTO session VALUES (?, ?)").run("s1", now);
+      db.prepare("INSERT INTO message VALUES (?, ?, ?)").run("s1", now,
+        JSON.stringify({ role: "assistant", providerID: "openai", modelID: "v1-model", cost: 0.5,
+          tokens: { input: 7, output: 3, cache: { read: 2, write: 1 } } }));
+      db.close();
+      // Stand in for the v1 CLI: validate the arguments and run its SQL verbatim.
+      const cli = join(bin, "opencode");
+      writeFileSync(cli, [
+        "#!/bin/sh",
+        "[ \"$1\" = db ] && [ \"$3\" = --format ] && [ \"$4\" = json ] || exit 1",
+        "python3 -c 'import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.row_factory=sqlite3.Row; print(json.dumps([dict(r) for r in db.execute(sys.argv[2])]))' \"$XDG_DATA_HOME/opencode/opencode.db\" \"$2\"",
+      ].join("\n") + "\n");
+      chmodSync(cli, 0o755);
+      const output = execFileSync("sh", ["-c", openCodeCommand()], {
+        encoding: "utf8", env: { ...process.env, XDG_DATA_HOME: home, PATH: `${bin}:${process.env.PATH}` },
+      });
+      expect(JSON.parse(extractOpenCodeJson(output))).toMatchObject([{ day: localDay(now),
+        modelProviderId: "openai", model: "v1-model", loggedCostUsd: 0.5, inputTokens: 7,
+        cachedInputTokens: 2, cacheWriteTokens: 1, outputTokens: 3 }]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it("rejects failed and incomplete OpenCode query output", () => {

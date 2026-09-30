@@ -29,7 +29,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Grok Agent: `~/.grok/logs/unified.jsonl`
 - Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
 - Prime Agent: root sessions in `~/.prime/agent/sessions/*.jsonl` and recursive-agent sessions under `~/.prime/agent/session-artifacts/**/*.jsonl`, plus optional custom session directories in plugin settings
-- OpenCode: assistant-message usage from the last 90 days, recorded by `opencode db`
+- OpenCode: assistant-message usage from the last 90 days, recorded by `opencode db` (v1) or the read-only local database (v2)
 - Antigravity: `~/.antigravity-acp/usage.jsonl`, written by the `bb-plugin-antigravity-acp` provider bridge (the `agy` CLI has no session log of its own in a stable, parseable shape, so the bridge is the source of truth, one line per turn it runs)
 - Grok Build limits: credit usage and reset times from the Grok billing endpoint, using the local Grok login (`~/.grok/auth.json`, respecting `GROK_HOME` and `GROK_AUTH_PATH`)
 - OpenCode Go limits: plan windows from `https://opencode.ai/zen/go/v1/usage`, authenticated with the `opencode-go` credential in `~/.local/share/opencode/auth.json` on each machine
@@ -43,7 +43,7 @@ Devin collection requires Node.js 22.13 or newer (for `node:sqlite`) on each enr
 
 FX history follows the rolling retention of FX's local usage ledger. The plugin reads generation usage facts only; FX sessions and prompts are not scanned.
 
-OpenCode collection requires an OpenCode CLI with `opencode db --format json` support on each enrolled machine. The fixed `SELECT` query aggregates assistant-message usage from the last 90 calendar days—the longest range the dashboard supports—returns only usage metadata, is limited to 900 KB of output, and times out after 60 seconds. OpenCode, Pi, and Prime preserve positive agent-recorded costs and otherwise estimate cost from models.dev token rates. Models without recorded costs or catalog rates remain unknown.
+OpenCode v1 collection requires an OpenCode CLI with `opencode db --format json` support. OpenCode v2 collection requires Python 3 on the enrolled machine to read its local SQLite database (the v2 CLI no longer offers `opencode db`). The fixed `SELECT` query aggregates assistant-message usage from the last 90 calendar days—the longest range the dashboard supports—returns only usage metadata, is limited to 900 KB of output, and times out after 60 seconds. OpenCode, Pi, and Prime preserve positive agent-recorded costs and otherwise estimate cost from models.dev token rates. Models without recorded costs or catalog rates remain unknown.
 
 Grok Build limits require Node.js 18+ and a first-party Grok login on the enrolled machine. The collector supports current weekly/monthly credit percentages, legacy monthly budgets, and on-demand caps. Unified credits are labeled as shared across Grok products. Credentials stay on the machine; only normalized limits and a hashed account identity are transferred. API-key-only logins and accounts without a billing plan are skipped. Expired credentials require `grok login`; the plugin does not rotate refresh tokens. The limits card appears only after valid limits have been collected, including 0% usage. First-time failures stay in diagnostics; later failures retain the previous snapshot with a warning. This uses the billing endpoint implemented by [Grok Build](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-shell/src/extensions/billing.rs), which may change between releases.
 
