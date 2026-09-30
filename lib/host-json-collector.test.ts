@@ -368,10 +368,15 @@ describe("host JSON usage collector", () => {
     const first = await scan("codex", root, cachePath, { accountHomes: [{ account: "work", home }] });
     expect(first.rows[0]).toMatchObject({ account: "work", uncachedInputTokens: 50 });
 
+    // A newly archived copy is parsed alongside the cached active file. Both
+    // must receive the renamed account's event key so the scan deduplicates it.
+    await mkdir(join(home, "archived_sessions"), { recursive: true });
+    await copyFile(join(home, "sessions", "rollout-x.jsonl"), join(home, "archived_sessions", "rollout-x.jsonl"));
+
     // The file is unchanged so its rows come from cache; the renamed label
     // must still take effect instead of serving the stale "work" rows.
     const renamed = await scan("codex", root, cachePath, { accountHomes: [{ account: "personal", home }] });
-    expect(renamed).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1 });
+    expect(renamed).toMatchObject({ fileCount: 2, changedFileCount: 1, reusedFileCount: 1 });
     expect(renamed.rows).toHaveLength(1);
     expect(renamed.rows[0]).toMatchObject({ account: "personal", uncachedInputTokens: 50 });
 
@@ -770,7 +775,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(8);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
