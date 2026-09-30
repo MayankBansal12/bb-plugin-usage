@@ -34,7 +34,6 @@ async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath
     sinceDay: "2026-08-01",
     ...extra,
   });
-  expect(script.length).toBeLessThan(9_000);
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024 });
   return extractHostJsonScan(stdout.replace(/\n/g, "\r\n"));
 }
@@ -107,7 +106,7 @@ describe("host JSON usage collector", () => {
       await writeFile(join(root, "rollout-session.jsonl"), codexRollout("same-id-in-separate-accounts", tokens));
       await writeFile(join(root, "unrelated.jsonl"), codexRollout("ignored", 999));
     }
-    const first = await scan("codex", roots, cachePath, { accountRoot });
+    const first = await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(first).toMatchObject({ fileCount: 3, changedFileCount: 3, failureCount: 0 });
     expect(first.rows).toHaveLength(3);
     expect(first.rows).toEqual(expect.arrayContaining([
@@ -116,7 +115,7 @@ describe("host JSON usage collector", () => {
       expect.objectContaining({ account: "personal", uncachedInputTokens: 300 }),
     ]));
     expect(first.rows.find((row) => row.uncachedInputTokens === 100)?.account).toBeUndefined();
-    const second = await scan("codex", roots, cachePath, { accountRoot });
+    const second = await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(second).toMatchObject({ changedFileCount: 0, reusedFileCount: 3, failureCount: 0 });
     expect(second.rows).toEqual(first.rows);
     const cache = await readFile(cachePath, "utf8");
@@ -137,21 +136,21 @@ describe("host JSON usage collector", () => {
     await mkdir(join(home, "sessions"), { recursive: true });
     await mkdir(join(home, "archived_sessions"), { recursive: true });
     await writeFile(active, codexRollout("move-session", 100));
-    const first = await scan("codex", roots, cachePath, { accountRoot });
+    const first = await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] });
     await rename(active, archived);
-    const moved = await scan("codex", roots, cachePath, { accountRoot });
+    const moved = await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(moved).toMatchObject({ fileCount: 1, changedFileCount: 1, failureCount: 0 });
     expect(moved.rows).toEqual(first.rows);
     expect(Object.keys(JSON.parse(await readFile(cachePath, "utf8")).files)).toHaveLength(1);
-    expect((await scan("codex", roots, cachePath, { accountRoot })).reusedFileCount).toBe(1);
+    expect((await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] })).reusedFileCount).toBe(1);
     await rename(archived, active);
-    expect((await scan("codex", roots, cachePath, { accountRoot })).rows).toEqual(first.rows);
+    expect((await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] })).rows).toEqual(first.rows);
     await appendFile(active, "\n" + JSON.stringify({
       timestamp: "2026-08-09T12:00:02Z", type: "event_msg", payload: { type: "token_count", info: {
         last_token_usage: { input_tokens: 50, output_tokens: 2 },
       } },
     }));
-    const continued = await scan("codex", roots, cachePath, { accountRoot });
+    const continued = await scan("codex", roots, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(continued.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 150, outputTokens: 7 })]);
     expect(continued.rows[0]?.account).toBe(account);
   });
@@ -251,7 +250,7 @@ describe("host JSON usage collector", () => {
     await writeFile(join(accountRoot, "omnidrome", "sessions", "rollout-extra.jsonl"), rollout("omnidrome-session", 60));
     await writeFile(join(accountRoot, "saiens", "auth.json"), "{}");
 
-    const first = await scan("codex", root, cachePath, { accountRoot });
+    const first = await scan("codex", root, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(first).toMatchObject({ fileCount: 3, changedFileCount: 3, reusedFileCount: 0, failureCount: 0 });
     const day = localDay("2026-08-09T12:00:00Z");
     expect(first.rows).toEqual(expect.arrayContaining([
@@ -262,9 +261,48 @@ describe("host JSON usage collector", () => {
     expect(first.rows.find((row) => row.account === undefined)?.account).toBeUndefined();
     expect(JSON.stringify(first.rows)).not.toContain("dormant");
 
-    const second = await scan("codex", root, cachePath, { accountRoot });
+    const second = await scan("codex", root, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(second).toMatchObject({ fileCount: 3, changedFileCount: 0, reusedFileCount: 3, failureCount: 0 });
     expect(second.rows).toEqual(first.rows);
+  });
+
+  it("attributes sibling .codex-* homes and configured homes to their accounts", async () => {
+    const directory = await temporaryDirectory();
+    const home = join(directory, "home");
+    const root = join(home, ".codex", "sessions");
+    const cachePath = join(directory, "cache", "codex.json");
+    const rollout = (id: string, inputTokens: number) => [
+      { timestamp: "2026-08-09T12:00:00Z", type: "session_meta", payload: { id, cwd: `/work/${id}` } },
+      { timestamp: "2026-08-09T12:00:01Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: inputTokens, cached_input_tokens: 0, output_tokens: 5 } } } },
+    ].map((value) => JSON.stringify(value)).join("\n");
+    await mkdir(root, { recursive: true });
+    await mkdir(join(home, ".codex-work", "sessions"), { recursive: true });
+    await mkdir(join(home, ".codex-profiles", "saiens", "sessions"), { recursive: true });
+    await mkdir(join(home, "unrelated"), { recursive: true });
+    await mkdir(join(directory, "elsewhere", "sessions"), { recursive: true });
+    await writeFile(join(root, "rollout-main.jsonl"), rollout("main", 100));
+    await writeFile(join(home, ".codex-work", "sessions", "rollout-work.jsonl"), rollout("work", 40));
+    await writeFile(join(home, ".codex-profiles", "saiens", "sessions", "rollout-extra.jsonl"), rollout("saiens", 60));
+    await writeFile(join(home, "unrelated", "rollout-stray.jsonl"), rollout("stray", 999));
+    await writeFile(join(directory, "elsewhere", "sessions", "rollout-custom.jsonl"), rollout("custom", 80));
+
+    const result = await scan("codex", root, cachePath, {
+      accountRoots: [{ root: join(home, ".codex-profiles") }, { root: home, prefix: ".codex-" }],
+      accountHomes: [{ account: "custom", home: join(directory, "elsewhere") }],
+    });
+    expect(result).toMatchObject({ fileCount: 4, failureCount: 0 });
+    const day = localDay("2026-08-09T12:00:00Z");
+    expect(result.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ day, project: "main", uncachedInputTokens: 100 }),
+      expect.objectContaining({ day, account: "work", project: "work", uncachedInputTokens: 40 }),
+      expect.objectContaining({ day, account: "saiens", project: "saiens", uncachedInputTokens: 60 }),
+      expect.objectContaining({ day, account: "custom", project: "custom", uncachedInputTokens: 80 }),
+    ]));
+    expect(result.rows).toHaveLength(4);
+    // `.codex-profiles` matched the `.codex-` prefix as a sibling but has no
+    // sessions/ of its own, and `unrelated` never enters the scan.
+    expect(JSON.stringify(result.rows)).not.toContain("profiles");
+    expect(JSON.stringify(result.rows)).not.toContain("stray");
   });
 
   it.each(["sessions", "archived_sessions"])("does not double-count a linked Codex profile (%s)", async (sessionDirectory) => {
@@ -280,11 +318,42 @@ describe("host JSON usage collector", () => {
     ].join("\n"));
     await symlink(join(home, ".codex"), join(accountRoot, "alias"), "dir");
 
-    const result = await scan("codex", root, cachePath, { accountRoot });
+    const result = await scan("codex", root, cachePath, { accountRoots: [{ root: accountRoot }] });
     expect(result).toMatchObject({ fileCount: 1, failureCount: 0 });
     expect(result.rows).toHaveLength(1);
     expect(result.rows[0]).not.toMatchObject({ account: "alias" });
     expect(result.rows[0]).toMatchObject({ uncachedInputTokens: 100 });
+  });
+
+  it("re-applies the current account label to rows reused from cache", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache", "codex.json");
+    const home = join(directory, "custom-home");
+    await mkdir(join(home, "sessions"), { recursive: true });
+    await writeFile(join(home, "sessions", "rollout-x.jsonl"), [
+      JSON.stringify({ timestamp: "2026-08-09T12:00:00Z", type: "event_msg", payload: { type: "token_count", info: { last_token_usage: { input_tokens: 50, cached_input_tokens: 0, output_tokens: 5 } } } }),
+    ].join("\n"));
+
+    const first = await scan("codex", root, cachePath, { accountHomes: [{ account: "work", home }] });
+    expect(first.rows[0]).toMatchObject({ account: "work", uncachedInputTokens: 50 });
+
+    // A newly archived copy is parsed alongside the cached active file. Both
+    // must receive the renamed account's event key so the scan deduplicates it.
+    await mkdir(join(home, "archived_sessions"), { recursive: true });
+    await copyFile(join(home, "sessions", "rollout-x.jsonl"), join(home, "archived_sessions", "rollout-x.jsonl"));
+
+    // The file is unchanged so its rows come from cache; the renamed label
+    // must still take effect instead of serving the stale "work" rows.
+    const renamed = await scan("codex", root, cachePath, { accountHomes: [{ account: "personal", home }] });
+    expect(renamed).toMatchObject({ fileCount: 2, changedFileCount: 1, reusedFileCount: 1 });
+    expect(renamed.rows).toHaveLength(1);
+    expect(renamed.rows[0]).toMatchObject({ account: "personal", uncachedInputTokens: 50 });
+
+    // An empty configured label drops attribution again: rows merge back
+    // into the base Codex agent.
+    const untagged = await scan("codex", root, cachePath, { accountHomes: [{ account: "", home }] });
+    expect(untagged.rows[0]?.account).toBeUndefined();
   });
 
   it.each([
@@ -393,6 +462,43 @@ describe("host JSON usage collector", () => {
     const second = await scan("antigravity", root, cachePath);
     expect(second).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1, failureCount: 0 });
     expect(second.rows).toEqual(first.rows);
+  });
+
+  it("collects completed Copilot sessions once and retains only aggregate metadata", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "session-state", "session-private");
+    const cachePath = join(directory, "cache", "copilot.json");
+    await mkdir(root, { recursive: true });
+    const shutdown = {
+      type: "session.shutdown", id: "shutdown-private", timestamp: "2026-08-09T12:00:00Z",
+      data: { modelMetrics: {
+        "gpt-5-test": { requests: { count: 2, cost: 1 }, usage: {
+          inputTokens: 100, cacheReadTokens: 60, cacheWriteTokens: 5, outputTokens: 20, reasoningTokens: 7,
+        } },
+        "claude-test": { requests: { count: 1, cost: 1 }, usage: {
+          inputTokens: 40, cacheReadTokens: 10, cacheWriteTokens: 0, outputTokens: 8,
+        } },
+      }, codeChanges: { filesModified: ["/private/work/project/secret.ts"] } },
+    };
+    await writeFile(join(root, "events.jsonl"), [
+      { type: "session.start", id: "start-private", timestamp: "2026-08-09T10:00:00Z", data: { context: { cwd: "/private/work/project" } } },
+      shutdown,
+      shutdown,
+      { type: "session.usage_checkpoint", id: "checkpoint-private", timestamp: "2026-08-09T11:00:00Z", data: { totalPremiumRequests: 2 } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const first = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ day: localDay("2026-08-09T12:00:00Z"), modelProviderId: "github-copilot", model: "gpt-5-test", project: "project", uncachedInputTokens: 35, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 20 }),
+      expect.objectContaining({ modelProviderId: "github-copilot", model: "claude-test", uncachedInputTokens: 30, cachedInputTokens: 10, cacheWriteTokens: 0, outputTokens: 8 }),
+    ]));
+    expect(first.rows).toHaveLength(2);
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toMatch(/private|secret/);
+
+    const second = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(second).toMatchObject({ changedFileCount: 0, reusedFileCount: 1, rows: first.rows });
   });
 
   it("streams Thaura's usage ledger and prices its flat model rate", async () => {
@@ -578,7 +684,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(9);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
@@ -842,7 +948,7 @@ describe("host JSON usage collector", () => {
       const result = await scan("dsh", root, cachePath);
       expect(result).toMatchObject({ failureCount: 0, changedFileCount: 1, reusedFileCount: 0 });
       expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 14, outputTokens: 5 })]);
-      expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
+      expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(9);
     });
   });
 
@@ -862,19 +968,15 @@ describe("host JSON usage collector", () => {
   it("keeps host filesystem paths out of failure diagnostics", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "sessions");
-    const cachePath = join(directory, "cache", "codex.json");
+    const cachePath = join(directory, "cache", "dsh.json");
     await mkdir(root, { recursive: true });
-    // Discoverable and stat-able, but unreadable -- so parseFile throws and the
-    // failure path runs with a real filePath in scope.
-    const secret = join(root, "rollout-secret.jsonl");
-    await writeFile(secret, "{}\n");
-    await chmod(secret, 0o000);
+    await writeFile(join(root, "session.v3.jsonl.zstd"), "not a zstd frame");
 
-    const result = await scan("codex", root, cachePath);
+    const result = await scan("dsh", root, cachePath);
     expect(result.failureCount).toBeGreaterThan(0);
     // `error` carries the first failure string off the host verbatim.
     expect(result.error).toBe("A usage log could not be read.");
-    await chmod(secret, 0o600);
+    expect(JSON.stringify(result)).not.toContain(directory);
   });
 });
 

@@ -4,9 +4,10 @@ import { createHash } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
-  parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
+  codexHomeTag, parseAmpUsageAggregates, parseHostUsageAggregates, parseOpenCode, repriceUsageRecord,
   type AgentId, type UsageRecord,
 } from "./collectors";
+import { compressedAmpUsageCollectorScript, extractAmpUsageScan } from "./lib/amp-usage-collector";
 import { activateCachedCatalog, refreshCatalog } from "./lib/catalog";
 import { openCodeGoUsageCommand, extractOpenCodeGoFingerprint, parseOpenCodeGoUsage } from "./lib/opencode-go";
 import {
@@ -74,11 +75,21 @@ export const rpcContract = defineRpcContract({
 
 type Database = ReturnType<BbPluginApi["storage"]["database"]>;
 type Machine = { id: string; name: string };
-type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSessionRoots: string };
+type CollectorSettings = {
+  codexHomes?: string;
+  piSessionRoots: string;
+  primeSessionRoots: string;
+  codexProfileHomes?: string;
+  extraUsageRoots?: string;
+};
 
 const AGENTS = [
+  { id: "amp", name: "Amp" },
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "codebuddy", name: "CodeBuddy" },
+  { id: "copilot", name: "GitHub Copilot" },
+  { id: "cursor", name: "Cursor Agent" },
   { id: "dsh", name: "DeepSeek Harness" },
   { id: "devin", name: "Devin" },
   { id: "fx", name: "FX" },
@@ -157,6 +168,7 @@ const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
+const AMP_SYNC_TIMEOUT_MS = 10 * 60_000;
 const DEVIN_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
@@ -286,6 +298,7 @@ CREATE TABLE IF NOT EXISTS opencode_go_limit_state (
 );`;
 const openCodeGoFingerprintMigration = `
 ALTER TABLE opencode_go_limits ADD COLUMN account_fingerprint TEXT;`;
+const codexAttributionMigration = `ALTER TABLE usage_sources ADD COLUMN attribution TEXT;`;
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -326,6 +339,25 @@ function primeRoots(home: string, configured: string) {
     const parent = parentDirectory(root);
     return [root, parent === "/" ? "/session-artifacts" : `${parent}/session-artifacts`];
   }))];
+}
+
+// Entries are `name=path` or a bare CODEX_HOME path whose basename becomes the
+// account label; a home literally named "codex" stays untagged so a relocated
+// primary home merges into the base Codex agent. A `=` only separates a label
+// when the prefix is pathless, so a bare path containing "=" still parses.
+function codexAccountHomes(value: string, home: string): Array<{ account: string; home: string }> {
+  const seen = new Set<string>();
+  const homes: Array<{ account: string; home: string }> = [];
+  for (const part of value.split(/[;\n]/)) {
+    const separator = part.indexOf("=");
+    const named = separator > 0 && !part.slice(0, separator).includes("/");
+    const resolved = normalizeRoot(expandHome(named ? part.slice(separator + 1) : part, home));
+    if (!resolved || seen.has(resolved)) continue;
+    seen.add(resolved);
+    const account = (named ? part.slice(0, separator).trim() : resolved.slice(resolved.lastIndexOf("/") + 1)).slice(0, 80);
+    homes.push({ account: account === "codex" ? "" : account, home: resolved });
+  }
+  return homes;
 }
 
 function countForMachine(db: Database, machineId: string, agentId: AgentId) {
@@ -411,6 +443,223 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
   })();
 }
 
+// The last-seen home tag→label map is persisted on the scan's source row so a
+// rename (same home, different label) can be told apart from an added or
+// removed profile. Entries for removed homes are kept, so re-adding the home
+// under a new label is still recognised as a rename of its retained history.
+// Snapshots written before keys were tags hold raw home paths; they fold into
+// tags so a rename recorded by an intermediate build still resolves.
+function codexAttributionSnapshot(stored: string | null | undefined, current: Map<string, string>) {
+  const merged: Record<string, string> = {};
+  try {
+    const parsed: unknown = JSON.parse(stored ?? "{}");
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      for (const [home, account] of Object.entries(parsed)) {
+        if (typeof account === "string") merged[home.includes("/") ? codexHomeTag(home) : home] = account;
+      }
+    }
+  } catch { /* An unreadable snapshot just means no renames can be proven. */ }
+  for (const [tag, account] of current) merged[tag] = account;
+  return merged;
+}
+
+type CodexBucketRow = {
+  eventKey: string; agentId: string; processedTokens: number; cachedInputTokens: number; cacheWriteTokens: number;
+  uncachedInputTokens: number; outputTokens: number; loggedCostUsd: number | null;
+  costUsd: number; cacheSavingsUsd: number;
+};
+
+const codexBucketRowColumns = `e.event_key eventKey, e.provider_id agentId, e.processed_tokens processedTokens,
+  e.cached_input_tokens cachedInputTokens, e.cache_write_tokens cacheWriteTokens,
+  e.uncached_input_tokens uncachedInputTokens, e.output_tokens outputTokens,
+  e.logged_cost_usd loggedCostUsd, e.cost_usd costUsd, e.cache_savings_usd cacheSavingsUsd`;
+
+// Applies key rewrites with the same per-column MAX merge insertEvent uses,
+// so folding a renamed or newly-tagged row into an existing bucket mirrors
+// how a rescan would merge the same content. `drop` removes a row entirely:
+// an untagged bucket that several tagged siblings now split is unassignable
+// and already covered by the fresh scan, so keeping it would double count.
+// Merged buckets are repriced afterwards: the folded column maxima can total
+// more than either input row, so keeping a merged cost would understate it.
+function applyCodexKeyRewrites(db: Database, sourceId: string, rewrites: Array<{ key: string; nextKey?: string; to?: string; row: CodexBucketRow; drop?: boolean }>) {
+  if (rewrites.length === 0) return;
+  const targetRow = db.prepare(`SELECT event_key eventKey, processed_tokens processedTokens,
+    cached_input_tokens cachedInputTokens, cache_write_tokens cacheWriteTokens,
+    uncached_input_tokens uncachedInputTokens, output_tokens outputTokens,
+    logged_cost_usd loggedCostUsd, cost_usd costUsd, cache_savings_usd cacheSavingsUsd
+    FROM usage_events WHERE event_key=?`);
+  const mergeInto = db.prepare(`UPDATE usage_events SET
+      processed_tokens=?, cached_input_tokens=?, cache_write_tokens=?, uncached_input_tokens=?,
+      output_tokens=?, logged_cost_usd=?
+    WHERE event_key=?`);
+  const relabel = db.prepare("UPDATE usage_events SET event_key=?, provider_id=?, provider_name=? WHERE event_key=?");
+  const carryMappings = db.prepare("INSERT OR IGNORE INTO usage_event_sources (event_key, source_id) SELECT ?, source_id FROM usage_event_sources WHERE event_key=?");
+  const dropMappings = db.prepare("DELETE FROM usage_event_sources WHERE event_key=?");
+  const dropEvent = db.prepare("DELETE FROM usage_events WHERE event_key=?");
+  // Same record shape upsertSourceEvents uses to reprice retained rows.
+  const recordFor = db.prepare(`SELECT e.event_key eventKey, e.timestamp, e.day,
+    e.provider_id agentId, e.provider_name agentName, e.model_provider_id modelProviderId,
+    e.model_provider_name modelProviderName, s.machine_id machineId, s.machine_name machineName,
+    e.model, e.project, e.cost_usd costUsd, e.logged_cost_usd loggedCostUsd,
+    e.pricing_status pricingStatus, e.cache_savings_usd cacheSavingsUsd,
+    e.processed_tokens processedTokens, e.cached_input_tokens cachedInputTokens,
+    e.cache_write_tokens cacheWriteTokens, e.uncached_input_tokens uncachedInputTokens,
+    e.output_tokens outputTokens FROM usage_events e
+    JOIN usage_event_sources es ON es.event_key=e.event_key
+    JOIN usage_sources s ON s.source_id=es.source_id
+    WHERE e.event_key=? AND es.source_id=?`);
+  const updatePrice = db.prepare(`UPDATE usage_events SET cost_usd=?, cache_savings_usd=?,
+    pricing_status=? WHERE event_key=?`);
+
+  db.transaction(() => {
+    const mergedKeys: string[] = [];
+    for (const { key, nextKey, to, row, drop } of rewrites) {
+      if (drop) {
+        dropMappings.run(key);
+        dropEvent.run(key);
+        continue;
+      }
+      const target = targetRow.get(nextKey!) as CodexBucketRow | undefined;
+      if (target) {
+        // The new label already owns the bucket: fold the row into it. Totals
+        // follow the merged per-column maxima, as insertEvent computes them.
+        const cached = Math.max(target.cachedInputTokens, row.cachedInputTokens);
+        const writes = Math.max(target.cacheWriteTokens, row.cacheWriteTokens);
+        const uncached = Math.max(target.uncachedInputTokens, row.uncachedInputTokens);
+        const output = Math.max(target.outputTokens, row.outputTokens);
+        const logged = row.loggedCostUsd === null ? target.loggedCostUsd
+          : target.loggedCostUsd === null ? row.loggedCostUsd
+            : Math.max(target.loggedCostUsd, row.loggedCostUsd);
+        mergeInto.run(cached + writes + uncached + output, cached, writes, uncached, output, logged, nextKey!);
+        mergedKeys.push(nextKey!);
+      } else {
+        relabel.run(nextKey!, to!, to === "codex" ? "Codex" : `Codex (${to!.slice(6)})`, key);
+      }
+      carryMappings.run(nextKey!, key);
+      dropMappings.run(key);
+      dropEvent.run(key);
+    }
+    for (const key of mergedKeys) {
+      const record = recordFor.get(key, sourceId) as UsageRecord | undefined;
+      if (record === undefined) continue;
+      const priced = repriceUsageRecord(record);
+      updatePrice.run(priced.costUsd, priced.cacheSavingsUsd, priced.pricingStatus, key);
+    }
+  })();
+}
+
+// Rewrites rows produced by a renamed profile home to the new label. The
+// bucket key's trailing home tag scopes the rewrite to that home only, so
+// homes sharing a label and unlabeled homes never have their buckets moved
+// wholesale. Attribution is keyed by home tag so convention-discovered homes
+// rename exactly like configured ones.
+function relabelRenamedCodexAccounts(db: Database, sourceId: string, attribution: Map<string, string>) {
+  const source = db.prepare("SELECT attribution FROM usage_sources WHERE source_id=?").get(sourceId) as { attribution: string | null } | undefined;
+  const previous = codexAttributionSnapshot(source?.attribution, new Map());
+  const renames: Array<{ tag: string; from: string; to: string }> = [];
+  for (const [tag, account] of attribution) {
+    const before = previous[tag];
+    if (before !== undefined && before !== account) {
+      renames.push({ tag, from: before ? `codex-${before}` : "codex", to: account ? `codex-${account}` : "codex" });
+    }
+  }
+  if (renames.length === 0) return;
+
+  const staleRows = db.prepare(`SELECT ${codexBucketRowColumns}
+    FROM usage_events e JOIN usage_event_sources es ON es.event_key=e.event_key
+    WHERE es.source_id=? AND substr(e.event_key, 1, ?) = ? AND substr(e.event_key, -13) = ?`);
+  const stageEvent = db.prepare("UPDATE usage_events SET event_key=? WHERE event_key=?");
+  const stageMapping = db.prepare("UPDATE usage_event_sources SET event_key=? WHERE event_key=?");
+
+  db.transaction(() => {
+    // Stage every renamed row under a sentinel key before any final write:
+    // rows produced by an earlier rename must not be picked up again when
+    // labels chain (A→B and B→C) or swap (A→B and B→A) in one config edit.
+    const staged: Array<{ stagedKey: string; nextKey: string; to: string; row: CodexBucketRow }> = [];
+    for (const { tag, from, to } of renames) {
+      const prefix = `${from}:`;
+      for (const row of staleRows.all(sourceId, prefix.length, prefix, `:${tag}`) as CodexBucketRow[]) {
+        if (row.eventKey.slice(prefix.length).split(":").length !== 6) continue;
+        const stagedKey = `\0relabel:${row.eventKey}`;
+        stageEvent.run(stagedKey, row.eventKey);
+        stageMapping.run(stagedKey, row.eventKey);
+        staged.push({ stagedKey, nextKey: `${to}:${row.eventKey.slice(prefix.length)}`, to, row });
+      }
+    }
+    applyCodexKeyRewrites(db, sourceId, staged.map(({ stagedKey, nextKey, to, row }) => ({ key: stagedKey, nextKey, to, row })));
+  })();
+}
+
+// Rows persisted before keys carried a home tag get one appended when their
+// label resolves to exactly one known home — configured or observed by the
+// scan — with the primary home as the fallback for the unlabeled prefix.
+// Legacy rows whose label resolves to several homes are already represented
+// by tagged siblings. Adopted rows whose label resolves to no home are
+// upgrade leftovers:
+// a single tagged sibling (a renamed home still emitting the same bucket)
+// absorbs the row, while several siblings prove the old bucket merged content
+// the fresh scan already splits, so the untagged row is dropped rather than
+// double counted. Other unresolvable stable-source rows retain their history.
+function normalizeCodexHomeKeys(db: Database, sourceId: string, attribution: Map<string, string>, primaryHomeTag: string, adoptedKeys: Set<string>) {
+  const tagsByLabel = new Map<string, string[]>();
+  for (const [tag, account] of attribution) {
+    const list = tagsByLabel.get(account) ?? [];
+    list.push(tag);
+    tagsByLabel.set(account, list);
+  }
+  const rows = db.prepare(`SELECT ${codexBucketRowColumns}
+    FROM usage_events e JOIN usage_event_sources es ON es.event_key=e.event_key WHERE es.source_id=?`)
+    .all(sourceId) as CodexBucketRow[];
+  const taggedSiblings = db.prepare(`SELECT DISTINCT event_key eventKey FROM usage_events
+    WHERE instr(event_key, ?) > 0 AND event_key <> ?
+      AND (provider_id='codex' OR provider_id LIKE 'codex-%')`);
+  const rewrites: Array<{ key: string; nextKey?: string; to?: string; row: CodexBucketRow; drop?: boolean }> = [];
+  for (const row of rows) {
+    // The account label may contain colons, but components after the agent id
+    // are URI encoded. A project can look like a twelve-character home tag.
+    if (row.eventKey.slice(row.agentId.length + 1).split(":").length !== 5) continue;
+    const label = row.eventKey.startsWith("codex:") ? "" : row.eventKey.startsWith("codex-") ? row.eventKey.slice(6, row.eventKey.indexOf(":")) : null;
+    if (label === null) continue;
+    const candidates = label === "" ? (tagsByLabel.get("") ?? [primaryHomeTag]) : (tagsByLabel.get(label) ?? []);
+    if (candidates.length === 1) {
+      rewrites.push({ key: row.eventKey, nextKey: `${row.eventKey}:${candidates[0]}`, to: label ? `codex-${label}` : "codex", row });
+      continue;
+    }
+    if (candidates.length === 0 && !adoptedKeys.has(row.eventKey)) continue;
+    const siblings = taggedSiblings.all(`${row.eventKey.slice(row.eventKey.indexOf(":"))}:`, row.eventKey) as Array<{ eventKey: string }>;
+    if (siblings.length === 1) {
+      if (adoptedKeys.has(row.eventKey)) rewrites.push({ key: row.eventKey, nextKey: siblings[0].eventKey, row });
+    } else if (siblings.length > 1) {
+      rewrites.push({ key: row.eventKey, row, drop: true });
+    }
+  }
+  applyCodexKeyRewrites(db, sourceId, rewrites);
+}
+
+// Builds before source attribution put the whole Codex scan on a
+// config-derived source id, so its replacements delete the old source. Adopt
+// any such leftover source's event mappings into the stable scan source to
+// keep its retained history alive, and return the adopted event keys so the
+// caller can treat their unresolvable buckets as upgrade leftovers.
+function adoptLegacyCodexSources(db: Database, machineId: string, sourceId: string) {
+  const legacy = db.prepare(`SELECT source_id id FROM usage_sources
+    WHERE machine_id=? AND provider_id='codex' AND source_id<>` + "?")
+    .all(machineId, sourceId) as Array<{ id: string }>;
+  const adopted = new Set<string>();
+  db.transaction(() => {
+    for (const { id } of legacy) {
+      for (const { key } of db.prepare("SELECT event_key key FROM usage_event_sources WHERE source_id=?").all(id) as Array<{ key: string }>) {
+        adopted.add(key);
+      }
+      db.prepare(`INSERT OR IGNORE INTO usage_event_sources (event_key, source_id)
+        SELECT event_key, ? FROM usage_event_sources WHERE source_id=?`).run(sourceId, id);
+      db.prepare("DELETE FROM usage_event_sources WHERE source_id=?").run(id);
+      db.prepare("DELETE FROM usage_sources WHERE source_id=?").run(id);
+    }
+  })();
+  return adopted;
+}
+
 function deleteOrphanEvents(db: Database) {
   db.prepare("DELETE FROM usage_events WHERE event_key NOT IN (SELECT event_key FROM usage_event_sources)").run();
 }
@@ -448,7 +697,10 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
     return homes.flatMap((root) => [`${root}/sessions`, `${root}/archived_sessions`]);
   }
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
-  return agentId === "claude" ? [`${home}/.claude/projects`]
+  const defaults = agentId === "claude" ? [`${home}/.claude/projects`]
+    : agentId === "codebuddy" ? [`${home}/.codebuddy/projects`]
+    : agentId === "copilot" ? [`${home}/.copilot/session-state`]
+    : agentId === "cursor" ? [`${home}/.cursor/usage.jsonl`]
     : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
@@ -459,6 +711,15 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
       const defaultPrimeAgentRoot = `${home}/.prime/agent`;
       return root !== defaultPrimeAgentRoot && !resolvedPrimeRoots.includes(root);
     })];
+  let extra;
+  try { extra = JSON.parse(settings.extraUsageRoots?.trim() || "{}"); }
+  catch { throw new Error("Extra usage roots must be valid JSON."); }
+  if (!extra || typeof extra !== "object" || Array.isArray(extra)) throw new Error("Extra usage roots must be a JSON object.");
+  const roots = extra[agentId] ?? [];
+  if (!Array.isArray(roots) || !roots.every((root) => typeof root === "string" && /^(\/|~\/|[A-Za-z]:[\\/])/.test(root))) {
+    throw new Error("Extra usage roots must contain arrays of absolute paths or ~/ paths.");
+  }
+  return [...new Set([...defaults, ...roots.map((root: string) => normalizeRoot(expandHome(root, home)))])];
 }
 
 function historyStartDay(days = HISTORY_DAYS) {
@@ -477,6 +738,83 @@ export function jsonAgentCommand(input: Parameters<typeof compressedHostJsonColl
   ].join("; ");
 }
 
+export function ampUsageCommand(home: string) {
+  const script = compressedAmpUsageCollectorScript({
+    cachePath: `${home}/.cache/bb-plugin-usage/amp-thread-scan-v1.json`,
+    sinceDay: historyStartDay(),
+  });
+  return [
+    "if ! command -v node >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to scan Amp usage.'; exit 127",
+    "fi",
+    "if ! command -v amp >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Amp CLI is required to collect Amp usage.'; exit 127",
+    "fi",
+    `node -e ${shellQuote(script)}`,
+  ].join("; ");
+}
+
+export async function syncAmp(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  home: string,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const agentId: AgentId = "amp";
+  const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const output = await executeHostCommand(bb, machine, ampUsageCommand(home), signal, {
+      title: "Usage: Amp scan",
+      timeoutMs: AMP_SYNC_TIMEOUT_MS,
+      home,
+    });
+    const scan = extractAmpUsageScan(output);
+    if (scan.agentId !== agentId) throw new Error(`Amp usage scan returned ${scan.agentId} data.`);
+
+    // A partial scan must not delete a thread whose export failed. Mark prior
+    // sources seen first; complete scans still reconcile threads no longer in
+    // the account or retention window.
+    if (scan.failureCount > 0) {
+      db.prepare("UPDATE usage_sources SET last_seen_generation=? WHERE machine_id=? AND provider_id=?")
+        .run(generation, machine.id, agentId);
+    }
+    for (const thread of scan.threads) {
+      const records = parseAmpUsageAggregates(thread.rows, {
+        machineId: machine.id,
+        machineName: machine.name,
+      });
+      const aggregateJson = JSON.stringify(thread.rows);
+      upsertSourceEvents(db, {
+        id: opaqueId(machine.id, agentId, thread.threadId),
+        rootReference: opaqueId("amp-thread", thread.threadId),
+        sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+        generation,
+      }, machine, agentId, records);
+    }
+    reconcileSources(db, machine.id, agentId, generation);
+
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const complete = scan.failureCount === 0;
+    const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
+    const error = complete ? null
+      : `${scan.failureCount} Amp thread problem${scan.failureCount === 1 ? "" : "s"} prevented a complete scan${scan.error ? `: ${scan.error}` : "."}`;
+    upsertState(db, machine.id, agentId, status, recordCount, error, complete);
+    bb.log.info(`${machine.name}/amp: ${recordCount} records from ${scan.threadCount} threads (${scan.changedThreadCount} changed, ${scan.reusedThreadCount} cached, ${status})`);
+  } catch (error) {
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const message = errorMessage(error);
+    if (message.includes("Amp CLI is required")) {
+      upsertState(db, machine.id, agentId, "skipped", recordCount, message, false);
+      bb.log.info(`${machine.name}/amp: skipped (no local Amp CLI)`);
+    } else {
+      upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+      bb.log.warn(`${machine.name}/amp: ${message}`);
+    }
+  }
+}
+
 async function syncJsonAgent(
   bb: BbPluginApi,
   db: Database,
@@ -490,15 +828,21 @@ async function syncJsonAgent(
   try {
     const roots = [...new Set(jsonAgentRoots(home, agentId, settings))];
     const cachePath = `${home}/.cache/bb-plugin-usage/json-log-scan-v1/${agentId}.json`;
+    // Extra Codex accounts keep CODEX_HOME in per-account homes: the
+    // ~/.codex-profiles/<name> and ~/.codex-<name> conventions plus any
+    // configured homes. The scan tags their rows with the account name so
+    // each account stays a distinct agent.
+    const accountRoots = agentId === "codex"
+      ? [{ root: `${home}/.codex-profiles` }, { root: home, prefix: ".codex-" }]
+      : undefined;
+    const accountHomes = agentId === "codex" ? codexAccountHomes(settings.codexProfileHomes ?? "", home) : undefined;
     const output = await runHostCommand(bb, machine, jsonAgentCommand({
       agentId,
       roots,
       cachePath,
       sinceDay: historyStartDay(),
-      // Extra Codex accounts (BB account-limits ACP providers) keep their
-      // CODEX_HOME under ~/.codex-profiles/<name>; the scan tags their rows
-      // with the profile name so each account stays a distinct agent.
-      accountRoot: agentId === "codex" ? `${home}/.codex-profiles` : undefined,
+      accountRoots,
+      accountHomes,
     }), signal, {
       title: `Usage: ${agentId} scan`,
       timeoutMs: JSON_AGENT_SYNC_TIMEOUT_MS,
@@ -515,12 +859,30 @@ async function syncJsonAgent(
     // are added, so reconciliation keeps history whose logs are no longer present.
     const sourceRoots = agentId === "codex" ? [`${home}/.codex/sessions`] : roots;
     const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...sourceRoots);
+    // Home tag → label for this scan: the collector reports every home it
+    // observed (including convention-discovered ones); configured homes win
+    // ties because their explicit label outranks a conventional one.
+    const codexAttribution = new Map<string, string>();
+    for (const entry of scan.homes ?? []) codexAttribution.set(entry.homeTag, entry.account);
+    for (const { home, account } of accountHomes ?? []) codexAttribution.set(codexHomeTag(home), account);
+    // A renamed profile label rewrites its rows' keys/provider in place: the
+    // source stays stable, so retained history survives and the new label's
+    // rows merge into the relabeled buckets instead of duplicating them.
+    if (agentId === "codex") relabelRenamedCodexAccounts(db, sourceId, codexAttribution);
     upsertSourceEvents(db, {
       id: sourceId,
       rootReference: opaqueId(...roots),
       sha256: createHash("sha256").update(aggregateJson).digest("hex"),
       generation,
     }, machine, agentId, records);
+    if (agentId === "codex") {
+      const adoptedKeys = adoptLegacyCodexSources(db, machine.id, sourceId);
+      normalizeCodexHomeKeys(db, sourceId, codexAttribution, codexHomeTag(`${home}/.codex`), adoptedKeys);
+      db.prepare("UPDATE usage_sources SET attribution=? WHERE source_id=?")
+        .run(JSON.stringify(codexAttributionSnapshot(
+          (db.prepare("SELECT attribution FROM usage_sources WHERE source_id=?").get(sourceId) as { attribution: string | null } | undefined)?.attribution,
+          codexAttribution)), sourceId);
+    }
     reconcileSources(db, machine.id, agentId, generation);
 
     const complete = scan.failureCount === 0;
@@ -1003,9 +1365,21 @@ export default async function plugin(bb: BbPluginApi) {
       description: "Optional semicolon-separated absolute session directories. The default ~/.prime/agent/sessions and its recursive-agent artifacts are always scanned.",
       default: "",
     },
+    extraUsageRoots: {
+      type: "string",
+      label: "Extra usage log roots",
+      description: 'JSON object of agent IDs to arrays of absolute or ~/ log paths, e.g. {"codebuddy":["~/custom-buddy/projects"],"cursor":["~/custom-cursor/usage.jsonl"]}. Defaults are always scanned; paths resolve on each enrolled machine.',
+      default: "{}",
+    },
+    codexProfileHomes: {
+      type: "string",
+      label: "Extra Codex profile homes",
+      description: "Optional semicolon-separated CODEX_HOME directories for extra Codex accounts, as name=path or bare paths (the basename becomes the account label). ~/.codex, ~/.codex-profiles/*, and ~/.codex-* are always scanned.",
+      default: "",
+    },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, codexAttributionMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
@@ -1039,8 +1413,12 @@ export default async function plugin(bb: BbPluginApi) {
           continue;
         }
         await Promise.all([
+          syncAmp(bb, db, machine, home, timeoutSignal(AMP_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "codebuddy", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "copilot", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "cursor", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
