@@ -983,7 +983,7 @@ describe("host command output", () => {
 });
 
 describe("OpenCode query", () => {
-  it("uses the OpenCode CLI for a 90-day aggregate without sqlite3", () => {
+  it("keeps the v1 CLI query alongside the v2 read-only database query", () => {
     const command = openCodeCommand();
     expect(command).toContain("command -v opencode");
     expect(command).toContain("opencode db");
@@ -1065,15 +1065,29 @@ describe("OpenCode query", () => {
       mkdirSync(dir);
       mkdirSync(bin);
       const db = new Database(join(dir, "opencode.db"));
-      db.exec("CREATE TABLE session_message (id TEXT);");
+      db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, time_updated INTEGER NOT NULL);
+        CREATE TABLE message (session_id TEXT, time_created INTEGER, data TEXT);
+        CREATE TABLE session_message (id TEXT);`);
+      const now = Date.now();
+      db.prepare("INSERT INTO session VALUES (?, ?)").run("s1", now);
+      db.prepare("INSERT INTO message VALUES (?, ?, ?)").run("s1", now,
+        JSON.stringify({ role: "assistant", providerID: "openai", modelID: "v1-model", cost: 0.5,
+          tokens: { input: 7, output: 3, cache: { read: 2, write: 1 } } }));
       db.close();
+      // Stand in for the v1 CLI: validate the arguments and run its SQL verbatim.
       const cli = join(bin, "opencode");
-      writeFileSync(cli, "#!/bin/sh\nprintf '[]\\n'\n");
+      writeFileSync(cli, [
+        "#!/bin/sh",
+        "[ \"$1\" = db ] && [ \"$3\" = --format ] && [ \"$4\" = json ] || exit 1",
+        "python3 -c 'import json,sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.row_factory=sqlite3.Row; print(json.dumps([dict(r) for r in db.execute(sys.argv[2])]))' \"$XDG_DATA_HOME/opencode/opencode.db\" \"$2\"",
+      ].join("\n") + "\n");
       chmodSync(cli, 0o755);
       const output = execFileSync("sh", ["-c", openCodeCommand()], {
         encoding: "utf8", env: { ...process.env, XDG_DATA_HOME: home, PATH: `${bin}:${process.env.PATH}` },
       });
-      expect(JSON.parse(extractOpenCodeJson(output))).toEqual([]);
+      expect(JSON.parse(extractOpenCodeJson(output))).toMatchObject([{ day: localDay(now),
+        modelProviderId: "openai", model: "v1-model", loggedCostUsd: 0.5, inputTokens: 7,
+        cachedInputTokens: 2, cacheWriteTokens: 1, outputTokens: 3 }]);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
