@@ -55,7 +55,7 @@ afterEach(async () => {
 
 describe("host JSON usage collector", () => {
   it.each([
-    ["codex", "rollout-cached.jsonl", 8], ["claude", "session.jsonl", 5],
+    ["codex", "rollout-cached.jsonl", 9], ["claude", "session.jsonl", 5],
     ["dsh", "session.v3.jsonl.zstd", 6], ["fx", "usage.jsonl", 5],
     ["grok", "unified.jsonl", 5], ["pi", "session.jsonl", 5],
     ["prime", "session.jsonl", 5], ["antigravity", "usage.jsonl", 5],
@@ -857,7 +857,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(8);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(9);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
