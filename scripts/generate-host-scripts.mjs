@@ -7,6 +7,7 @@ import ts from "typescript";
 const functions = [
   ["lib/host-json-collector.ts", "hostJsonCollector"],
   ["lib/devin-sqlite-collector.ts", "devinSqliteCollector"],
+  ["lib/amp-usage-collector.ts", "ampUsageCollector"],
   ["lib/grok-limits.ts", "normalizeGrokBilling"],
 ];
 const root = new URL("../", import.meta.url);

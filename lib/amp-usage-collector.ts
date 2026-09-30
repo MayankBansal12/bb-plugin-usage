@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { z } from "zod";
+import { ampUsageCollectorSource } from "./host-scripts.generated";
 
 export type AmpUsageAggregate = {
   threadId: string;
@@ -221,7 +222,7 @@ async function ampUsageCollector(encodedInput: string, dependencies: CollectorDe
 export function ampUsageCollectorScript(input: AmpUsageScanInput) {
   const encodedInput = Buffer.from(JSON.stringify(input)).toString("base64");
   const dependencies = "{buffer:require('node:buffer').Buffer,childProcess:require('node:child_process'),fs:require('node:fs'),path:require('node:path'),zlib:require('node:zlib')}";
-  return `(${ampUsageCollector.toString()})(${JSON.stringify(encodedInput)},${dependencies}).catch((error)=>{process.stderr.write('__BB_USAGE_ERROR__:'+String(error?.message??error).replace(/[\\r\\n]+/g,' ').slice(0,300)+'\\n');process.exitCode=1;});`;
+  return `(${ampUsageCollectorSource})(${JSON.stringify(encodedInput)},${dependencies}).catch((error)=>{process.stderr.write('__BB_USAGE_ERROR__:'+String(error?.message??error).replace(/[\\r\\n]+/g,' ').slice(0,300)+'\\n');process.exitCode=1;});`;
 }
 
 export function compressedAmpUsageCollectorScript(input: AmpUsageScanInput) {
