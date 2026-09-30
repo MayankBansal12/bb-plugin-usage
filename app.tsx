@@ -1239,7 +1239,7 @@ function UsageDashboard() {
     cacheHitRateGroups(rows, "agent").map((item) => [item.agentId, item]),
   ), [rows]);
   const modelCacheHitRates = useMemo(() => new Map(
-    cacheHitRateGroups(rows, "model").map((item) => [`${item.agentId}\0${item.model}`, item]),
+    cacheHitRateGroups(rows, "model").map((item) => [`${item.agentId}\0${item.modelProviderId}\0${item.model}`, item]),
   ), [rows]);
 
   type BreakdownRow = {
@@ -1272,7 +1272,7 @@ function UsageDashboard() {
         key, label: row.model === "codex-unknown" ? "Unknown" : row.model,
         agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName,
         providerId: row.modelProviderId, cost: 0, tokens: 0,
-        cacheRate: modelCacheHitRates.get(`${row.agentId}\0${row.model}`),
+        cacheRate: modelCacheHitRates.get(`${row.agentId}\0${row.modelProviderId}\0${row.model}`),
       };
       current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
