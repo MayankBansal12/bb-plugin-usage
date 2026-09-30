@@ -60,13 +60,14 @@ describe("buildBreakdownDonut", () => {
   });
 
   it("counts cost rows with unknown pricing only in cost mode", () => {
-    const rows = [row("known", 10, 5), row("mystery", 0, 40, true)];
+    const rows = [row("known", 10, 5), row("mixed", 20, 20, true), row("mystery", 0, 40, true)];
     const cost = buildBreakdownDonut(rows, "cost");
-    expect(cost.unpricedCount).toBe(1);
-    expect(cost.slices.map((slice) => slice.key)).toEqual(["known"]);
+    expect(cost.unpricedCount).toBe(2);
+    expect(cost.slices.map((slice) => slice.key)).toEqual(["mixed", "known"]);
+    expect(cost.total).toBe(30);
     const tokens = buildBreakdownDonut(rows, "tokens");
     expect(tokens.unpricedCount).toBe(0);
-    expect(tokens.slices.map((slice) => slice.key)).toEqual(["mystery", "known"]);
+    expect(tokens.slices.map((slice) => slice.key)).toEqual(["mystery", "mixed", "known"]);
   });
 
   it("returns an empty slice list when nothing has value", () => {
