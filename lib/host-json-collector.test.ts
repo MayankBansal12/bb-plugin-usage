@@ -684,7 +684,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(8);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(9);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {
@@ -948,7 +948,7 @@ describe("host JSON usage collector", () => {
       const result = await scan("dsh", root, cachePath);
       expect(result).toMatchObject({ failureCount: 0, changedFileCount: 1, reusedFileCount: 0 });
       expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 14, outputTokens: 5 })]);
-      expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(8);
+      expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(9);
     });
   });
 

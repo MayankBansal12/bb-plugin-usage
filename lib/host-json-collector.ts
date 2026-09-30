@@ -35,6 +35,7 @@ export type HostJsonScanResult = {
   failureCount: number;
   error: string | null;
   rows: HostUsageAggregate[];
+  homes?: Array<{ homeTag: string; account: string }>;
 };
 
 type CollectorDependencies = {
@@ -54,6 +55,7 @@ const aggregateSchema = z.object({
   model: z.string(),
   project: z.string().default("Unknown"),
   account: z.string().optional(),
+  homeTag: z.string().optional(),
   loggedCostUsd: z.number().finite().nullable(),
   uncachedInputTokens: z.number().int().nonnegative(),
   cachedInputTokens: z.number().int().nonnegative(),
@@ -68,6 +70,7 @@ const scanResultSchema = z.object({
   failureCount: z.number().int().nonnegative(),
   error: z.string().nullable(),
   rows: z.array(aggregateSchema),
+  homes: z.array(z.object({ homeTag: z.string(), account: z.string() })).optional(),
 });
 
 // This function is compiled by generate:collectors and executed on the host. Keep
@@ -92,8 +95,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // under v6 keep the double-counted values and must be reparsed.
   // v8 (codex): retain an account-independent event identity so cached rows
   // can rebuild their dedup key when a configured account label changes.
+  // v9 (codex): rows carry the owning home so a label rename rewrites exactly
+  // that home's retained buckets instead of every row sharing the label.
   // All agents share this version so existing caches migrate consistently.
-  const cacheVersion = 8;
+  const cacheVersion = 9;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "copilot", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -121,6 +126,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const canDecompressZstd = typeof zlib.zstdDecompressSync === "function";
   // Files discovered under an account home map to that account name.
   const accountByPath = new Map<string, string>();
+  const homeByPath = new Map<string, string>();
+  const homeTagFor = (home: string) => crypto.createHash("sha256").update(home).digest("hex").slice(0, 12);
+  // Every observed Codex home reports its opaque tag and the account label it
+  // carried this scan so the server can detect relabels of homes it never
+  // configured (e.g. convention-discovered ~/.codex-* directories).
+  const observedHomes = new Map<string, string>();
 
   function object(value: unknown): Record<string, unknown> | null {
     return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
@@ -172,7 +183,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       && finite(row.cacheWriteTokens) !== null
       && finite(row.outputTokens) !== null
       && (row.eventKey === undefined || typeof row.eventKey === "string")
-      && (row.eventIdentity === undefined || typeof row.eventIdentity === "string"));
+      && (row.eventIdentity === undefined || typeof row.eventIdentity === "string")
+      && (row.homeTag === undefined || typeof row.homeTag === "string"));
   }
 
   function validCacheEntry(value: unknown): value is CacheEntry {
@@ -196,8 +208,11 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     };
     const account = text(raw.account, "");
     if (account) row.account = account;
+    const homeTag = text(raw.homeTag, "");
+    if (homeTag) row.homeTag = homeTag;
     const keyed = new Set<HostJsonAgentId>(["pi", "prime", "thaura"]).has(input.agentId);
     const key = JSON.stringify([row.day, row.modelProviderId, row.model, row.project, row.account ?? null,
+      row.homeTag ?? null,
       keyed ? (row.loggedCostUsd !== null && row.loggedCostUsd > 0 ? "logged" : "estimate") : "all"]);
     const prior = target.get(key);
     if (!prior) {
@@ -350,6 +365,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     const rows = new Map<string, HostUsageAggregate>();
     const events = new Map<string, CachedUsageRow>();
     const fileAccount = accountByPath.get(filePath);
+    const fileHome = homeByPath.get(filePath);
+    const fileHomeTag = fileHome === undefined ? undefined : homeTagFor(fileHome);
     let codexModel = "codex-unknown";
     let codexSessionId = path.basename(filePath);
     // Session-scoped project, learned from the first record that carries a
@@ -395,7 +412,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const cached = Math.min(inputTokens, count(usage.cached_input_tokens));
         add(rows, {
           day: usageDay, modelProviderId: "openai", model: codexModel, project: sessionProject, loggedCostUsd: null,
-          account: fileAccount,
+          account: fileAccount, homeTag: fileHomeTag,
           uncachedInputTokens: inputTokens - cached, cachedInputTokens: cached,
           cacheWriteTokens: count(usage.cache_write_input_tokens), outputTokens: count(usage.output_tokens),
         });
@@ -708,7 +725,19 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     const home = process.env.CODEBUDDY_CONFIG_DIR.trim();
     if (path.isAbsolute(home)) roots.push(path.join(home, "projects"));
   }
-  for (const root of [...new Set(roots)]) await walk(root, discovered);
+  for (const root of [...new Set(roots)]) {
+    const before = discovered.length;
+    await walk(root, discovered);
+    // Codex scan roots are <home>/sessions and <home>/archived_sessions, so
+    // the home owning each discovered file is the walked root's parent.
+    if (input.agentId === "codex") {
+      const rootHome = path.dirname(root);
+      observedHomes.set(homeTagFor(rootHome), "");
+      for (const filePath of discovered.slice(before)) {
+        if (!homeByPath.has(filePath)) homeByPath.set(filePath, rootHome);
+      }
+    }
+  }
   const accountDiscovered: string[] = [];
   // Configured homes are discovered before convention-based parents so a
   // configured label wins when the same file is reached through both.
@@ -717,7 +746,11 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     await walk(path.join(home, "sessions"), files);
     await walk(path.join(home, "archived_sessions"), files);
     files.sort();
-    for (const filePath of files) if (!accountByPath.has(filePath)) accountByPath.set(filePath, account);
+    for (const filePath of files) {
+      if (!accountByPath.has(filePath)) accountByPath.set(filePath, account);
+      if (!homeByPath.has(filePath)) homeByPath.set(filePath, home);
+    }
+    observedHomes.set(homeTagFor(home), account);
     accountDiscovered.push(...files);
   }
   for (const parent of accountRoots) {
@@ -742,7 +775,14 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       await walk(path.join(parent.root, entry.name, "sessions"), files);
       await walk(path.join(parent.root, entry.name, "archived_sessions"), files);
       files.sort();
-      for (const filePath of files) if (!accountByPath.has(filePath)) accountByPath.set(filePath, account);
+      for (const filePath of files) {
+        if (!accountByPath.has(filePath)) accountByPath.set(filePath, account);
+        if (!homeByPath.has(filePath)) homeByPath.set(filePath, path.join(parent.root, entry.name));
+      }
+      // A configured label beats a conventional one; a conventional label
+      // still upgrades a home the config left unlabeled.
+      const conventionTag = homeTagFor(path.join(parent.root, entry.name));
+      if (!observedHomes.get(conventionTag)) observedHomes.set(conventionTag, account);
       accountDiscovered.push(...files);
     }
   }
@@ -766,8 +806,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     // or convention path changes.
     const reattribute = (rows: CachedUsageRow[]): CachedUsageRow[] => {
       const account = accountByPath.get(filePath);
-      return account === undefined ? rows : rows.map((row) => {
-        const attributed = { ...row, account: account || undefined };
+      const home = homeByPath.get(filePath);
+      return account === undefined && home === undefined ? rows : rows.map((row) => {
+        const homeTag = home === undefined ? undefined : homeTagFor(home);
+        const attributed = { ...row, account: account || undefined, homeTag };
         if (row.eventIdentity) {
           attributed.eventKey = crypto.createHash("sha256")
             .update(JSON.stringify([row.eventIdentity, attributed.account ?? null])).digest("hex");
@@ -841,6 +883,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     failureCount: failures.length,
     error: failures[0]?.replace(/[\r\n]+/g, " ").slice(0, 200) ?? null,
     rows,
+    homes: input.agentId === "codex"
+      ? [...observedHomes].map(([homeTag, account]) => ({ homeTag, account }))
+      : undefined,
   };
   const encoded = zlib.gzipSync(JSON.stringify(result)).toString("base64");
   process.stdout.write(`${scanBegin}\n${encoded}\n${scanEnd}\n`);

@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
 import type { AmpUsageAggregate } from "./lib/amp-usage-collector";
 
@@ -49,6 +50,12 @@ type UsageInput = {
 
 type ParseContext = { machineId: string; machineName: string };
 
+// Twelve hex chars of the home path's digest: enough to keep profile homes
+// distinct inside a bucket key without leaking the path.
+export function codexHomeTag(home: string) {
+  return home ? createHash("sha256").update(home).digest("hex").slice(0, 12) : "";
+}
+
 export type HostUsageAggregate = {
   day: string;
   modelProviderId: string;
@@ -57,6 +64,10 @@ export type HostUsageAggregate = {
   // Set when a session file came from a per-account home (a Codex profile);
   // absent for the agent's primary home.
   account?: string;
+  // Short digest of the Codex home directory a session file was read from;
+  // raw host paths never leave the host. It ends the bucket key so a relabeled
+  // profile can rewrite exactly its own rows.
+  homeTag?: string;
   loggedCostUsd: number | null;
   uncachedInputTokens: number;
   cachedInputTokens: number;
@@ -356,8 +367,11 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const account = agentId === "codex" ? text(row.account, "").slice(0, 80) : "";
     const scopedAgentId: AgentId = account ? `codex-${account}` : agentId;
     const scopedAgentName = account ? `Codex (${account})` : agentName;
+    // The owning home's tag ends the key, so a label rename can be applied to
+    // just that home's buckets instead of every row sharing the label.
+    const homeTag = agentId === "codex" ? text(row.homeTag, "").slice(0, 12) : "";
     return [usageRecord({
-      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
+      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${homeTag ? `:${homeTag}` : ""}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
       agentId: scopedAgentId,
