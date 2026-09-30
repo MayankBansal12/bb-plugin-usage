@@ -30,10 +30,12 @@ guessed here.
 Copilot CLI persists `session.shutdown` events under
 `~/.copilot/session-state/**/events.jsonl`. Its published event type defines
 `data.modelMetrics` as cumulative per-model input, output, cache-read, and
-cache-write token totals for the completed session. The collector reads only
-those totals, the close timestamp, the session-start project basename, and a
-hashed event identity. It ignores checkpoint, context-window, premium-request,
-and code-change fields; premium-request cost multipliers are not USD prices.
+cache-write token totals for the completed session. The input total includes
+cache reads and writes, so the collector subtracts both once when deriving
+uncached input. It reads only those totals, the close timestamp, the
+session-start project basename, and a hashed event identity. It ignores
+checkpoint, context-window, premium-request, and code-change fields;
+premium-request cost multipliers are not USD prices.
 
 An open session has no final cumulative event, so it is intentionally omitted
 until Copilot closes it. Session totals are attributed to that close date: the

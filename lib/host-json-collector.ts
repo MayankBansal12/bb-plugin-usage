@@ -461,11 +461,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
           const cached = count(usage.cacheReadTokens);
           const writes = count(usage.cacheWriteTokens);
           const output = count(usage.outputTokens);
-          if (inputTokens + cached + writes + output === 0) continue;
+          const uncached = Math.max(0, inputTokens - cached - writes);
+          if (uncached + cached + writes + output === 0) continue;
           mergeEvent(events, {
             eventKey: crypto.createHash("sha256").update(`copilot:${eventId}:${modelName}`).digest("hex"),
             day: usageDay, modelProviderId: "github-copilot", model: text(modelName, "unknown"), project: sessionProject,
-            loggedCostUsd: null, uncachedInputTokens: inputTokens, cachedInputTokens: cached,
+            loggedCostUsd: null, uncachedInputTokens: uncached, cachedInputTokens: cached,
             cacheWriteTokens: writes, outputTokens: output,
           });
         }

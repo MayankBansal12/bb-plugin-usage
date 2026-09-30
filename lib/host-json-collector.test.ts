@@ -420,8 +420,8 @@ describe("host JSON usage collector", () => {
     const first = await scan("copilot", join(directory, "session-state"), cachePath);
     expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
     expect(first.rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({ day: localDay("2026-08-09T12:00:00Z"), modelProviderId: "github-copilot", model: "gpt-5-test", project: "project", uncachedInputTokens: 100, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 20 }),
-      expect.objectContaining({ modelProviderId: "github-copilot", model: "claude-test", uncachedInputTokens: 40, cachedInputTokens: 10, cacheWriteTokens: 0, outputTokens: 8 }),
+      expect.objectContaining({ day: localDay("2026-08-09T12:00:00Z"), modelProviderId: "github-copilot", model: "gpt-5-test", project: "project", uncachedInputTokens: 35, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 20 }),
+      expect.objectContaining({ modelProviderId: "github-copilot", model: "claude-test", uncachedInputTokens: 30, cachedInputTokens: 10, cacheWriteTokens: 0, outputTokens: 8 }),
     ]));
     expect(first.rows).toHaveLength(2);
     const cache = await readFile(cachePath, "utf8");
