@@ -11,6 +11,7 @@ import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { ProviderLimitsSkeleton, UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
 import { BreakdownDonut } from "@/components/breakdown-donut";
+import { BAR_DIMMED_OPACITY, BAR_SLOT_MIN_WIDTH, BAR_TOP_RADIUS, buildDailyBars, dailyBarIndexAt, orderStackedSeries, roundedTopBarPath } from "@/lib/daily-bars";
 import { paginateItems } from "@/lib/pagination";
 import { buildBreakdownDonut } from "@/lib/breakdown-donut";
 import { compareUsage, nextUsageSort, type MetricMode, type UsageSort } from "@/lib/usage-sort";
@@ -419,6 +420,7 @@ function UsageChart({
   const [measuredWidth, setMeasuredWidth] = useState(980);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
   const [touchPinned, setTouchPinned] = useState(false);
+  const [scrollLeft, setScrollLeft] = useState(0);
   const width = Math.max(compactView ? 240 : 360, measuredWidth);
   const height = compactView ? 250 : 322;
   const inset = compactView
@@ -460,23 +462,16 @@ function UsageChart({
     values: days.map((day) => totalsByKey.get(`${day}:${provider.id}`) ?? 0),
   }));
   const dailyTotals = days.map((_, dayIndex) => series.reduce((sum, item) => sum + item.values[dayIndex], 0));
-  const stackOrder = series
-    .map((item) => ({ ...item, total: item.values.reduce((sum, value) => sum + value, 0) }))
-    .sort((left, right) => left.total - right.total || left.name.localeCompare(right.name));
-  const cumulativeValues = days.map(() => 0);
-  const stackedSeries = stackOrder.map((item) => {
-    const lowerValues = [...cumulativeValues];
-    const upperValues = item.values.map((value, dayIndex) => {
-      cumulativeValues[dayIndex] += value;
-      return cumulativeValues[dayIndex];
-    });
-    return { ...item, lowerValues, upperValues };
-  });
+  const stackOrder = orderStackedSeries(series);
   const rawMaximum = Math.max(0, ...dailyTotals);
   const maximum = niceMaximum(rawMaximum);
-  const chartWidth = width - inset.left - inset.right;
+  // Dense ranges scroll horizontally rather than shrinking bars below the
+  // minimum width or squeezing the gaps between them away.
+  const chartWidth = Math.max(width - inset.left - inset.right, days.length * BAR_SLOT_MIN_WIDTH);
+  const svgWidth = inset.left + chartWidth + inset.right;
   const chartHeight = height - inset.top - inset.bottom;
-  const x = (index: number) => inset.left + (index / Math.max(1, days.length - 1)) * chartWidth;
+  const bars = buildDailyBars({ dayCount: days.length, series: stackOrder, chartWidth, chartHeight, maximum });
+  const columnCenter = (index: number) => inset.left + bars.columns[index].columnX + bars.slotWidth / 2;
   const y = (value: number) => inset.top + chartHeight - (value / maximum) * chartHeight;
   const formatValue = mode === "cost" ? money : compact;
 
@@ -484,29 +479,37 @@ function UsageChart({
     const svg = containerRef.current?.querySelector("svg");
     if (!svg) return;
     const rect = svg.getBoundingClientRect();
-    const scaleX = rect.width > 0 ? width / rect.width : 1;
+    const scaleX = rect.width > 0 ? svgWidth / rect.width : 1;
     const localX = (clientX - rect.left) * scaleX;
-    const ratio = Math.min(1, Math.max(0, (localX - inset.left) / Math.max(1, chartWidth)));
-    setHoverIndex(Math.round(ratio * (days.length - 1)));
-  }, [width, inset.left, chartWidth, days.length]);
+    setHoverIndex(dailyBarIndexAt(localX - inset.left, chartWidth, days.length));
+  }, [svgWidth, inset.left, chartWidth, days.length]);
 
-  const hoverDay = hoverIndex !== null ? days[hoverIndex] : null;
-  const hoverSeries = hoverIndex !== null
-    ? series
-        .map((item) => ({ id: item.id, name: item.name, value: item.values[hoverIndex!] }))
+  // The toolbar can shrink `days` under a stale hoverIndex; only trust it
+  // while it still points at a rendered column.
+  const hoveredColumn = hoverIndex !== null ? (bars.columns[hoverIndex] ?? null) : null;
+  const hoverDay = hoveredColumn ? days[hoveredColumn.dayIndex] : null;
+  const hoverSeries = hoveredColumn
+    ? stackOrder
+        .map((item) => ({ id: item.id, name: item.name, value: item.values[hoveredColumn.dayIndex] }))
         .filter((item) => item.value > 0)
-        .sort((a, b) => b.value - a.value)
     : [];
-  const hoverTotal = hoverIndex !== null ? dailyTotals[hoverIndex] : 0;
-  const tooltipLeft = hoverIndex !== null ? x(hoverIndex) : 0;
-  const tooltipOnRight = tooltipLeft < width * 0.6;
+  const hoverTotal = hoveredColumn ? dailyTotals[hoveredColumn.dayIndex] : 0;
+  // The tooltip lives outside the scroll container and positions in viewport
+  // coordinates, so it tracks the column as the chart scrolls horizontally.
+  const tooltipLeft = hoveredColumn ? columnCenter(hoveredColumn.dayIndex) - scrollLeft : 0;
+  const tooltipOnRight = tooltipLeft < measuredWidth * 0.6;
+  const tooltipMaxWidth = Math.min(220, Math.max(140, measuredWidth - 24));
+  // Clamp the anchored edge so the whole tooltip stays inside the container,
+  // even when the hovered column sits in the cramped middle of a narrow view.
+  const tooltipEdgeMax = Math.max(12, measuredWidth - tooltipMaxWidth - 12);
 
   return (
-    <div ref={containerRef} className="relative min-w-0 select-none overflow-hidden">
+    <div ref={containerRef} className="relative min-w-0 select-none">
+      <div className="overflow-x-auto overflow-y-hidden" onScroll={(event) => setScrollLeft(event.currentTarget.scrollLeft)}>
       <svg
-        width={width}
+        width={svgWidth}
         height={height}
-        className="block max-w-full touch-pan-y"
+        className="block touch-pan-x touch-pan-y"
         role="img"
         aria-label={`Daily ${mode} by ${groupBy}`}
         onPointerMove={(event) => {
@@ -554,7 +557,7 @@ function UsageChart({
             <g key={step}>
               <line
                 x1={inset.left}
-                x2={width - inset.right}
+                x2={inset.left + chartWidth}
                 y1={y(value)}
                 y2={y(value)}
                 className="stroke-border/70"
@@ -569,70 +572,47 @@ function UsageChart({
         })}
 
         <g clipPath="url(#usage-chart-clip)">
-          {stackedSeries.map((item) => {
-            const upperPoints = item.upperValues.map((value, index) => ({ x: x(index), y: y(value) }));
-            const lowerPoints = item.lowerValues.map((value, index) => ({ x: x(index), y: y(value) })).reverse();
-            const upperLine = smoothPath(upperPoints, inset.top, inset.top + chartHeight);
-            const lowerLine = smoothPath(lowerPoints, inset.top, inset.top + chartHeight).replace(/^M/, "L");
-            const area = `${upperLine} ${lowerLine} Z`;
-            return <path key={item.id} d={area} fill={providerColor(item.id)} fillOpacity="0.26" />;
-          })}
-          {/* Hairline gaps keep collapsed bands' boundaries readable without becoming per-series lines. */}
-          {stackedSeries.map((item) => (
-            <path
-              key={item.id}
-              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
-              fill="none"
-              stroke="var(--background)"
-              strokeWidth="1"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
+          {hoveredColumn && (
+            <rect
+              x={inset.left + hoveredColumn.columnX}
+              y={inset.top}
+              width={bars.slotWidth}
+              height={chartHeight}
+              className="fill-foreground/5"
+              pointerEvents="none"
             />
+          )}
+          {bars.columns.map((column) => (
+            <g
+              key={days[column.dayIndex]}
+              opacity={hoveredColumn === null || hoveredColumn.dayIndex === column.dayIndex ? 1 : BAR_DIMMED_OPACITY}
+            >
+              {column.segments.map((segment) =>
+                segment.roundedTop ? (
+                  <path
+                    key={segment.seriesId}
+                    d={roundedTopBarPath(inset.left + column.barX, inset.top + segment.y, column.barWidth, segment.height, BAR_TOP_RADIUS)}
+                    fill={providerColor(segment.seriesId)}
+                  />
+                ) : (
+                  <rect
+                    key={segment.seriesId}
+                    x={inset.left + column.barX}
+                    y={inset.top + segment.y}
+                    width={column.barWidth}
+                    height={segment.height}
+                    fill={providerColor(segment.seriesId)}
+                  />
+                ),
+              )}
+            </g>
           ))}
-          <path
-            d={smoothPath(dailyTotals.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
-            fill="none"
-            className="stroke-foreground/55"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            vectorEffect="non-scaling-stroke"
-          />
         </g>
-
-        {hoverIndex !== null && (
-          <g pointerEvents="none">
-            <line
-              x1={x(hoverIndex)}
-              x2={x(hoverIndex)}
-              y1={inset.top}
-              y2={inset.top + chartHeight}
-              className="stroke-foreground/25"
-              strokeWidth="1"
-              vectorEffect="non-scaling-stroke"
-            />
-            {stackedSeries.flatMap((item) => {
-              const value = item.values[hoverIndex];
-              if (value <= 0) return [];
-              const midpoint = (item.lowerValues[hoverIndex] + item.upperValues[hoverIndex]) / 2;
-              return <circle
-                key={item.id}
-                cx={x(hoverIndex)}
-                cy={y(midpoint)}
-                r="3.5"
-                fill={providerColor(item.id)}
-                stroke="var(--background)"
-                strokeWidth="1.5"
-              />;
-            })}
-          </g>
-        )}
 
         {[0, Math.floor((days.length - 1) / 2), days.length - 1].map((index, labelIndex) => (
           <text
             key={`${days[index]}:${labelIndex}`}
-            x={x(index)}
+            x={labelIndex === 0 ? inset.left : labelIndex === 2 ? inset.left + chartWidth : columnCenter(index)}
             y={height - 7}
             textAnchor={labelIndex === 0 ? "start" : labelIndex === 2 ? "end" : "middle"}
             className="fill-muted-foreground text-[11px] tabular-nums"
@@ -641,13 +621,15 @@ function UsageChart({
           </text>
         ))}
       </svg>
+      </div>
 
-      {hoverIndex !== null && hoverDay && (
+      {hoveredColumn && hoverDay && (
         <div
-          className="pointer-events-none absolute top-2 z-10 min-w-[140px] max-w-[220px] rounded-lg border border-border/70 bg-popover px-2.5 py-2 text-xs shadow-md"
+          className="pointer-events-none absolute top-2 z-10 min-w-[140px] rounded-lg border border-border/70 bg-popover px-2.5 py-2 text-xs shadow-md"
           style={{
-            left: tooltipOnRight ? Math.min(tooltipLeft + 12, width - 12) : undefined,
-            right: tooltipOnRight ? undefined : Math.max(width - tooltipLeft + 12, 12),
+            maxWidth: tooltipMaxWidth,
+            left: tooltipOnRight ? Math.min(Math.max(tooltipLeft + 12, 12), tooltipEdgeMax) : undefined,
+            right: tooltipOnRight ? undefined : Math.min(Math.max(measuredWidth - tooltipLeft + 12, 12), tooltipEdgeMax),
           }}
         >
           <div className="font-medium text-foreground">{formatDay(hoverDay, true)}</div>
@@ -659,7 +641,7 @@ function UsageChart({
             <div className="mt-1 text-muted-foreground">No usage</div>
           ) : (
             <div className="mt-1.5 space-y-1">
-              {hoverSeries.slice(0, 6).map((item) => (
+              {hoverSeries.map((item) => (
                 <div key={item.id} className="flex items-center justify-between gap-3">
                   <span className="flex min-w-0 items-center gap-1.5 truncate text-muted-foreground">
                     <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: providerColor(item.id) }} />
