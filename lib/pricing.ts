@@ -146,22 +146,31 @@ function proxyModelIds(providerId: string, model: string) {
   return modelIds;
 }
 
+function hasRoutedProviderDecoration(providerId: string, model: string) {
+  const modelIds = normalizedModelIds(providerId, model);
+  return (routedProviderDecorations[providerId] ?? []).some((pattern) =>
+    modelIds.some((modelId) => pattern.test(modelId)));
+}
+
 function matchViaFirstParty(modelIds: string[]): PricingResult | null {
   const providers = activeProviders();
-  for (const vendorId of firstPartyProviders) {
-    const vendor = providers[vendorId];
-    if (vendor) {
-      for (const modelId of modelIds) {
+  for (const modelId of modelIds) {
+    const matches: PricingResult[] = [];
+    for (const vendorId of firstPartyProviders) {
+      const vendor = providers[vendorId];
+      if (vendor) {
         const match = matchWithinProvider(vendorId, vendor, modelId);
         // Attribution is inferred rather than reported, hence alias status.
-        if (match) return { ...match, status: "models-dev-alias" };
+        if (match) {
+          matches.push({ ...match, status: "models-dev-alias" });
+          continue;
+        }
       }
-    }
-    const builtin = builtinPrices[vendorId];
-    for (const modelId of modelIds) {
+      const builtin = builtinPrices[vendorId];
       const price = builtin?.models[modelId];
-      if (price) return { modelProviderId: vendorId, modelProviderName: builtin.name ?? providerName(vendorId), price, status: "models-dev-alias" };
+      if (price) matches.push({ modelProviderId: vendorId, modelProviderName: builtin.name ?? providerName(vendorId), price: { ...price }, status: "models-dev-alias" });
     }
+    if (matches.length > 0) return matches.length === 1 ? matches[0]! : null;
   }
   return null;
 }
@@ -189,13 +198,13 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
 
   const builtin = builtinPrices[modelProviderId]?.models[model.trim().toLowerCase()];
   if (builtin) {
-    return { modelProviderId, modelProviderName: providerName(modelProviderId, provider) || builtinPrices[modelProviderId]!.name!, price: builtin, status: "models-dev-exact" };
+    return { modelProviderId, modelProviderName: providerName(modelProviderId, provider) || builtinPrices[modelProviderId]!.name!, price: { ...builtin }, status: "models-dev-exact" };
   }
 
   // Explicit providers must never inherit a different vendor's rates, except
   // for the transparent routing labels declared above.
   if (provider || builtinPrices[modelProviderId]) {
-    if (routedProviderDecorations[modelProviderId]) {
+    if (hasRoutedProviderDecoration(modelProviderId, model)) {
       const modelIds = proxyModelIds(modelProviderId, model);
       const inferred = matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
       if (inferred) return inferred;
