@@ -686,7 +686,11 @@ async function syncJsonAgent(
     // Preserve the original Codex source identity as archive and custom roots
     // are added, so reconciliation keeps history whose logs are no longer present.
     const sourceRoots = agentId === "codex" ? [`${home}/.codex/sessions`] : roots;
-    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...sourceRoots);
+    // A configured profile label is part of Codex attribution. Give a renamed
+    // configuration a new source so reconciliation removes rows attributed to
+    // the old label, while ordinary rescans keep retaining missing log history.
+    const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...sourceRoots,
+      ...(accountHomes?.length ? [JSON.stringify(accountHomes)] : []));
     const complete = scan.failureCount === 0;
     const revision = (db.prepare("SELECT scan_revision revision FROM usage_sources WHERE source_id=?")
       .get(sourceId) as { revision: number | null } | undefined)?.revision ?? 0;
