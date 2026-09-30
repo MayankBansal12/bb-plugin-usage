@@ -1762,13 +1762,16 @@ describe("retained usage through the real sync path", () => {
   // Drives the unmodified plugin factory end-to-end through its public sync()
   // RPC (like the Antigravity regression test above); the mutable `state`
   // object lets each subsequent sync serve a different pi scan.
-  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string }, targetAgent = "pi") {
+  async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string; codexProfileHomes?: string }, targetAgent = "pi") {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown; dashboard: () => Promise<{ sync: { running: boolean } }> } | undefined;
     const commandsByTerminalId = new Map<string, string>();
     const stagedFiles = new Map<string, string>();
     const bb = {
-      settings: { define: vi.fn(() => ({ get: async () => ({ codexHomes: state.codexHomes ?? "", piSessionRoots: "", primeSessionRoots: "" }) })) },
+      settings: { define: vi.fn(() => ({ get: async () => ({
+        codexHomes: state.codexHomes ?? "", codexProfileHomes: state.codexProfileHomes ?? "",
+        piSessionRoots: "", primeSessionRoots: "",
+      }) })) },
       storage: {
         database: vi.fn(() => db),
         migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
@@ -1843,6 +1846,29 @@ describe("retained usage through the real sync path", () => {
       state.rows = [];
       await syncAgain();
       expect(totals(db)).toEqual({ count: 3, tokens: 4500, cost: 4.5 });
+    } finally { db.close(); }
+  });
+
+  it("replaces history attributed to an old configured Codex profile label", async () => {
+    setPricingCatalog(catalog(1000), "codex-profile-rename-v1");
+    const state = {
+      rows: [piRow({ account: "work" })], failureCount: 0,
+      codexProfileHomes: "work=/profiles/shared",
+    };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events").all())
+        .toEqual([{ providerId: "codex-work" }]);
+      state.codexProfileHomes = "personal=/profiles/shared";
+      state.rows = [piRow({ account: "personal" })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
+      expect(db.prepare("SELECT provider_id providerId FROM usage_events").all())
+        .toEqual([{ providerId: "codex-personal" }]);
+
+      state.rows = [];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 1, tokens: 1500, cost: 1.5 });
     } finally { db.close(); }
   });
 

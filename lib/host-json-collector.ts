@@ -90,8 +90,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // v6 (copilot): add session summaries.
   // v7 (copilot): uncached input subtracts cache reads and writes; rows cached
   // under v6 keep the double-counted values and must be reparsed.
+  // v8 (codex): retain an account-independent event identity so cached rows
+  // can rebuild their dedup key when a configured account label changes.
   // All agents share this version so existing caches migrate consistently.
-  const cacheVersion = 7;
+  const cacheVersion = 8;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "copilot", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -110,7 +112,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     })
     : [];
 
-  type CachedUsageRow = HostUsageAggregate & { eventKey?: string };
+  type CachedUsageRow = HostUsageAggregate & { eventKey?: string; eventIdentity?: string };
   type CacheEntry = { signature: string; rows: CachedUsageRow[] };
   type Cache = { version: number; agentId: HostJsonAgentId; files: Record<string, CacheEntry> };
   const failures: string[] = [];
@@ -169,7 +171,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       && finite(row.cachedInputTokens) !== null
       && finite(row.cacheWriteTokens) !== null
       && finite(row.outputTokens) !== null
-      && (row.eventKey === undefined || typeof row.eventKey === "string"));
+      && (row.eventKey === undefined || typeof row.eventKey === "string")
+      && (row.eventIdentity === undefined || typeof row.eventIdentity === "string"));
   }
 
   function validCacheEntry(value: unknown): value is CacheEntry {
@@ -668,12 +671,16 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       if (row.uncachedInputTokens + row.cachedInputTokens + row.cacheWriteTokens + row.outputTokens > 0) add(rows, row);
     }
     if (input.agentId === "codex") {
-      return [...rows.values()].map((row) => ({
-        ...row,
-        eventKey: crypto.createHash("sha256").update(JSON.stringify([
-          "codex", codexSessionId, row.account ?? null, row.day, row.modelProviderId, row.model, row.project,
-        ])).digest("hex"),
-      }));
+      return [...rows.values()].map((row) => {
+        const eventIdentity = crypto.createHash("sha256").update(JSON.stringify([
+          "codex", codexSessionId, row.day, row.modelProviderId, row.model, row.project,
+        ])).digest("hex");
+        return {
+          ...row,
+          eventIdentity,
+          eventKey: crypto.createHash("sha256").update(JSON.stringify([eventIdentity, row.account ?? null])).digest("hex"),
+        };
+      });
     }
     return input.agentId === "claude" || input.agentId === "codebuddy" || input.agentId === "cursor" || input.agentId === "copilot"
       ? [...events.values(), ...rows.values()]
@@ -759,7 +766,14 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     // or convention path changes.
     const reattribute = (rows: CachedUsageRow[]): CachedUsageRow[] => {
       const account = accountByPath.get(filePath);
-      return account === undefined ? rows : rows.map((row) => ({ ...row, account: account || undefined }));
+      return account === undefined ? rows : rows.map((row) => {
+        const attributed = { ...row, account: account || undefined };
+        if (row.eventIdentity) {
+          attributed.eventKey = crypto.createHash("sha256")
+            .update(JSON.stringify([row.eventIdentity, attributed.account ?? null])).digest("hex");
+        }
+        return attributed;
+      });
     };
     try {
       const stat = await fs.promises.stat(filePath);
