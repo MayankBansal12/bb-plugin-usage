@@ -114,7 +114,7 @@ export function BreakdownDonut({
       </div>
       {mode === "cost" && donut.unpricedCount > 0 && (
         <div className="mt-2 max-w-[210px] text-center text-[11px] leading-4 text-muted-foreground">
-          {donut.unpricedCount} {groupLabel} with unknown cost not shown
+          {donut.unpricedCount} {groupLabel} include unpriced usage; shares reflect known cost only
         </div>
       )}
     </div>
