@@ -34,8 +34,7 @@ export type BreakdownDonutData = {
   slices: DonutSlice[];
   colorByKey: Map<string, string>;
   total: number;
-  // Cost-mode rows whose usage has no known price contribute nothing to the
-  // donut; the component footnotes this count.
+  // Cost-mode groups that include unpriced usage, even when some cost is known.
   unpricedCount: number;
 };
 
@@ -84,6 +83,6 @@ export function buildBreakdownDonut(rows: DonutRow[], mode: DonutMode): Breakdow
     slices,
     colorByKey,
     total,
-    unpricedCount: mode === "cost" ? rows.filter((row) => row.unknown && row.cost === 0).length : 0,
+    unpricedCount: mode === "cost" ? rows.filter((row) => row.unknown).length : 0,
   };
 }
