@@ -56,7 +56,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "dsh", "devin", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
+  agentId: z.enum(["codex", "claude", "codebuddy", "copilot", "cursor", "devin", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -82,8 +82,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   const input = JSON.parse(buffer.from(encodedInput, "base64").toString("utf8")) as HostJsonScanInput;
   // v6 (dsh): replace repeated attempt samples and reject missing fork cuts.
   // v6 (codex): retain hashed session/bucket identities across archive moves and copies.
-  const cacheVersion = input.agentId === "dsh" || input.agentId === "codex" ? 6 : 5;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
+  // v6 (copilot): add session summaries.
+  // v7 (copilot): uncached input subtracts cache reads and writes; rows cached
+  // under v6 keep the double-counted values and must be reparsed.
+  // All agents share this version so existing caches migrate consistently.
+  const cacheVersion = 7;
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "copilot", "cursor", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
   // Extra per-account homes (e.g. Codex profiles). Only the codex parser knows
@@ -197,7 +201,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       target.set(raw.eventKey, { ...raw });
       return;
     }
-    // Claude currently repeats the same final counters on every content-block
+    // Some agents repeat the same final counters on every content-block
     // row. Maxima also handle a partially-written/incremental row safely
     // without multiplying one API response's usage. Codex rows hold session
     // bucket totals; maxima merge an older archive copy with a continued log.
@@ -215,6 +219,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     // generations (session.jsonl.zstd, session.vN...) beside the live v3 log
     // after a migration, and they replay the same history.
     if (input.agentId === "dsh") return name === "session.v3.jsonl.zstd";
+    if (input.agentId === "copilot") return name === "events.jsonl";
     if (input.agentId === "fx" || input.agentId === "antigravity" || input.agentId === "thaura") return name === "usage.jsonl";
     if (input.agentId === "grok") return name === "unified.jsonl";
     return name.endsWith(".jsonl");
@@ -406,6 +411,70 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         continue;
       }
 
+      if (input.agentId === "codebuddy" || input.agentId === "cursor") {
+        const buddy = input.agentId === "codebuddy";
+        if (buddy ? !["assistant", "message", "function_call"].includes(String(value.type)) || value.role === "user"
+          : value.kind !== "cursor-response" || value.version !== 1) continue;
+        const provider = object(value.providerData);
+        const usage = buddy ? object(object(value.message)?.usage) : value;
+        const usageDay = day(value.timestamp);
+        if (!usage || !usageDay) continue;
+        const inputTokens = count(usage.input_tokens);
+        const rawUsage = object(provider?.rawUsage);
+        const cached = buddy ? Math.min(inputTokens, Math.max(count(usage.cache_read_input_tokens),
+          count(rawUsage?.cache_read_input_tokens), count(rawUsage?.prompt_cache_hit_tokens),
+          count(object(rawUsage?.prompt_tokens_details)?.cached_tokens))) : count(usage.cache_read_tokens);
+        const writes = buddy ? Math.min(inputTokens - cached, Math.max(count(usage.cache_creation_input_tokens),
+          count(rawUsage?.cache_creation_input_tokens), count(rawUsage?.prompt_cache_write_tokens))) : count(usage.cache_write_tokens);
+        const output = count(usage.output_tokens);
+        // CodeBuddy persists SDK input totals including caches; Cursor's
+        // afterAgentResponse hook already subtracts cache reads and writes.
+        const uncached = buddy ? Math.max(0, inputTokens - cached - writes) : inputTokens;
+        if (uncached + cached + writes + output === 0) continue;
+        const identity = buddy ? provider?.messageId ?? object(value.message)?.id ?? value.id : value.eventId;
+        if (typeof identity !== "string" || !identity) continue;
+        if (typeof value.cwd === "string") sessionProject = projectName(value.cwd);
+        mergeEvent(events, {
+          eventKey: crypto.createHash("sha256").update(`${input.agentId}:${identity}`).digest("hex"),
+          day: usageDay, modelProviderId: input.agentId,
+          model: text(buddy ? provider?.model ?? object(value.message)?.model : value.model, "unknown"),
+          project: buddy ? sessionProject : projectName(value.project), loggedCostUsd: null,
+          uncachedInputTokens: uncached, cachedInputTokens: cached, cacheWriteTokens: writes, outputTokens: output,
+        });
+        continue;
+      }
+
+      if (input.agentId === "copilot") {
+        const data = object(value.data);
+        if (value.type === "session.start") {
+          const context = object(data?.context);
+          if (typeof context?.cwd === "string") sessionProject = projectName(context.cwd);
+          continue;
+        }
+        if (value.type !== "session.shutdown") continue;
+        const usageDay = day(value.timestamp);
+        const eventId = typeof value.id === "string" ? value.id : "";
+        const modelMetrics = object(data?.modelMetrics);
+        if (!usageDay || !eventId || !modelMetrics) continue;
+        for (const [modelName, rawMetrics] of Object.entries(modelMetrics)) {
+          const usage = object(object(rawMetrics)?.usage);
+          if (!usage) continue;
+          const inputTokens = count(usage.inputTokens);
+          const cached = count(usage.cacheReadTokens);
+          const writes = count(usage.cacheWriteTokens);
+          const output = count(usage.outputTokens);
+          const uncached = Math.max(0, inputTokens - cached - writes);
+          if (uncached + cached + writes + output === 0) continue;
+          mergeEvent(events, {
+            eventKey: crypto.createHash("sha256").update(`copilot:${eventId}:${modelName}`).digest("hex"),
+            day: usageDay, modelProviderId: "github-copilot", model: text(modelName, "unknown"), project: sessionProject,
+            loggedCostUsd: null, uncachedInputTokens: uncached, cachedInputTokens: cached,
+            cacheWriteTokens: writes, outputTokens: output,
+          });
+        }
+        continue;
+      }
+
       if (input.agentId === "grok") {
         if (value.msg !== "shell.turn.inference_done") continue;
         const usage = object(value.ctx);
@@ -592,7 +661,9 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         ])).digest("hex"),
       }));
     }
-    return input.agentId === "claude" ? [...events.values(), ...rows.values()] : [...rows.values()];
+    return input.agentId === "claude" || input.agentId === "codebuddy" || input.agentId === "cursor" || input.agentId === "copilot"
+      ? [...events.values(), ...rows.values()]
+      : [...rows.values()];
   }
 
   let cache: Cache = { version: cacheVersion, agentId: input.agentId, files: {} };
@@ -611,7 +682,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   }
 
   const discovered: string[] = [];
-  for (const root of [...new Set(input.roots)]) await walk(root, discovered);
+  const roots = [...input.roots];
+  if (input.agentId === "codebuddy" && process.env.CODEBUDDY_CONFIG_DIR?.trim()) {
+    const home = process.env.CODEBUDDY_CONFIG_DIR.trim();
+    if (path.isAbsolute(home)) roots.push(path.join(home, "projects"));
+  }
+  for (const root of [...new Set(roots)]) await walk(root, discovered);
   const accountDiscovered: string[] = [];
   if (accountRoot) {
     let accountEntries: import("node:fs").Dirent[] = [];
