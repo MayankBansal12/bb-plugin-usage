@@ -32,8 +32,10 @@ it("records only real Cursor counters and strips content and identifying paths",
     output_tokens: 5, cache_read_tokens: 60, cache_write_tokens: 10, eventId: expect.stringMatching(/^[a-f0-9]{64}$/) });
   expect((await stat(output)).mode & 0o777).toBe(0o600);
   await run(event, ["--output", output]);
+  await run({ ...event, text: "second private reply", input_tokens: 7, output_tokens: 3 }, ["--output", output]);
   const lines = (await readFile(output, "utf8")).trim().split("\n").map((s) => JSON.parse(s));
   expect(lines[0].eventId).toBe(lines[1].eventId);
+  expect(lines[2].eventId).not.toBe(lines[0].eventId);
 });
 it.each([
   { used: 123, size: 200000 }, { input_tokens: -1, output_tokens: 1 }, { input_tokens: "123", output_tokens: 1 },

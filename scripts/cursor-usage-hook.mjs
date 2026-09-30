@@ -64,7 +64,12 @@ function record(value) {
   const project = typeof workspace === "string" ? workspace.replace(/\\/g, "/").replace(/\/+$/, "").split("/").pop() : "";
   return {
     version: 1, kind: "cursor-response",
-    eventId: createHash("sha256").update(JSON.stringify([value.conversation_id, value.generation_id])).digest("hex"),
+    // Cursor has no response id: fingerprint the documented response payload so
+    // retries dedupe without merging separate responses from one generation.
+    eventId: createHash("sha256").update(JSON.stringify([
+      value.conversation_id, value.generation_id, value.text, value.model,
+      value.input_tokens, value.output_tokens, value.cache_read_tokens ?? 0, value.cache_write_tokens ?? 0,
+    ])).digest("hex"),
     timestamp: new Date().toISOString(),
     model: typeof value.model === "string" ? value.model.slice(0, 200) : "unknown",
     project: project?.trim().slice(0, 80) || "Unknown",

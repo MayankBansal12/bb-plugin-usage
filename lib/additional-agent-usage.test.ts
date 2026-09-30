@@ -81,11 +81,13 @@ it("collects Cursor metadata ledgers without adding cache twice or inferring tok
   const root = await setup();
   const event = { version: 1, kind: "cursor-response", eventId: "hash", timestamp: "2026-08-10T12:00:00Z",
     model: "cursor-grok-4.6-high", project: "project", input_tokens: 20, cache_read_tokens: 60, cache_write_tokens: 10, output_tokens: 5 };
-  await writeFile(join(root, "usage.jsonl"), [event, event,
+  const secondResponse = { ...event, eventId: "second-response", input_tokens: 7, cache_read_tokens: 11,
+    cache_write_tokens: 2, output_tokens: 3 };
+  await writeFile(join(root, "usage.jsonl"), [event, event, secondResponse,
     { version: 1, kind: "cursor-response", eventId: "context", timestamp: event.timestamp, used: 99000, size: 200000 },
   ].map((v) => JSON.stringify(v)).join("\n"));
   const result = await scan("cursor", root);
-  expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 20, cachedInputTokens: 60, cacheWriteTokens: 10, outputTokens: 5 })]);
+  expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 27, cachedInputTokens: 71, cacheWriteTokens: 12, outputTokens: 8 })]);
   expect(parseHostUsageAggregates(JSON.stringify(result.rows), "cursor", { machineId: "m", machineName: "M" })[0])
-    .toMatchObject({ agentId: "cursor", agentName: "Cursor Agent", processedTokens: 95 });
+    .toMatchObject({ agentId: "cursor", agentName: "Cursor Agent", processedTokens: 118 });
 });
