@@ -2,6 +2,7 @@ export type CacheUsageRecord = {
   agentId: string;
   agentName: string;
   modelProviderId: string;
+  modelProviderName: string;
   model: string;
   cachedInputTokens: number;
   cacheWriteTokens: number;
@@ -13,6 +14,7 @@ export type CacheHitRateGroup = {
   agentId: string;
   agentName: string;
   modelProviderId: string | null;
+  modelProviderName: string | null;
   model: string | null;
   cachedInputTokens: number;
   totalInputTokens: number;
@@ -50,6 +52,7 @@ export function cacheHitRateGroups(records: CacheUsageRecord[], groupBy: "agent"
       agentId: record.agentId,
       agentName: record.agentName,
       modelProviderId: groupBy === "model" ? record.modelProviderId : null,
+      modelProviderName: groupBy === "model" ? record.modelProviderName : null,
       model: groupBy === "model" ? record.model : null,
       cachedInputTokens: 0,
       cacheWriteTokens: 0,
@@ -68,6 +71,7 @@ export function cacheHitRateGroups(records: CacheUsageRecord[], groupBy: "agent"
       agentId: group.agentId,
       agentName: group.agentName,
       modelProviderId: group.modelProviderId,
+      modelProviderName: group.modelProviderName,
       model: group.model,
       cachedInputTokens: group.cachedInputTokens,
       totalInputTokens,
