@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { appendFile, chmod, copyFile, mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { appendFile, copyFile, mkdir, mkdtemp, readFile, rename, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdCompressSync } from "node:zlib";
@@ -34,7 +35,6 @@ async function scan(agentId: HostJsonAgentId, root: string | string[], cachePath
     sinceDay: "2026-08-01",
     ...extra,
   });
-  expect(script.length).toBeLessThan(9_000);
   const { stdout } = await execFileAsync(process.execPath, ["-e", script], { maxBuffer: 2 * 1024 * 1024 });
   return extractHostJsonScan(stdout.replace(/\n/g, "\r\n"));
 }
@@ -54,6 +54,34 @@ afterEach(async () => {
 });
 
 describe("host JSON usage collector", () => {
+  it.each([
+    ["codex", "rollout-cached.jsonl", 6], ["claude", "session.jsonl", 5],
+    ["dsh", "session.v3.jsonl.zstd", 6], ["fx", "usage.jsonl", 5],
+    ["grok", "unified.jsonl", 5], ["pi", "session.jsonl", 5],
+    ["prime", "session.jsonl", 5], ["antigravity", "usage.jsonl", 5],
+    ["thaura", "usage.jsonl", 5],
+  ] as const)("preserves the existing %s cache when Copilot collection is added", async (agentId, fileName, version) => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "sessions");
+    const cachePath = join(directory, "cache.json");
+    await mkdir(root);
+    const filePath = join(root, fileName);
+    // A matching, valid metadata cache must be sufficient; reparsing this
+    // placeholder would drop the cached row (or fail for compressed DSH).
+    await writeFile(filePath, "{}\n");
+    const info = await stat(filePath);
+    const rows = [{ day: "2026-08-09", modelProviderId: "test", model: "cached-model", project: "project",
+      loggedCostUsd: null, uncachedInputTokens: 35, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 20 }];
+    await writeFile(cachePath, JSON.stringify({ version, agentId, files: {
+      [createHash("sha256").update(filePath).digest("hex")]: {
+        signature: `${info.size}:${Math.trunc(info.mtimeMs)}`, rows,
+      },
+    } }));
+    const result = await scan(agentId, root, cachePath);
+    expect(result).toMatchObject({ changedFileCount: 0, reusedFileCount: 1, failureCount: 0, rows });
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(version);
+  });
+
   it("streams Codex logs and reuses metadata-only per-file aggregates", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "sessions");
@@ -393,6 +421,53 @@ describe("host JSON usage collector", () => {
     const second = await scan("antigravity", root, cachePath);
     expect(second).toMatchObject({ fileCount: 1, changedFileCount: 0, reusedFileCount: 1, failureCount: 0 });
     expect(second.rows).toEqual(first.rows);
+  });
+
+  it("collects completed Copilot sessions once and retains only aggregate metadata", async () => {
+    const directory = await temporaryDirectory();
+    const root = join(directory, "session-state", "session-private");
+    const cachePath = join(directory, "cache", "copilot.json");
+    await mkdir(root, { recursive: true });
+    const shutdown = {
+      type: "session.shutdown", id: "shutdown-private", timestamp: "2026-08-09T12:00:00Z",
+      data: { modelMetrics: {
+        "gpt-5-test": { requests: { count: 2, cost: 1 }, usage: {
+          inputTokens: 100, cacheReadTokens: 60, cacheWriteTokens: 5, outputTokens: 20, reasoningTokens: 7,
+        } },
+        "claude-test": { requests: { count: 1, cost: 1 }, usage: {
+          inputTokens: 40, cacheReadTokens: 10, cacheWriteTokens: 0, outputTokens: 8,
+        } },
+      }, codeChanges: { filesModified: ["/private/work/project/secret.ts"] } },
+    };
+    await writeFile(join(root, "events.jsonl"), [
+      { type: "session.start", id: "start-private", timestamp: "2026-08-09T10:00:00Z", data: { context: { cwd: "/private/work/project" } } },
+      shutdown,
+      shutdown,
+      { type: "session.usage_checkpoint", id: "checkpoint-private", timestamp: "2026-08-09T11:00:00Z", data: { totalPremiumRequests: 2 } },
+    ].map((value) => JSON.stringify(value)).join("\n"));
+
+    const first = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
+    expect(first.rows).toEqual(expect.arrayContaining([
+      expect.objectContaining({ day: localDay("2026-08-09T12:00:00Z"), modelProviderId: "github-copilot", model: "gpt-5-test", project: "project", uncachedInputTokens: 35, cachedInputTokens: 60, cacheWriteTokens: 5, outputTokens: 20 }),
+      expect.objectContaining({ modelProviderId: "github-copilot", model: "claude-test", uncachedInputTokens: 30, cachedInputTokens: 10, cacheWriteTokens: 0, outputTokens: 8 }),
+    ]));
+    expect(first.rows).toHaveLength(2);
+    const cache = await readFile(cachePath, "utf8");
+    expect(cache).not.toMatch(/private|secret/);
+
+    const second = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(second).toMatchObject({ changedFileCount: 0, reusedFileCount: 1, rows: first.rows });
+
+    const staleCache = JSON.parse(await readFile(cachePath, "utf8"));
+    staleCache.version = 6;
+    for (const entry of Object.values(staleCache.files) as Array<{ rows: Array<{ uncachedInputTokens: number }> }>) {
+      for (const row of entry.rows) row.uncachedInputTokens += row.uncachedInputTokens + 100;
+    }
+    await writeFile(cachePath, JSON.stringify(staleCache));
+    const migrated = await scan("copilot", join(directory, "session-state"), cachePath);
+    expect(migrated).toMatchObject({ changedFileCount: 1, reusedFileCount: 0, rows: first.rows });
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(7);
   });
 
   it("streams Thaura's usage ledger and prices its flat model rate", async () => {
@@ -862,19 +937,15 @@ describe("host JSON usage collector", () => {
   it("keeps host filesystem paths out of failure diagnostics", async () => {
     const directory = await temporaryDirectory();
     const root = join(directory, "sessions");
-    const cachePath = join(directory, "cache", "codex.json");
+    const cachePath = join(directory, "cache", "dsh.json");
     await mkdir(root, { recursive: true });
-    // Discoverable and stat-able, but unreadable -- so parseFile throws and the
-    // failure path runs with a real filePath in scope.
-    const secret = join(root, "rollout-secret.jsonl");
-    await writeFile(secret, "{}\n");
-    await chmod(secret, 0o000);
+    await writeFile(join(root, "session.v3.jsonl.zstd"), "not a zstd frame");
 
-    const result = await scan("codex", root, cachePath);
+    const result = await scan("dsh", root, cachePath);
     expect(result.failureCount).toBeGreaterThan(0);
     // `error` carries the first failure string off the host verbatim.
     expect(result.error).toBe("A usage log could not be read.");
-    await chmod(secret, 0o600);
+    expect(JSON.stringify(result)).not.toContain(directory);
   });
 });
 

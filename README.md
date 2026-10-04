@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
+- Collect usage from Codex, Claude Code, GitHub Copilot, DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
 - Separate the coding agent from the underlying model provider.
 - Group charts and usage shares by agent or model provider.
 - Switch the chart and provider shares between cost and tokens.

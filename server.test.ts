@@ -18,6 +18,7 @@ import plugin, {
   openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
+import { getSourceIssueMessage } from "./lib/usage-view-state";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -86,6 +87,11 @@ function commandTextFor(command: string, stagedFiles: Map<string, string>) {
 }
 
 describe("JSON agent roots", () => {
+  it("points Copilot at its session state root", () => {
+    expect(jsonAgentRoots("/home/user", "copilot", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.copilot/session-state",
+    ]);
+  });
   it("includes active and archived Codex sessions", () => {
     expect(jsonAgentRoots("/home/user", "codex", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.codex/sessions",
@@ -181,7 +187,7 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it("actually dispatches an Antigravity scan through syncAll, not just through direct scan() calls", async () => {
+  it.each(["antigravity", "copilot"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
     // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
@@ -222,8 +228,8 @@ describe("sync RPC", () => {
           output: vi.fn(async (args: { terminalId: string }) => {
             const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
             const agentId = agentIdFromCommand(command);
-            const text = agentId === "antigravity"
-              ? fakeHostScanOutput("antigravity", [{
+            const text = agentId === targetAgent
+              ? fakeHostScanOutput(targetAgent, [{
                 day: new Date().toISOString().slice(0, 10),
                 modelProviderId: "google",
                 model: "gemini-4-ultra-preview",
@@ -248,14 +254,29 @@ describe("sync RPC", () => {
     expect(handlers?.sync()).toEqual({ ok: true });
 
     await vi.waitFor(() => {
-      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'antigravity'").get();
+      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = ?").get(targetAgent);
       expect(row).toBeTruthy();
     }, { timeout: 2000 });
 
     const syncState = db.prepare(
-      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'antigravity'",
-    ).get();
+      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = ?",
+    ).get(targetAgent);
     expect(syncState).toEqual({ status: "ready", recordCount: 1 });
+
+    if (targetAgent === "antigravity") {
+      // This host has another working agent but no Copilot history. The new
+      // collector must complete without records or an unavailable-data banner.
+      await vi.waitFor(() => {
+        expect(db.prepare(`SELECT status, record_count recordCount, error
+          FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'copilot'`).get())
+          .toEqual({ status: "no-data", recordCount: 0, error: null });
+      });
+      expect(db.prepare("SELECT * FROM usage_events WHERE provider_id = 'copilot'").all()).toEqual([]);
+      const sources = db.prepare(`SELECT machine_id machineId, status FROM usage_sync_state
+        WHERE provider_id IN ('antigravity', 'copilot')`).all() as Array<{ machineId: string; status: string }>;
+      expect(getSourceIssueMessage([{ id: "host-1", name: "Machine", status: "connected" }], sources)).toBeNull();
+      expect(bb.log.warn).not.toHaveBeenCalledWith(expect.stringContaining("/copilot:"));
+    }
 
     // The terminal contract caps start.command at 10,000 characters; every
     // collector command must fit, whether inline or staged through files.write.
