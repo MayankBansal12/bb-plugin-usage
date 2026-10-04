@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -68,7 +68,7 @@ test("production JSON commands scan logs and reuse the metadata cache", (t) => {
 
 test("production JSON commands accept absent roots for every JSON agent", (t) => {
   const home = temporaryHome(t);
-  for (const agentId of ["codex", "claude", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
+  for (const agentId of ["codex", "claude", "copilot", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
     const result = scan(run(jsonAgentCommand({
       agentId, roots: [join(home, "absent")], cachePath: join(home, `${agentId}.json`), sinceDay: "2026-09-01",
     }), home));
@@ -76,6 +76,44 @@ test("production JSON commands accept absent roots for every JSON agent", (t) =>
     assert.equal(result.failureCount, 0);
     assert.deepEqual(result.rows, []);
   }
+});
+
+test("production Copilot collection needs no CLI binary or configuration", (t) => {
+  const home = temporaryHome(t);
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+  symlinkSync(process.execPath, join(bin, "node"));
+  // The generated command gets only Node on PATH: there is no Copilot CLI,
+  // package manager, credential helper, or configuration in this fixture.
+  const env = { ...process.env, HOME: home, PATH: bin, NODE_OPTIONS: "", TZ: "UTC" };
+  execFileSync("/bin/sh", ["-c", "if command -v copilot >/dev/null 2>&1; then exit 1; fi"], { env });
+  const root = join(home, ".copilot/session-state");
+  const command = jsonAgentCommand({ agentId: "copilot", roots: [root], cachePath: join(home, "cache/copilot.json"), sinceDay: "2026-09-01" });
+  const collect = () => scan(execFileSync("/bin/sh", ["-c", command], {
+    env, encoding: "utf8", timeout: 15_000, maxBuffer: 2 * 1024 * 1024,
+  }));
+  for (const createEmptyRoot of [false, true]) {
+    if (createEmptyRoot) mkdirSync(root, { recursive: true });
+    const result = collect();
+    assert.equal(result.failureCount, 0);
+    assert.equal(result.error, null);
+    assert.equal(result.fileCount, 0);
+    assert.deepEqual(result.rows, []);
+  }
+  // Retained history also remains readable after the CLI is uninstalled.
+  writeFileSync(join(root, "events.jsonl"), JSON.stringify({
+    type: "session.shutdown", id: "finished-session", timestamp: "2026-09-24T12:00:00Z",
+    data: { modelMetrics: { "unknown-model": { usage: {
+      inputTokens: 100, cacheReadTokens: 60, cacheWriteTokens: 5, outputTokens: 20,
+    } } } },
+  }));
+  const historical = collect();
+  assert.equal(historical.failureCount, 0);
+  assert.equal(historical.rows.length, 1);
+  assert.equal(historical.rows[0].uncachedInputTokens, 35);
+  assert.equal(historical.rows[0].cachedInputTokens, 60);
+  assert.equal(historical.rows[0].cacheWriteTokens, 5);
+  assert.equal(historical.rows[0].outputTokens, 20);
 });
 
 test("production Devin command queries a real SQLite fixture", (t) => {

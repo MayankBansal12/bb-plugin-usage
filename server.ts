@@ -79,6 +79,7 @@ type CollectorSettings = { codexHomes?: string; piSessionRoots: string; primeSes
 const AGENTS = [
   { id: "codex", name: "Codex" },
   { id: "claude", name: "Claude Code" },
+  { id: "copilot", name: "GitHub Copilot" },
   { id: "dsh", name: "DeepSeek Harness" },
   { id: "devin", name: "Devin" },
   { id: "fx", name: "FX" },
@@ -449,6 +450,7 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
   }
   const resolvedPrimeRoots = primeRoots(home, settings.primeSessionRoots);
   return agentId === "claude" ? [`${home}/.claude/projects`]
+    : agentId === "copilot" ? [`${home}/.copilot/session-state`]
     : agentId === "dsh" ? [`${home}/.dsh/sessions`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
@@ -1041,6 +1043,7 @@ export default async function plugin(bb: BbPluginApi) {
         await Promise.all([
           syncJsonAgent(bb, db, machine, home, "codex", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "copilot", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
