@@ -656,6 +656,59 @@ describe("provider limit loading", () => {
     ]);
   });
 
+  it.each([
+    ["acp-cursor-sdk"],
+    ["acp-cursor", "acp-cursor-sdk"],
+  ])("shows one Cursor quota card for provider keys %j", async (...keys) => {
+    const cursorLimit = {
+      status: "ok",
+      planLabel: "Team",
+      accountEmail: null,
+      windows: [{ label: "Plan usage", usedPercent: 5, resetsAt: null }],
+    };
+    const usageLimits = vi.fn(async () => Object.fromEntries(keys.map((key) => [key, cursorLimit])));
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    await expect(loadProviderLimits(bb, [
+      { id: "host_1", name: "Current machine", status: "connected" },
+    ], emptyDb())).resolves.toEqual([expect.objectContaining({
+      providerId: "cursor",
+      status: "ok",
+      planLabel: "Team",
+      windows: cursorLimit.windows,
+    })]);
+  });
+
+  it("retains quota responses that take more than five seconds", async () => {
+    const usageLimits = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({
+        "acp-cursor": {
+          status: "ok",
+          planLabel: "Team",
+          windows: [{ label: "Plan usage", usedPercent: 5, resetsAt: null }],
+        },
+      }), 6_000);
+      signal.addEventListener("abort", () => {
+        clearTimeout(timer);
+        reject(signal.reason);
+      }, { once: true });
+    }));
+    const bb = {
+      sdk: { system: { usageLimits } },
+      log: { debug: vi.fn() },
+    } as unknown as BbPluginApi;
+    const result = loadProviderLimits(bb, [
+      { id: "host_1", name: "Current machine", status: "connected" },
+    ], emptyDb());
+    const assertion = expect(result).resolves.toEqual([
+      expect.objectContaining({ providerId: "cursor", status: "ok" }),
+    ]);
+    await assertion;
+  }, 8_000);
+
   it("surfaces a provider error (e.g. rate limited) instead of hiding the provider", async () => {
     const usageLimits = vi.fn(async () => ({
       codex: { status: "ok", planLabel: "Pro", windows: [{ label: "5 hours", usedPercent: 10, resetsAt: null }] },

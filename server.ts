@@ -97,7 +97,7 @@ const AGENTS = [
 const LIMIT_PROVIDERS = [
   { keys: ["codex"], id: "codex", name: "Codex" },
   { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
-  { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
+  { keys: ["acp-cursor", "acp-cursor-sdk", "cursor"], id: "cursor", name: "Cursor" },
 ] as const;
 export const grokLimitsMigration = `CREATE TABLE IF NOT EXISTS grok_limits (
   machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, snapshot_json TEXT,
@@ -156,7 +156,7 @@ export function loadStoredGrokLimits(db: Database, connectedMachineIds: Set<stri
   });
 }
 
-const PROVIDER_LIMITS_TIMEOUT_MS = 5_000;
+const PROVIDER_LIMITS_TIMEOUT_MS = 20_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
