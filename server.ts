@@ -312,7 +312,6 @@ CREATE TABLE amp_installations (
 CREATE TABLE amp_thread_origins (
   source_id TEXT PRIMARY KEY, installation_id TEXT
 );`;
-const AMP_OTHER_MACHINE = { id: "amp-other", name: "Amp: Other / unknown environment" };
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -375,6 +374,10 @@ function codexAccountHomes(value: string, home: string): Array<{ account: string
 }
 
 function countForMachine(db: Database, machineId: string, agentId: AgentId) {
+  if (agentId === "amp") {
+    return (db.prepare(`${canonicalEventsSql()} SELECT COUNT(*) count FROM canonical
+      WHERE machine_id=? AND provider_id='amp'`).get(machineId) as { count: number }).count;
+  }
   return (db.prepare(`SELECT COUNT(DISTINCT es.event_key) AS count FROM usage_event_sources es
     JOIN usage_sources s ON s.source_id=es.source_id WHERE s.machine_id=? AND s.provider_id=?`)
     .get(machineId, agentId) as { count: number }).count;
@@ -1446,24 +1449,30 @@ export function loadStoredOpenCodeGoLimits(
   });
 }
 
-// Rows are bucketed by each host's local day, so the plugin server's timezone
-// cannot decide the exact visible window without clipping a host that is ahead
-// of it. This query only bounds retention -- it fetches one extra day of slack
-// and the dashboard applies the exact range in the viewer's timezone.
-export function dashboardRecordsSql() {
+function canonicalEventsSql() {
   return `WITH amp_machines AS (
       SELECT installation_id, MIN(machine_id) machine_id FROM amp_installations
       GROUP BY installation_id HAVING COUNT(*)=1
     ), canonical AS (
       SELECT e.*, CASE WHEN e.provider_id='amp'
-        THEN CASE WHEN COUNT(DISTINCT ao.installation_id)=1 THEN COALESCE(MIN(am.machine_id), '${AMP_OTHER_MACHINE.id}')
-          ELSE '${AMP_OTHER_MACHINE.id}' END
+        THEN MIN(am.machine_id)
         ELSE MIN(s.machine_id) END machine_id FROM usage_events e
       JOIN usage_event_sources es ON es.event_key=e.event_key JOIN usage_sources s ON s.source_id=es.source_id
       LEFT JOIN amp_thread_origins ao ON e.provider_id='amp' AND ao.source_id=s.source_id
       LEFT JOIN amp_machines am ON am.installation_id=ao.installation_id
       GROUP BY e.event_key
-    ) SELECT day, provider_id agentId, provider_name agentName,
+      HAVING e.provider_id!='amp' OR (
+        COUNT(DISTINCT ao.installation_id)=1 AND MAX(am.machine_id=s.machine_id)=1
+      )
+    )`;
+}
+
+// Rows are bucketed by each host's local day, so the plugin server's timezone
+// cannot decide the exact visible window without clipping a host that is ahead
+// of it. This query only bounds retention -- it fetches one extra day of slack
+// and the dashboard applies the exact range in the viewer's timezone.
+export function dashboardRecordsSql() {
+  return `${canonicalEventsSql()} SELECT day, provider_id agentId, provider_name agentName,
     model_provider_id modelProviderId, model_provider_name modelProviderName, machine_id machineId, model, project,
     SUM(cost_usd) costUsd,
     SUM(CASE WHEN pricing_status='unknown' THEN processed_tokens ELSE 0 END) unknownPricedTokens,
@@ -1652,8 +1661,7 @@ export default async function plugin(bb: BbPluginApi) {
     async dashboard() {
       const machines = await loadMachines();
       const rows = db.prepare(dashboardRecordsSql()).all() as Array<Omit<DashboardRecord, "machineName">>;
-      const displayMachines = rows.some((row) => row.machineId === AMP_OTHER_MACHINE.id) ? [...machines, AMP_OTHER_MACHINE] : machines;
-      const machineNames = new Map(displayMachines.map((machine) => [machine.id, machine.name]));
+      const machineNames = new Map(machines.map((machine) => [machine.id, machine.name]));
       const records = rows.map((row) => ({ ...row, machineName: machineNames.get(row.machineId) ?? "Unknown machine" }));
       const sources = db.prepare(`SELECT machine_id machineId, provider_id agentId, status, last_attempt_at lastAttemptAt,
         last_success_at lastSuccessAt, record_count recordCount, error FROM usage_sync_state ORDER BY machine_id, provider_id`).all() as SourceState[];
@@ -1671,15 +1679,15 @@ export default async function plugin(bb: BbPluginApi) {
         generatedAt: new Date().toISOString(),
         lastSyncedAt: sync.completedAt,
         pricingVersion: pricingVersion(),
-        machines: displayMachines,
+        machines,
         agents: [...AGENTS, ...extraAgents],
         modelProviders,
         records,
         sources,
         sync,
         notice: "Prompts and message content are never stored."
-          + (records.some((row) => row.agentId === "amp")
-            ? " Amp usage is attributed to each thread's initial machine, not where later messages ran. Unmatched installations appear under Other / unknown environment."
+          + (sources.some((source) => source.agentId === "amp")
+            ? " Each machine counts only Amp threads started on its own installation. Other-machine and unknown origins are excluded. Moving a thread does not change its initial machine."
             : ""),
       };
     },

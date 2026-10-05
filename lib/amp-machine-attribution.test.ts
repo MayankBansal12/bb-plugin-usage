@@ -106,30 +106,33 @@ describe("Amp initial-machine attribution", () => {
       .toEqual([{ installation_id: "known-installation", machine_id: "original-host" }]);
   });
 
-  it("resolves another machine independently of collection order and deduplicates account usage", async () => {
+  it("counts only each collecting machine's own threads and sums enrolled machines without duplicates", async () => {
     const { db, dashboard, scan } = await setup();
     await scan(0, "collector-install", ["origin-install", "collector-install", null]);
     let data = await dashboard();
-    expect(data.records.map(r => [r.machineId, r.processedTokens])).toEqual(expect.arrayContaining([
-      ["a-collector", 26], ["amp-other", 52],
-    ]));
-    expect(data.machines).toContainEqual(expect.objectContaining({ id: "amp-other", name: "Amp: Other / unknown environment" }));
+    expect(data.records.map(r => [r.machineId, r.processedTokens])).toEqual([["a-collector", 26]]);
+    expect(data.sources).toContainEqual(expect.objectContaining({ machineId: "a-collector", recordCount: 1 }));
+    expect(data.machines.some(m => m.id === "amp-other")).toBe(false);
     expect(getSourceIssueMessage(data.machines.filter(m => m.id !== "z-origin"), data.sources)).toBeNull();
     expect(data.notice).toContain("initial machine");
 
-    // Register the origin after the remote thread has already been collected.
+    // Merely registering B must not count B's account history collected by A.
+    await scan(1, "origin-install", []);
+    expect((await dashboard()).records).toEqual(data.records);
     await scan(1, "origin-install", ["origin-install", "collector-install", null]);
     data = await dashboard();
     expect(data.records.map(r => [r.machineId, r.processedTokens])).toEqual(expect.arrayContaining([
-      ["z-origin", 25], ["a-collector", 26], ["amp-other", 27],
+      ["z-origin", 25], ["a-collector", 26],
     ]));
-    expect(data.records).toHaveLength(3);
+    expect(data.records).toHaveLength(2);
+    expect(data.records.reduce((sum, r) => sum + r.processedTokens, 0)).toBe(51);
+    expect(data.sources.every(s => s.recordCount === 1)).toBe(true);
     expect(data.records.find(r => r.machineId === "z-origin")?.machineName).toBe("Initial machine");
     expect(db.prepare("SELECT COUNT(*) n FROM usage_event_sources").get()).toEqual({ n: 6 });
 
     // Source cleanup remains scoped to the collecting machine, not attribution.
     await scan(0, "collector-install", []);
-    expect((await dashboard()).records).toEqual(data.records);
+    expect((await dashboard()).records).toEqual([expect.objectContaining({ machineId: "z-origin", processedTokens: 25 })]);
     expect(db.prepare("SELECT COUNT(*) n FROM usage_event_sources").get()).toEqual({ n: 3 });
   });
 
@@ -138,12 +141,35 @@ describe("Amp initial-machine attribution", () => {
     await scan(0, "collector-install", ["collector-install"]);
     // An upgraded database has usage sources but no initial-environment metadata.
     db.exec("DELETE FROM amp_thread_origins");
-    expect((await dashboard()).records[0]).toMatchObject({ machineId: "amp-other", processedTokens: 25 });
+    expect((await dashboard()).records).toEqual([]);
     await scan(0, null, [], 1);
-    expect((await dashboard()).records[0]).toMatchObject({ machineId: "amp-other", processedTokens: 25 });
+    expect((await dashboard()).records).toEqual([]);
     await scan(0, "collector-install", ["collector-install"]);
     expect((await dashboard()).records[0]).toMatchObject({ machineId: "a-collector", processedTokens: 25 });
     expect((await dashboard()).machines.some(m => m.id === "amp-other")).toBe(false);
+  });
+
+  it("needs no configuration, excludes unreadable local identity, and retains verified history on partial scans", async () => {
+    const { dashboard, scan } = await setup();
+    await scan(0, null, ["collector-install", null]);
+    let data = await dashboard();
+    expect(data.records).toEqual([]);
+    expect(data.sources[0]).toMatchObject({ recordCount: 0, status: "no-data" });
+    expect(data.notice).toContain("unknown origins are excluded");
+    await scan(0, "collector-install", ["collector-install", null]);
+    const known = (await dashboard()).records;
+    expect(known).toHaveLength(1);
+    await scan(0, null, [], 1);
+    expect((await dashboard()).records).toEqual(known);
+  });
+
+  it("leaves non-Amp records visible without installation metadata", async () => {
+    const { db, dashboard, scan } = await setup();
+    await scan(0, null, [null]);
+    db.exec("UPDATE usage_events SET provider_id='codex', provider_name='Codex'; UPDATE usage_sources SET provider_id='codex'");
+    expect((await dashboard()).records).toEqual([
+      expect.objectContaining({ agentId: "codex", machineId: "a-collector", processedTokens: 25 }),
+    ]);
   });
 
   it("retains historical installation matches after reinstall and rejects ambiguous cloned identities", async () => {
@@ -152,9 +178,7 @@ describe("Amp initial-machine attribution", () => {
     await scan(0, "new-install", ["old-install"]);
     expect((await dashboard()).records[0]).toMatchObject({ machineId: "a-collector", processedTokens: 25 });
     await scan(1, "old-install", ["old-install"]);
-    expect((await dashboard()).records).toEqual([
-      expect.objectContaining({ machineId: "amp-other", processedTokens: 25 }),
-    ]);
+    expect((await dashboard()).records).toEqual([]);
   });
 
   it("does not let a duplicate source erase or override another source's initial identity", async () => {
@@ -163,9 +187,9 @@ describe("Amp initial-machine attribution", () => {
     await scan(1, "origin-install", [null]);
     expect((await dashboard()).records[0]).toMatchObject({ machineId: "a-collector", processedTokens: 25 });
     await scan(1, "origin-install", ["origin-install"]);
-    expect((await dashboard()).records[0]).toMatchObject({ machineId: "amp-other", processedTokens: 25 });
+    expect((await dashboard()).records).toEqual([]);
     await scan(0, "collector-install", ["collector-install"]);
-    expect((await dashboard()).records[0]).toMatchObject({ machineId: "amp-other", processedTokens: 25 });
+    expect((await dashboard()).records).toEqual([]);
     await scan(1, "origin-install", []);
     expect((await dashboard()).records[0]).toMatchObject({ machineId: "a-collector", processedTokens: 25 });
   });
