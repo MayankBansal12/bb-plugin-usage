@@ -18,7 +18,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { jsonAgentCommand, devinCommand, syncGrokLimits } = await import("../dist/server.js");
+const { jsonAgentCommand, devinCommand, kilocodeCommand, syncGrokLimits } = await import("../dist/server.js");
 hooks.deregister();
 
 function temporaryHome(t) {
@@ -68,7 +68,7 @@ test("production JSON commands scan logs and reuse the metadata cache", (t) => {
 
 test("production JSON commands accept absent roots for every JSON agent", (t) => {
   const home = temporaryHome(t);
-  for (const agentId of ["codex", "claude", "copilot", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
+  for (const agentId of ["codex", "claude", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
     const result = scan(run(jsonAgentCommand({
       agentId, roots: [join(home, "absent")], cachePath: join(home, `${agentId}.json`), sinceDay: "2026-09-01",
     }), home));
@@ -141,6 +141,37 @@ test("production Devin command queries a real SQLite fixture", (t) => {
   assert.equal(result.rows[0].cacheWriteTokens, 5);
   assert.equal(result.rows[0].outputTokens, 20);
   assert.doesNotMatch(JSON.stringify(result), /private message/);
+});
+
+test("production Kilo Code command queries its local session database", (t) => {
+  const home = temporaryHome(t);
+  // No database yet: an empty, non-failing scan rather than a sync error.
+  assert.deepEqual(scan(run(kilocodeCommand(home), home)).rows, []);
+  const dbPath = join(home, ".local/share/kilo/kilo.db");
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`CREATE TABLE session (time_created INTEGER, model TEXT, directory TEXT, cost REAL,
+      tokens_input INTEGER, tokens_output INTEGER, tokens_reasoning INTEGER,
+      tokens_cache_read INTEGER, tokens_cache_write INTEGER);`);
+    db.prepare("INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(
+      Date.now(), JSON.stringify({ id: "kilo-auto/free", providerID: "kilo" }), "/work/project",
+      0.42, 1200, 350, 25, 400, 10,
+    );
+  } finally { db.close(); }
+  const result = scan(run(kilocodeCommand(home), home));
+  assert.equal(result.agentId, "kilocode");
+  assert.equal(result.failureCount, 0);
+  assert.equal(result.rows.length, 1);
+  assert.equal(result.rows[0].modelProviderId, "kilo");
+  assert.equal(result.rows[0].model, "kilo-auto/free");
+  assert.equal(result.rows[0].project, "project");
+  // 1200 inclusive input minus the 400 cached reads; reasoning tokens count as output.
+  assert.equal(result.rows[0].uncachedInputTokens, 800);
+  assert.equal(result.rows[0].cachedInputTokens, 400);
+  assert.equal(result.rows[0].cacheWriteTokens, 10);
+  assert.equal(result.rows[0].outputTokens, 375);
+  assert.equal(result.rows[0].loggedCostUsd, 0.42);
 });
 
 test("production Grok command normalizes billing without bundler helpers", async (t) => {

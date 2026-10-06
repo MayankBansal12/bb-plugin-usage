@@ -390,6 +390,86 @@ describe("usage collectors", () => {
     expect(records.find((record) => record.pricingStatus === "logged")?.costUsd).toBe(7);
     expect(records.find((record) => record.pricingStatus !== "logged")?.costUsd).toBeCloseTo(2.5);
   });
+
+  it("parses Kilo Code host aggregates with the kilocode agent and prefers its logged cost", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "kilo",
+      model: "kilo-auto/free",
+      project: "project-a",
+      loggedCostUsd: 0.42,
+      uncachedInputTokens: 500,
+      cachedInputTokens: 500,
+      cacheWriteTokens: 0,
+      outputTokens: 150,
+    }]);
+    const record = parseHostUsageAggregates(content, "kilocode", machine)[0];
+    expect(record).toMatchObject({
+      agentId: "kilocode",
+      agentName: "Kilo Code",
+      modelProviderId: "kilo",
+      model: "kilo-auto/free",
+      project: "project-a",
+      processedTokens: 1150,
+      costUsd: 0.42,
+      loggedCostUsd: 0.42,
+      pricingStatus: "logged",
+    });
+    expect(record!.eventKey).toBe("kilocode:machine-a:2026-08-09:kilo:kilo-auto%2Ffree:project-a:logged");
+  });
+
+  it("falls back to an estimate for Kilo Code rows without a recorded cost", () => {
+    const content = JSON.stringify([{
+      day: "2026-08-09",
+      modelProviderId: "kilo",
+      model: "kilo-auto/free",
+      project: "project-a",
+      loggedCostUsd: null,
+      uncachedInputTokens: 100,
+      cachedInputTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 50,
+    }]);
+    expect(parseHostUsageAggregates(content, "kilocode", machine)[0]).toMatchObject({
+      agentId: "kilocode",
+      agentName: "Kilo Code",
+      loggedCostUsd: null,
+      eventKey: "kilocode:machine-a:2026-08-09:kilo:kilo-auto%2Ffree:project-a:estimate",
+    });
+  });
+
+  it("parses Freebuff host aggregates with the Freebuff agent and its recorded cost", () => {
+    const day = "2026-08-09";
+    const logged = JSON.stringify([{
+      day, modelProviderId: "freebuff", model: "mimo-2.6-flash", project: "project-a",
+      loggedCostUsd: 0.0042, uncachedInputTokens: 1200, cachedInputTokens: 400, cacheWriteTokens: 0, outputTokens: 350,
+    }]);
+    expect(parseHostUsageAggregates(logged, "freebuff", machine)[0]).toMatchObject({
+      agentId: "freebuff",
+      agentName: "Freebuff",
+      modelProviderId: "freebuff",
+      model: "mimo-2.6-flash",
+      project: "project-a",
+      processedTokens: 1950,
+      costUsd: 0.0042,
+      loggedCostUsd: 0.0042,
+      pricingStatus: "logged",
+      eventKey: `freebuff:machine-a:${day}:freebuff:mimo-2.6-flash:project-a:logged`,
+    });
+
+    // freebuff is not on models.dev, so an unpriced, unlogged row stays
+    // unknown rather than borrowing another vendor's rates.
+    const unpriced = JSON.stringify([{
+      day, modelProviderId: "freebuff", model: "mimo-2.6-flash", project: "project-a",
+      loggedCostUsd: null, uncachedInputTokens: 1200, cachedInputTokens: 400, cacheWriteTokens: 0, outputTokens: 350,
+    }]);
+    expect(parseHostUsageAggregates(unpriced, "freebuff", machine)[0]).toMatchObject({
+      costUsd: 0,
+      loggedCostUsd: null,
+      pricingStatus: "unknown",
+      eventKey: `freebuff:machine-a:${day}:freebuff:mimo-2.6-flash:project-a:estimate`,
+    });
+  });
 });
 
 

@@ -15,6 +15,7 @@ import {
   type HostJsonAgentId,
 } from "./lib/host-json-collector";
 import { compressedDevinCollectorScript } from "./lib/devin-sqlite-collector";
+import { compressedKilocodeCollectorScript } from "./lib/kilocode-sqlite-collector";
 import { pricingRevision, pricingVersion } from "./lib/pricing";
 import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
@@ -82,8 +83,10 @@ const AGENTS = [
   { id: "copilot", name: "GitHub Copilot" },
   { id: "dsh", name: "DeepSeek Harness" },
   { id: "devin", name: "Devin" },
+  { id: "freebuff", name: "Freebuff" },
   { id: "fx", name: "FX" },
   { id: "grok", name: "Grok Agent" },
+  { id: "kilocode", name: "Kilo Code" },
   { id: "opencode", name: "OpenCode" },
   { id: "pi", name: "Pi" },
   { id: "prime", name: "Prime Agent" },
@@ -159,6 +162,7 @@ const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
 const JSON_AGENT_SYNC_TIMEOUT_MS = 10 * 60_000;
 const DEVIN_SYNC_TIMEOUT_MS = 60_000;
+const KILOCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_SYNC_TIMEOUT_MS = 60_000;
 const OPENCODE_GO_ABSENCE_ERRORS = new Set(["no-opencode-go-credential", "no-opencode-go-plan"]);
@@ -452,6 +456,7 @@ export function jsonAgentRoots(home: string, agentId: HostJsonAgentId, settings:
   return agentId === "claude" ? [`${home}/.claude/projects`]
     : agentId === "copilot" ? [`${home}/.copilot/session-state`]
     : agentId === "dsh" ? [`${home}/.dsh/sessions`]
+    : agentId === "freebuff" ? [`${home}/.freebuff`]
     : agentId === "fx" ? [`${home}/.fx/usage.jsonl`]
     : agentId === "grok" ? [`${home}/.grok/logs`]
     : agentId === "antigravity" ? [`${home}/.antigravity-acp/usage.jsonl`]
@@ -597,6 +602,70 @@ export async function syncDevin(
       : null;
     upsertState(db, machine.id, agentId, status, recordCount, error, complete);
     bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from Devin sessions.db (${status})`);
+  } catch (error) {
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const message = `Usage scan failed: ${errorMessage(error)}`;
+    upsertState(db, machine.id, agentId, "unavailable", recordCount, message, false);
+    bb.log.warn(`${machine.name}/${agentId}: ${message}`);
+  }
+}
+
+export function kilocodeCommand(home: string) {
+  const script = compressedKilocodeCollectorScript({
+    agentId: "kilocode",
+    dbPaths: [
+      `${home}/.local/share/kilo/kilo.db`,
+      `${home}/Library/Application Support/kilo/kilo.db`,
+    ],
+    sinceDay: historyStartDay(),
+  });
+  return [
+    "if ! command -v node >/dev/null 2>&1",
+    "then printf '%s\\n' '__BB_USAGE_ERROR__:Node.js is required to scan Kilo Code usage.'; exit 127",
+    "fi",
+    `node -e ${shellQuote(script)}`,
+  ].join("; ");
+}
+
+export async function syncKilocode(
+  bb: BbPluginApi,
+  db: Database,
+  machine: Machine,
+  home: string,
+  signal: AbortSignal,
+  executeHostCommand = runHostCommand,
+) {
+  const agentId: AgentId = "kilocode";
+  const generation = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  try {
+    const output = await executeHostCommand(bb, machine, kilocodeCommand(home), signal, {
+      title: "Usage: Kilo Code scan",
+      timeoutMs: KILOCODE_SYNC_TIMEOUT_MS,
+    });
+    const scan = extractHostJsonScan(output);
+    if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
+    const aggregateJson = JSON.stringify(scan.rows);
+    const records = parseHostUsageAggregates(aggregateJson, agentId, {
+      machineId: machine.id,
+      machineName: machine.name,
+    });
+    const sourceId = opaqueId(machine.id, agentId, "kilocode-sqlite-v1");
+    upsertSourceEvents(db, {
+      id: sourceId,
+      rootReference: opaqueId("kilo-local-db"),
+      sha256: createHash("sha256").update(aggregateJson).digest("hex"),
+      generation,
+    }, machine, agentId, records);
+    reconcileSources(db, machine.id, agentId, generation);
+
+    const complete = scan.failureCount === 0;
+    const recordCount = countForMachine(db, machine.id, agentId);
+    const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
+    const error = scan.failureCount > 0
+      ? `${scan.failureCount} source problem${scan.failureCount === 1 ? "" : "s"} prevented a complete scan${scan.error ? `: ${scan.error}` : "."}`
+      : null;
+    upsertState(db, machine.id, agentId, status, recordCount, error, complete);
+    bb.log.info(`${machine.name}/${agentId}: ${recordCount} records from Kilo Code's local session database (${status})`);
   } catch (error) {
     const recordCount = countForMachine(db, machine.id, agentId);
     const message = `Usage scan failed: ${errorMessage(error)}`;
@@ -1045,6 +1114,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "claude", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "copilot", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "dsh", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncJsonAgent(bb, db, machine, home, "freebuff", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "fx", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "grok", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "pi", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
@@ -1052,6 +1122,7 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "antigravity", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncJsonAgent(bb, db, machine, home, "thaura", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncDevin(bb, db, machine, home, timeoutSignal(DEVIN_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncKilocode(bb, db, machine, home, timeoutSignal(KILOCODE_SYNC_TIMEOUT_MS, serviceSignal)),
           syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
           syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
           syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),

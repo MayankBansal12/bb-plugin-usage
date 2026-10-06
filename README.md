@@ -6,7 +6,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Features
 
-- Collect usage from Codex, Claude Code, GitHub Copilot, DeepSeek Harness, Devin, FX, Grok Agent, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
+- Collect usage from Codex, Claude Code, GitHub Copilot, DeepSeek Harness, Devin, Freebuff, FX, Grok Agent, Kilo Code, OpenCode, Pi, Prime Agent, Antigravity, and Thaura.
 - Separate the coding agent from the underlying model provider.
 - Group charts and usage shares by agent or model provider.
 - Switch the chart and provider shares between cost and tokens.
@@ -25,6 +25,8 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - DeepSeek Harness: `~/.dsh/sessions/*/*/session.v3.jsonl.zstd` (Zstandard-compressed JSONL; requires Node.js 22.15+ on the machine)
 - Devin: `~/.local/share/devin/cli/sessions.db` — the Devin CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` is honored). Devin runs in BB through the `acp-devin` provider and writes no JSONL session logs.
+- Freebuff: `~/.freebuff/usage.jsonl`, written by the `bb-freebuff` provider bridge, one line per turn it settles through the local freebuff CLI (the CLI keeps no parseable session ledger of its own, so the bridge is the source of truth)
+- Kilo Code: `~/.local/share/kilo/kilo.db` — the Kilo CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` and `APPDATA` are honored). Kilo Code runs in BB through the `kilocode` provider. Its database is the only Kilo Code source: `~/.kilocode/usage.jsonl` is deliberately not scanned, so a bridge-written log cannot double-count turns the database already reports
 - FX: `~/.fx/usage.jsonl`
 - Grok Agent: `~/.grok/logs/unified.jsonl`
 - Pi: `~/.pi/agent/sessions/**/*.jsonl`, plus optional extra roots in plugin settings
@@ -40,6 +42,10 @@ JSON-log collection requires Node.js on each enrolled machine. Logs are streamed
 For a custom `CODEX_HOME` outside the default locations, add the home directory to **Extra Codex homes** (`codexHomes`) in the plugin settings. Separate paths with semicolons or newlines; `~` expands to each enrolled machine's home. Both active and archived sessions are scanned, and these extra homes report under Codex. Copies of the same session within an account are counted once. The first sync after upgrading reparses Codex logs to populate session identities in the metadata cache; later syncs reuse unchanged files.
 
 Devin collection requires Node.js 22.13 or newer (for `node:sqlite`) on each enrolled machine. The session database is queried read-only and reduced to per-day token aggregates on the host; only usage metadata fields are extracted, so prompts and message content never leave the machine. A missing database reports as no data, while a database that exists but cannot be read (for example under an older Node.js) surfaces as a sync error for the Devin source only. Devin records ACU totals rather than per-request USD, so its usage shows token counts with unknown cost.
+
+Kilo Code collection has the same Node.js 22.13+ requirement and the same read-only, metadata-only contract: session rows are reduced to per-day token aggregates on the host, and a missing database reports as no data rather than an error. Kilo Code preserves its recorded cost when one is logged and otherwise estimates from models.dev token rates; models without recorded costs or catalog rates remain unknown.
+
+Freebuff history follows the generation ledger that the `bb-freebuff` provider bridge appends to `~/.freebuff/usage.jsonl`, one line per settled turn. The plugin reads usage facts only; Freebuff transcripts and message history are never scanned. Positive recorded costs win over models.dev estimates, and models without recorded costs or catalog rates remain unknown.
 
 FX history follows the rolling retention of FX's local usage ledger. The plugin reads generation usage facts only; FX sessions and prompts are not scanned.
 

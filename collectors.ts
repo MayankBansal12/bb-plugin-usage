@@ -3,7 +3,7 @@ import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/p
 // `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
 // lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
 // in grouping and filters instead of merging into "codex".
-export type AgentId = "codex" | "claude" | "copilot" | "dsh" | "devin" | "fx" | "grok" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
+export type AgentId = "codex" | "claude" | "copilot" | "dsh" | "devin" | "freebuff" | "fx" | "grok" | "kilocode" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
 
 export type UsageRecord = {
   eventKey: string;
@@ -165,7 +165,7 @@ export function repriceUsageRecord(record: UsageRecord): UsageRecord {
   return usageRecord({
     ...record,
     costMode: record.agentId === "fx" ? "logged-only"
-      : ["opencode", "pi", "prime", "thaura"].includes(record.agentId) ? "logged-or-estimate"
+      : ["freebuff", "kilocode", "opencode", "pi", "prime", "thaura"].includes(record.agentId) ? "logged-or-estimate"
       : "estimate-or-logged",
   }, record);
 }
@@ -335,6 +335,8 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     : agentId === "prime" ? "Prime Agent"
     : agentId === "antigravity" ? "Antigravity"
     : agentId === "thaura" ? "Thaura"
+    : agentId === "freebuff" ? "Freebuff"
+    : agentId === "kilocode" ? "Kilo Code"
     : "Pi";
 
   return values.flatMap((raw) => {
@@ -353,7 +355,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const scopedAgentId: AgentId = account ? `codex-${account}` : agentId;
     const scopedAgentName = account ? `Codex (${account})` : agentName;
     return [usageRecord({
-      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${agentId === "pi" || agentId === "prime" || agentId === "thaura" ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
+      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${["freebuff", "kilocode", "pi", "prime", "thaura"].includes(agentId) ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
       agentId: scopedAgentId,
@@ -363,7 +365,7 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       project,
       loggedCostUsd: finite(row.loggedCostUsd),
       costMode: agentId === "fx" ? "logged-only"
-        : agentId === "prime" || agentId === "pi" || agentId === "thaura" ? "logged-or-estimate"
+        : ["freebuff", "kilocode", "pi", "prime", "thaura"].includes(agentId) ? "logged-or-estimate"
         : undefined,
       uncachedInputTokens: count(row.uncachedInputTokens),
       cachedInputTokens: count(row.cachedInputTokens),
