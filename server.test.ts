@@ -15,7 +15,7 @@ vi.mock("@bb/plugin-sdk", () => ({
 
 import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncOpenCode, syncOpenCodeGo,
+  kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getSourceIssueMessage } from "./lib/usage-view-state";
@@ -90,6 +90,11 @@ describe("JSON agent roots", () => {
   it("points Copilot at its session state root", () => {
     expect(jsonAgentRoots("/home/user", "copilot", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.copilot/session-state",
+    ]);
+  });
+  it("points Freebuff at the bridge's own usage log directory", () => {
+    expect(jsonAgentRoots("/home/user", "freebuff", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
+      "/home/user/.freebuff",
     ]);
   });
   it("includes active and archived Codex sessions", () => {
@@ -187,7 +192,7 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it.each(["antigravity", "copilot"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
+  it.each(["antigravity", "copilot", "freebuff", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
     // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
@@ -1236,7 +1241,7 @@ describe("OpenCode query", () => {
   });
 });
 
-describe("Devin collector sync", () => {
+describe("SQLite collector sync (Devin, Kilo Code)", () => {
   function usageDb() {
     const db = new Database(":memory:");
     db.exec(`
@@ -1431,6 +1436,72 @@ describe("Devin collector sync", () => {
     expect(db.prepare(
       "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'devin'",
     ).get()).toEqual({ status: "ready", recordCount: 1 });
+    db.close();
+  });
+
+  it("targets the Kilo Code session database through a node collector", () => {
+    const command = kilocodeCommand("/home/user");
+    expect(command).toContain("command -v node");
+    expect(command).toContain("node -e");
+    const input = decodeCollectorInput(command);
+    expect(input).toMatchObject({
+      agentId: "kilocode",
+      dbPaths: [
+        "/home/user/.local/share/kilo/kilo.db",
+        "/home/user/Library/Application Support/kilo/kilo.db",
+      ],
+    });
+  });
+
+  it("stores scanned Kilo Code aggregates and reports ready", async () => {
+    const db = usageDb();
+    const bb = { log: { info: vi.fn(), warn: vi.fn() } } as unknown as BbPluginApi;
+    const output = fakeHostScanOutput("kilocode", [{
+      day: new Date().toISOString().slice(0, 10),
+      modelProviderId: "kilo",
+      model: "kilo-auto/free",
+      project: "project-a",
+      loggedCostUsd: 0.42,
+      uncachedInputTokens: 800,
+      cachedInputTokens: 400,
+      cacheWriteTokens: 10,
+      outputTokens: 375,
+    }]);
+
+    await syncKilocode(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => output,
+    );
+
+    const event = db.prepare("SELECT provider_id, provider_name, model, project, processed_tokens, pricing_status, logged_cost_usd FROM usage_events").get();
+    expect(event).toEqual({
+      provider_id: "kilocode", provider_name: "Kilo Code", model: "kilo-auto/free",
+      project: "project-a", processed_tokens: 1585, pricing_status: "logged", logged_cost_usd: 0.42,
+    });
+    expect(db.prepare("SELECT status, record_count recordCount FROM usage_sync_state").get())
+      .toEqual({ status: "ready", recordCount: 1 });
+    db.close();
+  });
+
+  it("reports no-data when the host has no Kilo Code session database", async () => {
+    const db = usageDb();
+    const bb = { log: { info: vi.fn(), warn: vi.fn() } } as unknown as BbPluginApi;
+
+    await syncKilocode(
+      bb,
+      db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
+      { id: "host-1", name: "Machine" },
+      "/home/user",
+      new AbortController().signal,
+      async () => fakeHostScanOutput("kilocode", []),
+    );
+
+    expect(db.prepare("SELECT status, record_count recordCount, error FROM usage_sync_state").get())
+      .toEqual({ status: "no-data", recordCount: 0, error: null });
     db.close();
   });
 });

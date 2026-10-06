@@ -18,7 +18,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { jsonAgentCommand, devinCommand, syncGrokLimits } = await import("../dist/server.js");
+const { jsonAgentCommand, devinCommand, kilocodeCommand, syncGrokLimits } = await import("../dist/server.js");
 hooks.deregister();
 
 function temporaryHome(t) {
@@ -68,7 +68,7 @@ test("production JSON commands scan logs and reuse the metadata cache", (t) => {
 
 test("production JSON commands accept absent roots for every JSON agent", (t) => {
   const home = temporaryHome(t);
-  for (const agentId of ["codex", "claude", "copilot", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
+  for (const agentId of ["codex", "claude", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
     const result = scan(run(jsonAgentCommand({
       agentId, roots: [join(home, "absent")], cachePath: join(home, `${agentId}.json`), sinceDay: "2026-09-01",
     }), home));
@@ -141,6 +141,55 @@ test("production Devin command queries a real SQLite fixture", (t) => {
   assert.equal(result.rows[0].cacheWriteTokens, 5);
   assert.equal(result.rows[0].outputTokens, 20);
   assert.doesNotMatch(JSON.stringify(result), /private message/);
+});
+
+test("production Kilo Code command queries its local session database", (t) => {
+  const home = temporaryHome(t);
+  // No database yet: an empty, non-failing scan rather than a sync error.
+  assert.deepEqual(scan(run(kilocodeCommand(home), home)).rows, []);
+  const dbPath = join(home, ".local/share/kilo/kilo.db");
+  mkdirSync(dirname(dbPath), { recursive: true });
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.exec(`CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, model TEXT, cost REAL,
+      tokens_input INTEGER, tokens_output INTEGER, time_created INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT, type TEXT, time_created INTEGER, data TEXT);`);
+    const now = Date.now();
+    // Lifetime counters and the current session model are derived/mutable;
+    // only the persisted steps are usage.
+    db.prepare("INSERT INTO session VALUES (?, ?, ?, ?, ?, ?, ?)").run(
+      "ses", "/work/project", JSON.stringify({ id: "later-model", providerID: "kilo" }), 99, 99999, 99999, now - 90 * 86_400_000,
+    );
+    db.prepare("INSERT INTO message VALUES (?, ?, ?, ?)").run("msg", "ses", now, JSON.stringify({
+      role: "assistant", modelID: "kilo-auto/free", providerID: "kilo", cost: 99, time: { created: now },
+    }));
+    const step = (id, cost, input, output, reasoning, read, write) => db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run(
+      id, "msg", "ses", now, JSON.stringify({ type: "step-finish", reason: "stop", time: { start: now - 1, end: now, elapsed: 1 },
+        cost, tokens: { input, output, reasoning, cache: { read, write } } }),
+    );
+    step("prt-1", 0.42, 800, 350, 25, 400, 10);
+    step("prt-2", 0, 100, 5, 0, 0, 0);
+    db.prepare("INSERT INTO part VALUES (?, ?, ?, ?, ?)").run("prt-3", "msg", "ses", now, JSON.stringify({ type: "text", text: "private message" }));
+    db.prepare("INSERT INTO session_message VALUES (?, ?, ?, ?, ?)").run("v2", "ses", "assistant", now, JSON.stringify({
+      model: { id: "v2-model", providerID: "kilo" }, time: { created: now, completed: now }, cost: 0,
+      tokens: { input: 30, output: 3, reasoning: 0, cache: { read: 0, write: 0 } },
+    }));
+  } finally { db.close(); }
+  const result = scan(run(kilocodeCommand(home), home));
+  assert.equal(result.agentId, "kilocode");
+  assert.equal(result.failureCount, 0);
+  assert.doesNotMatch(JSON.stringify(result), /private message/);
+  const rows = result.rows.map(({ model, project, loggedCostUsd, uncachedInputTokens, cachedInputTokens, cacheWriteTokens, outputTokens }) =>
+    [model, project, loggedCostUsd, uncachedInputTokens, cachedInputTokens, cacheWriteTokens, outputTokens]);
+  // Kilo's step input is already uncached and reasoning counts as output; the
+  // priced and unpriced steps stay in separate buckets.
+  assert.deepEqual(rows, [
+    ["kilo-auto/free", "project", null, 100, 0, 0, 5],
+    ["kilo-auto/free", "project", 0.42, 800, 400, 10, 375],
+    ["v2-model", "project", null, 30, 0, 0, 3],
+  ]);
 });
 
 test("production Grok command normalizes billing without bundler helpers", async (t) => {
