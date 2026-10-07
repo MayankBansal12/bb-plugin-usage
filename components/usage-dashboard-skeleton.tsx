@@ -71,31 +71,13 @@ function ChartSkeleton({ compactView }: { compactView: boolean }) {
         className="absolute inset-x-0 bottom-0 h-[72%] w-full"
         aria-hidden="true"
       >
-        <defs>
-          <linearGradient id="skeleton-area" x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="var(--muted-foreground)" stopOpacity="0.16" />
-            <stop offset="100%" stopColor="var(--muted-foreground)" stopOpacity="0" />
-          </linearGradient>
-        </defs>
-        <path
-          d="M0 110 C28 98, 54 112, 82 90 C108 70, 132 42, 168 38 C202 34, 228 48, 260 62 C292 76, 318 92, 350 104 L350 160 L0 160 Z"
-          fill="url(#skeleton-area)"
-        />
-        <path
-          d="M0 110 C28 98, 54 112, 82 90 C108 70, 132 42, 168 38 C202 34, 228 48, 260 62 C292 76, 318 92, 350 104"
-          fill="none"
-          stroke="var(--muted-foreground)" strokeOpacity="0.35"
-          strokeWidth="1.8"
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-        <path
-          d="M0 138 C60 136, 140 132, 210 134 C280 136, 330 138, 400 139"
-          fill="none"
-          stroke="var(--muted-foreground)" strokeOpacity="0.22"
-          strokeWidth="1.4"
-          strokeLinecap="round"
-        />
+        {[64, 96, 78, 144, 112, 128, 88].map((height, index) => (
+          <g key={index} fill="var(--muted-foreground)">
+            <rect x={index * 57 + 7} y={160 - height * 0.5} width="43" height={height * 0.5} fillOpacity="0.22" />
+            <rect x={index * 57 + 7} y={160 - height * 0.8} width="43" height={height * 0.3} fillOpacity="0.16" />
+            <rect x={index * 57 + 7} y={160 - height} width="43" height={height * 0.2} fillOpacity="0.1" />
+          </g>
+        ))}
       </svg>
     </div>
   );
