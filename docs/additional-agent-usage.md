@@ -79,6 +79,23 @@ cache a second time. Counters are not present on all Cursor builds: the public
 guarantee them. Older builds produce no ledger entries. Missing counters never
 become zero-cost fabricated usage, and context-only events are ignored.
 
+Cursor SDK ledgers use version 2 with `source: "cursor-sdk"`: SDK input includes
+cache reads and writes, so the writer subtracts both before recording the
+uncached `input_tokens` bucket and retains `sdk_input_tokens` for auditing.
+Version 2 corrections with the same event ID override legacy version 1 records,
+even across files and cached scans. Native CLI hook records remain version 1
+and are not subject to this SDK-specific subtraction.
+
+Already-synced database buckets need a separate offline repair: normal sync
+retains maximum counters so missing logs cannot erase history. The exported
+`repairCursorSdkBuckets` server helper accepts audited before/after buckets for
+one Cursor source, verifies exact stored counters, updates transactionally and
+reprices them. Repeating an applied repair is a no-op; drift aborts the repair.
+Only use it after proving the complete historical event population from SDK
+records, backing up the database and ledger, and draining old writers/sync.
+Retain the matching v2 ledger corrections to prevent old v1 rows from inflating
+the database again. Do not use a smaller successful scan as repair evidence.
+
 Only a hashed response identity, collection timestamp, model, project basename,
 and token buckets are saved. Prompts, response text, full paths and credentials
 are discarded. Input is bounded, failures do not block a turn, and repeated

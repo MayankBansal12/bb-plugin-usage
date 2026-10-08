@@ -91,3 +91,23 @@ it("collects Cursor metadata ledgers without adding cache twice or inferring tok
   expect(parseHostUsageAggregates(JSON.stringify(result.rows), "cursor", { machineId: "m", machineName: "M" })[0])
     .toMatchObject({ agentId: "cursor", agentName: "Cursor Agent", processedTokens: 118 });
 });
+
+it.each(["a-correction.jsonl", "z-correction.jsonl"])("prefers SDK corrections over legacy rows across cached files: %s", async (correctionFile) => {
+  const root = await setup();
+  const legacy = { version: 1, kind: "cursor-response", eventId: "sdk-event", timestamp: "2026-08-10T12:00:00Z",
+    model: "claude-opus-5-5", project: "project", input_tokens: 49, cache_read_tokens: 31, cache_write_tokens: 11, output_tokens: 3 };
+  const hook = { ...legacy, eventId: "native-hook", input_tokens: 20, cache_read_tokens: 60, cache_write_tokens: 10, output_tokens: 5 };
+  await writeFile(join(root, "m-original.jsonl"), [legacy, hook].map((v) => JSON.stringify(v)).join("\n"));
+  expect((await scan("cursor", root)).rows[0].uncachedInputTokens).toBe(69);
+  const corrected = { ...legacy, version: 2, source: "cursor-sdk", sdk_input_tokens: 49, input_tokens: 7 };
+  await writeFile(join(root, correctionFile), [corrected, legacy, corrected,
+    { ...corrected, eventId: "unsupported", source: "unknown", input_tokens: 999 },
+  ].map((v) => JSON.stringify(v)).join("\n"));
+  const result = await scan("cursor", root);
+  expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 27, cachedInputTokens: 91, cacheWriteTokens: 21, outputTokens: 8 })]);
+  const cached = await scan("cursor", root);
+  expect(cached.reusedFileCount).toBe(2);
+  expect(cached.rows).toEqual(result.rows);
+  expect(parseHostUsageAggregates(JSON.stringify(result.rows), "cursor", { machineId: "m", machineName: "M" })[0])
+    .toMatchObject({ processedTokens: 147 });
+});
