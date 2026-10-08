@@ -380,6 +380,47 @@ function upsertState(db: Database, machineId: string, agentId: AgentId, status: 
     .run(machineId, agentId, status, now, successful ? now : null, recordCount, error);
 }
 
+// Offline repair only: callers must establish the complete historical event
+// population from SDK evidence and keep v2 corrections available on the host.
+// A successful scan alone is not proof that a retained bucket can be reduced.
+export function repairCursorSdkBuckets(db: Database, sourceId: string, pairs: Array<{ before: UsageRecord; after: UsageRecord }>) {
+  const source = db.prepare("SELECT machine_id machineId, provider_id agentId FROM usage_sources WHERE source_id=?")
+    .get(sourceId) as { machineId: string; agentId: string } | undefined;
+  if (source?.agentId !== "cursor") throw new Error("Repair requires a Cursor source.");
+  activateCachedCatalog(db);
+  const select = db.prepare(`SELECT uncached_input_tokens input, cached_input_tokens cached,
+    cache_write_tokens writes, output_tokens output, processed_tokens total FROM usage_events
+    WHERE event_key=? AND provider_id='cursor' AND EXISTS
+      (SELECT 1 FROM usage_event_sources WHERE event_key=usage_events.event_key AND source_id=?)`);
+  const update = db.prepare(`UPDATE usage_events SET uncached_input_tokens=?, processed_tokens=?,
+    cost_usd=?, cache_savings_usd=?, pricing_status=? WHERE event_key=?`);
+  return db.transaction(() => {
+    let repaired = 0;
+    for (const { before, after } of pairs) {
+      if (before.agentId !== "cursor" || after.agentId !== "cursor"
+        || before.machineId !== source.machineId || after.machineId !== source.machineId
+        || before.eventKey !== after.eventKey || before.day !== after.day
+        || before.model !== after.model || before.modelProviderId !== after.modelProviderId
+        || before.project !== after.project || before.loggedCostUsd !== after.loggedCostUsd
+        || after.uncachedInputTokens >= before.uncachedInputTokens
+        || before.cachedInputTokens !== after.cachedInputTokens
+        || before.cacheWriteTokens !== after.cacheWriteTokens || before.outputTokens !== after.outputTokens) {
+        throw new Error("Invalid Cursor SDK repair pair.");
+      }
+      const tuple = (row: UsageRecord) => ({ input: row.uncachedInputTokens, cached: row.cachedInputTokens,
+        writes: row.cacheWriteTokens, output: row.outputTokens, total: row.processedTokens });
+      const current = select.get(before.eventKey, sourceId);
+      if (JSON.stringify(current) === JSON.stringify(tuple(after))) continue;
+      if (JSON.stringify(current) !== JSON.stringify(tuple(before))) throw new Error("Cursor bucket changed; repair aborted.");
+      const priced = repriceUsageRecord(after);
+      update.run(priced.uncachedInputTokens, priced.processedTokens, priced.costUsd,
+        priced.cacheSavingsUsd, priced.pricingStatus, priced.eventKey);
+      repaired++;
+    }
+    return repaired;
+  })();
+}
+
 function upsertSourceEvents(db: Database, source: { id: string; rootReference: string; sha256: string; generation: string }, machine: Machine, agentId: AgentId, records: UsageRecord[]) {
   const insertEvent = db.prepare(`INSERT INTO usage_events (
       event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,

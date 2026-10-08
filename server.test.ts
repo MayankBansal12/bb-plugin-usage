@@ -15,9 +15,9 @@ vi.mock("@bb/plugin-sdk", () => ({
 
 import plugin, {
   rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
-  kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
+  kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, repairCursorSdkBuckets, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
-import { codexHomeTag } from "./collectors";
+import { codexHomeTag, parseHostUsageAggregates } from "./collectors";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getSourceIssueMessage } from "./lib/usage-view-state";
 
@@ -1925,6 +1925,43 @@ describe("retained usage through the real sync path", () => {
   afterEach(() => resetPricingCatalog());
   const totals = (db: Database) => db.prepare(`SELECT COUNT(*) count, SUM(processed_tokens) tokens,
     SUM(cost_usd) cost FROM usage_events`).get();
+
+  it("repairs verified Cursor history transactionally without weakening sync retention", async () => {
+    setPricingCatalog(catalog(1000), "cursor-repair-v1");
+    // SDK 49 includes 31 read + 11 write; a native hook contributes 20 uncached.
+    const old = piRow({ uncachedInputTokens: 69, cachedInputTokens: 91, cacheWriteTokens: 21, outputTokens: 8 });
+    const corrected = { ...old, uncachedInputTokens: 27 };
+    const state = { rows: [old, piRow({ project: "native-only" })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state, "cursor");
+    const records = (rows: Array<Record<string, unknown>>) => parseHostUsageAggregates(JSON.stringify(rows), "cursor", { machineId: "host-1", machineName: "Machine" });
+    const pair = { before: records([old])[0]!, after: records([corrected])[0]! };
+    const source = db.prepare("SELECT source_id id FROM usage_sources WHERE provider_id='cursor'").get() as { id: string };
+    const mappings = db.prepare("SELECT * FROM usage_event_sources ORDER BY event_key").all();
+    try {
+      state.rows = [corrected];
+      await syncAgain();
+      // The ordinary MAX merge cannot lower the old input: repair is explicit.
+      expect(totals(db)).toEqual({ count: 2, tokens: 1689, cost: 1.577 });
+      const missing = { before: { ...pair.before, eventKey: "missing" }, after: { ...pair.after, eventKey: "missing" } };
+      expect(() => repairCursorSdkBuckets(db, source.id, [pair, missing])).toThrow("changed");
+      expect(totals(db)).toEqual({ count: 2, tokens: 1689, cost: 1.577 });
+      expect(() => repairCursorSdkBuckets(db, source.id, [{ before: pair.before, after: { ...pair.after, machineId: "other" } }])).toThrow("Invalid");
+      expect(repairCursorSdkBuckets(db, source.id, [pair])).toBe(1);
+      expect(repairCursorSdkBuckets(db, source.id, [pair])).toBe(0);
+      expect(totals(db)).toEqual({ count: 2, tokens: 1647, cost: 1.535 });
+      expect(db.prepare("SELECT * FROM usage_event_sources ORDER BY event_key").all()).toEqual(mappings);
+      await syncAgain();
+      state.rows = [piRow({ uncachedInputTokens: 10, cachedInputTokens: 150, outputTokens: 1 })];
+      await syncAgain();
+      expect(db.prepare("SELECT uncached_input_tokens input FROM usage_events WHERE project='proj'").get()).toEqual({ input: 27 });
+      expect(() => repairCursorSdkBuckets(db, source.id, [pair])).toThrow("changed");
+      const retained = totals(db);
+      state.rows = [];
+      state.failureCount = 1;
+      await syncAgain();
+      expect(totals(db)).toEqual(retained);
+    } finally { db.close(); }
+  });
 
   it("preserves the existing Codex source and missing history as archive and custom roots are added", async () => {
     setPricingCatalog(catalog(1000), "codex-archive-v1");

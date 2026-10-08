@@ -98,9 +98,10 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // can rebuild their dedup key when a configured account label changes.
   // v9 (codex): rows carry the owning home so a label rename rewrites exactly
   // that home's retained buckets instead of every row sharing the label.
+  // v10 (cursor): accept corrected SDK v2 rows and retain their precedence in caches.
   // Keep unrelated agent caches at their existing versions.
-  const cacheVersion = input.agentId === "codex" ? 9 : input.agentId === "copilot" ? 7
-    : input.agentId === "dsh" ? 6 : 5;
+  const cacheVersion = input.agentId === "cursor" ? 10 : input.agentId === "codex" ? 9
+    : input.agentId === "copilot" ? 7 : input.agentId === "dsh" ? 6 : 5;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "cursor", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -119,7 +120,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     })
     : [];
 
-  type CachedUsageRow = HostUsageAggregate & { eventKey?: string; eventIdentity?: string };
+  type CachedUsageRow = HostUsageAggregate & { eventKey?: string; eventIdentity?: string; cursorVersion?: number };
   type CacheEntry = { signature: string; rows: CachedUsageRow[] };
   type Cache = { version: number; agentId: HostJsonAgentId; files: Record<string, CacheEntry> };
   const failures: string[] = [];
@@ -186,6 +187,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       && finite(row.outputTokens) !== null
       && (row.eventKey === undefined || typeof row.eventKey === "string")
       && (row.eventIdentity === undefined || typeof row.eventIdentity === "string")
+      && (row.cursorVersion === undefined || row.cursorVersion === 1 || row.cursorVersion === 2)
       && (row.homeTag === undefined || typeof row.homeTag === "string"));
   }
 
@@ -233,6 +235,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     const prior = target.get(raw.eventKey);
     if (!prior) {
       target.set(raw.eventKey, { ...raw });
+      return;
+    }
+    // SDK v2 rows correct legacy inclusive input counters. Maxima would keep
+    // the wrong v1 input; choose the newer format before merging equal versions.
+    if (input.agentId === "cursor" && (prior.cursorVersion ?? 1) !== (raw.cursorVersion ?? 1)) {
+      if ((raw.cursorVersion ?? 1) > (prior.cursorVersion ?? 1)) target.set(raw.eventKey, { ...raw });
       return;
     }
     // Some agents repeat the same final counters on every content-block
@@ -481,7 +489,8 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       if (input.agentId === "codebuddy" || input.agentId === "cursor") {
         const buddy = input.agentId === "codebuddy";
         if (buddy ? !["assistant", "message", "function_call"].includes(String(value.type)) || value.role === "user"
-          : value.kind !== "cursor-response" || value.version !== 1) continue;
+          : value.kind !== "cursor-response"
+            || !(value.version === 1 || (value.version === 2 && value.source === "cursor-sdk"))) continue;
         const provider = object(value.providerData);
         const usage = buddy ? object(object(value.message)?.usage) : value;
         const usageDay = day(value.timestamp);
@@ -503,6 +512,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         if (typeof value.cwd === "string") sessionProject = projectName(value.cwd);
         mergeEvent(events, {
           eventKey: crypto.createHash("sha256").update(`${input.agentId}:${identity}`).digest("hex"),
+          cursorVersion: buddy ? undefined : Number(value.version),
           day: usageDay, modelProviderId: input.agentId,
           model: text(buddy ? provider?.model ?? object(value.message)?.model : value.model, "unknown"),
           project: buddy ? sessionProject : projectName(value.project), loggedCostUsd: null,
