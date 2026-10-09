@@ -499,12 +499,6 @@ function UsageChart({
         onPointerLeave={() => setHoverIndex(null)}
       >
         <defs>
-          {providers.map((provider) => (
-            <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
-              <stop offset="0%" stopColor={providerColor(provider.id)} stopOpacity="0.16" />
-              <stop offset="100%" stopColor={providerColor(provider.id)} stopOpacity="0" />
-            </linearGradient>
-          ))}
           <clipPath id="usage-chart-clip">
             <rect x={inset.left} y={inset.top} width={chartWidth} height={chartHeight} />
           </clipPath>
@@ -537,10 +531,21 @@ function UsageChart({
             const upperLine = smoothPath(upperPoints, inset.top, inset.top + chartHeight);
             const lowerLine = smoothPath(lowerPoints, inset.top, inset.top + chartHeight).replace(/^M/, "L");
             const area = `${upperLine} ${lowerLine} Z`;
-            return (
-              <path key={item.id} d={area} fill={`url(#usage-area-${item.id})`} />
-            );
+            return <path key={item.id} d={area} fill={providerColor(item.id)} fillOpacity="0.26" />;
           })}
+          {/* Hairline gaps keep collapsed bands' boundaries readable without becoming per-series lines. */}
+          {stackedSeries.map((item) => (
+            <path
+              key={item.id}
+              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
+              fill="none"
+              stroke="var(--background)"
+              strokeWidth="1"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
           <path
             d={smoothPath(dailyTotals.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
             fill="none"
@@ -550,19 +555,6 @@ function UsageChart({
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           />
-          {/* Paint lower boundaries last so a zero-height layer cannot cover them. */}
-          {[...stackedSeries].reverse().map((item) => (
-            <path
-              key={item.id}
-              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
-              fill="none"
-              stroke={providerColor(item.id)}
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          ))}
         </g>
 
         {hoverIndex !== null && (
@@ -576,17 +568,20 @@ function UsageChart({
               strokeWidth="1"
               vectorEffect="non-scaling-stroke"
             />
-            {stackedSeries.filter((item) => item.values[hoverIndex] > 0).map((item) => (
-              <circle
+            {stackedSeries.flatMap((item) => {
+              const value = item.values[hoverIndex];
+              if (value <= 0) return [];
+              const midpoint = (item.lowerValues[hoverIndex] + item.upperValues[hoverIndex]) / 2;
+              return <circle
                 key={item.id}
                 cx={x(hoverIndex)}
-                cy={y(item.upperValues[hoverIndex])}
+                cy={y(midpoint)}
                 r="3.5"
                 fill={providerColor(item.id)}
                 stroke="var(--background)"
                 strokeWidth="1.5"
-              />
-            ))}
+              />;
+            })}
           </g>
         )}
 
