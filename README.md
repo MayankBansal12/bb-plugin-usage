@@ -65,6 +65,15 @@ Missing log roots are treated as normal “no data” results. Offline machines,
 
 ## Install
 
+Cursor subscription limits can also come from BB's `acp-cursor-sdk` provider.
+For a custom Cursor SDK adapter that shares the native Cursor account, set
+`"dialect": "cursor"` and `"providerUsage": true` on its existing `customAgents`
+entry. BB then reads the native Cursor CLI credentials and dashboard endpoints;
+the adapter does not need a quota extension. SDK login credentials are separate,
+so this reports the account signed in through the native Cursor CLI. Native
+Cursor may stay disabled. Usage shows one Cursor card when both providers are
+enabled and allows up to 20 seconds for the machine's subscription query.
+
 Requires BB 0.36 or newer.
 
 ```sh
