@@ -92,11 +92,6 @@ describe("JSON agent roots", () => {
       "/home/user/.copilot/session-state",
     ]);
   });
-  it("points Freebuff at the bridge's own usage log directory", () => {
-    expect(jsonAgentRoots("/home/user", "freebuff", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
-      "/home/user/.freebuff",
-    ]);
-  });
   it("includes active and archived Codex sessions", () => {
     expect(jsonAgentRoots("/home/user", "codex", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.codex/sessions",
@@ -192,7 +187,7 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it.each(["antigravity", "copilot", "freebuff", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
+  it.each(["antigravity", "copilot", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
     // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
