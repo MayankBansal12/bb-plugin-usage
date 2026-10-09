@@ -55,7 +55,7 @@ afterEach(async () => {
 
 describe("host JSON usage collector", () => {
   it.each([
-    ["codex", "rollout-cached.jsonl", 6], ["claude", "session.jsonl", 5],
+    ["codex", "rollout-cached.jsonl", 9], ["claude", "session.jsonl", 5],
     ["dsh", "session.v3.jsonl.zstd", 6], ["fx", "usage.jsonl", 5],
     ["grok", "unified.jsonl", 5], ["pi", "session.jsonl", 5],
     ["prime", "session.jsonl", 5], ["antigravity", "usage.jsonl", 5],
