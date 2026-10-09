@@ -57,7 +57,7 @@ const aggregateSchema = z.object({
   outputTokens: z.number().int().nonnegative(),
 });
 const scanResultSchema = z.object({
-  agentId: z.enum(["codex", "claude", "copilot", "dsh", "devin", "freebuff", "fx", "grok", "kilocode", "pi", "prime", "antigravity", "thaura"]),
+  agentId: z.enum(["codex", "claude", "codebuddy", "cursor", "copilot", "dsh", "devin", "freebuff", "fx", "grok", "kilocode", "pi", "prime", "antigravity", "thaura"]),
   fileCount: z.number().int().nonnegative(),
   changedFileCount: z.number().int().nonnegative(),
   reusedFileCount: z.number().int().nonnegative(),
@@ -90,7 +90,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // force users without Copilot to reparse unrelated session logs.
   const cacheVersion = input.agentId === "copilot" ? 7
     : input.agentId === "dsh" || input.agentId === "codex" ? 6 : 5;
-  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
+  const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "codebuddy", "cursor", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
   // Extra per-account homes (e.g. Codex profiles). Only the codex parser knows
@@ -204,7 +204,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
       target.set(raw.eventKey, { ...raw });
       return;
     }
-    // Claude currently repeats the same final counters on every content-block
+    // Some agents repeat the same final counters on every content-block
     // row. Maxima also handle a partially-written/incremental row safely
     // without multiplying one API response's usage. Codex rows hold session
     // bucket totals; maxima merge an older archive copy with a continued log.
@@ -445,6 +445,39 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         continue;
       }
 
+      if (input.agentId === "codebuddy" || input.agentId === "cursor") {
+        const buddy = input.agentId === "codebuddy";
+        if (buddy ? !["assistant", "message", "function_call"].includes(String(value.type)) || value.role === "user"
+          : value.kind !== "cursor-response" || value.version !== 1) continue;
+        const provider = object(value.providerData);
+        const usage = buddy ? object(object(value.message)?.usage) : value;
+        const usageDay = day(value.timestamp);
+        if (!usage || !usageDay) continue;
+        const inputTokens = count(usage.input_tokens);
+        const rawUsage = object(provider?.rawUsage);
+        const cached = buddy ? Math.min(inputTokens, Math.max(count(usage.cache_read_input_tokens),
+          count(rawUsage?.cache_read_input_tokens), count(rawUsage?.prompt_cache_hit_tokens),
+          count(object(rawUsage?.prompt_tokens_details)?.cached_tokens))) : count(usage.cache_read_tokens);
+        const writes = buddy ? Math.min(inputTokens - cached, Math.max(count(usage.cache_creation_input_tokens),
+          count(rawUsage?.cache_creation_input_tokens), count(rawUsage?.prompt_cache_write_tokens))) : count(usage.cache_write_tokens);
+        const output = count(usage.output_tokens);
+        // CodeBuddy persists SDK input totals including caches; Cursor's
+        // afterAgentResponse hook already subtracts cache reads and writes.
+        const uncached = buddy ? Math.max(0, inputTokens - cached - writes) : inputTokens;
+        if (uncached + cached + writes + output === 0) continue;
+        const identity = buddy ? provider?.messageId ?? object(value.message)?.id ?? value.id : value.eventId;
+        if (typeof identity !== "string" || !identity) continue;
+        if (typeof value.cwd === "string") sessionProject = projectName(value.cwd);
+        mergeEvent(events, {
+          eventKey: crypto.createHash("sha256").update(`${input.agentId}:${identity}`).digest("hex"),
+          day: usageDay, modelProviderId: input.agentId,
+          model: text(buddy ? provider?.model ?? object(value.message)?.model : value.model, "unknown"),
+          project: buddy ? sessionProject : projectName(value.project), loggedCostUsd: null,
+          uncachedInputTokens: uncached, cachedInputTokens: cached, cacheWriteTokens: writes, outputTokens: output,
+        });
+        continue;
+      }
+
       if (input.agentId === "grok") {
         if (value.msg !== "shell.turn.inference_done") continue;
         const usage = object(value.ctx);
@@ -654,7 +687,7 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         ])).digest("hex"),
       }));
     }
-    return input.agentId === "claude" || input.agentId === "copilot"
+    return input.agentId === "claude" || input.agentId === "codebuddy" || input.agentId === "cursor" || input.agentId === "copilot"
       ? [...events.values(), ...rows.values()]
       : [...rows.values()];
   }
@@ -675,7 +708,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   }
 
   const discovered: string[] = [];
-  for (const root of [...new Set(input.roots)]) await walk(root, discovered);
+  const roots = [...input.roots];
+  if (input.agentId === "codebuddy" && process.env.CODEBUDDY_CONFIG_DIR?.trim()) {
+    const home = process.env.CODEBUDDY_CONFIG_DIR.trim();
+    if (path.isAbsolute(home)) roots.push(path.join(home, "projects"));
+  }
+  for (const root of [...new Set(roots)]) await walk(root, discovered);
   const accountDiscovered: string[] = [];
   if (accountRoot) {
     let accountEntries: import("node:fs").Dirent[] = [];
