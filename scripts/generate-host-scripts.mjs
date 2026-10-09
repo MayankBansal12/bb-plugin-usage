@@ -8,6 +8,7 @@ const functions = [
   ["lib/host-json-collector.ts", "hostJsonCollector"],
   ["lib/devin-sqlite-collector.ts", "devinSqliteCollector"],
   ["lib/kilocode-sqlite-collector.ts", "kilocodeSqliteCollector"],
+  ["lib/amp-usage-collector.ts", "ampUsageCollector"],
   ["lib/grok-limits.ts", "normalizeGrokBilling"],
 ];
 const root = new URL("../", import.meta.url);

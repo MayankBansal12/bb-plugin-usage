@@ -1,9 +1,12 @@
+import { createHash } from "node:crypto";
 import { normalizeProviderId, resolvePricing, type PricingStatus } from "./lib/pricing";
+import type { AmpUsageAggregate } from "./lib/amp-usage-collector";
 
-// `codex-<name>` ids are emitted for extra Codex accounts whose CODEX_HOME
-// lives under ~/.codex-profiles/<name>, so each account stays a distinct agent
-// in grouping and filters instead of merging into "codex".
-export type AgentId = "codex" | "claude" | "copilot" | "dsh" | "devin" | "freebuff" | "fx" | "grok" | "kilocode" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
+// `codex-<name>` ids are emitted for extra Codex accounts whose usage lives in
+// a per-account CODEX_HOME (e.g. ~/.codex-profiles/<name>, ~/.codex-<name>, or
+// a configured home), so each account stays a distinct agent in grouping and
+// filters instead of merging into "codex".
+export type AgentId = "amp" | "codex" | "claude" | "codebuddy" | "cursor" | "copilot" | "dsh" | "devin" | "freebuff" | "fx" | "grok" | "kilocode" | "opencode" | "pi" | "prime" | "antigravity" | "thaura" | `codex-${string}`;
 
 export type UsageRecord = {
   eventKey: string;
@@ -47,6 +50,12 @@ type UsageInput = {
 
 type ParseContext = { machineId: string; machineName: string };
 
+// Twelve hex chars of the home path's digest: enough to keep profile homes
+// distinct inside a bucket key without leaking the path.
+export function codexHomeTag(home: string) {
+  return home ? createHash("sha256").update(home).digest("hex").slice(0, 12) : "";
+}
+
 export type HostUsageAggregate = {
   day: string;
   modelProviderId: string;
@@ -55,6 +64,10 @@ export type HostUsageAggregate = {
   // Set when a session file came from a per-account home (a Codex profile);
   // absent for the agent's primary home.
   account?: string;
+  // Short digest of the Codex home directory a session file was read from;
+  // raw host paths never leave the host. It ends the bucket key so a relabeled
+  // profile can rewrite exactly its own rows.
+  homeTag?: string;
   loggedCostUsd: number | null;
   uncachedInputTokens: number;
   cachedInputTokens: number;
@@ -316,7 +329,7 @@ export function parseOpenCode(content: string, context: ParseContext): UsageReco
   });
 }
 
-export function parseHostUsageAggregates(content: string, agentId: Exclude<AgentId, "opencode">, context: ParseContext): UsageRecord[] {
+export function parseHostUsageAggregates(content: string, agentId: Exclude<AgentId, "amp" | "opencode">, context: ParseContext): UsageRecord[] {
   let values: unknown;
   try {
     values = JSON.parse(content.trim() || "[]");
@@ -328,6 +341,8 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
   const agentName = agentId === "codex" ? "Codex"
     : agentId === "claude" ? "Claude Code"
     : agentId === "copilot" ? "GitHub Copilot"
+    : agentId === "codebuddy" ? "CodeBuddy"
+    : agentId === "cursor" ? "Cursor Agent"
     : agentId === "dsh" ? "DeepSeek Harness"
     : agentId === "devin" ? "Devin"
     : agentId === "grok" ? "Grok Agent"
@@ -348,14 +363,17 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
     const modelProviderId = normalizeProviderId(text(row.modelProviderId, "unknown"));
     const model = text(row.model, "unknown");
     const project = text(row.project, "Unknown");
-    // Only the codex scan emits `account` today; it marks rows from
-    // ~/.codex-profiles/<name> so each extra account lands on its own
+    // Only the codex scan emits `account` today; it marks rows from a
+    // per-account Codex home so each extra account lands on its own
     // dashboard agent instead of merging into Codex.
     const account = agentId === "codex" ? text(row.account, "").slice(0, 80) : "";
     const scopedAgentId: AgentId = account ? `codex-${account}` : agentId;
     const scopedAgentName = account ? `Codex (${account})` : agentName;
+    // The owning home's tag ends the key, so a label rename can be applied to
+    // just that home's buckets instead of every row sharing the label.
+    const homeTag = agentId === "codex" ? text(row.homeTag, "").slice(0, 12) : "";
     return [usageRecord({
-      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${["freebuff", "kilocode", "pi", "prime", "thaura"].includes(agentId) ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
+      eventKey: `${scopedAgentId}:${context.machineId}:${day}:${encodeURIComponent(modelProviderId)}:${encodeURIComponent(model)}:${encodeURIComponent(project)}${homeTag ? `:${homeTag}` : ""}${["freebuff", "kilocode", "pi", "prime", "thaura"].includes(agentId) ? (Number(row.loggedCostUsd) > 0 ? ":logged" : ":estimate") : ""}`,
       timestamp,
       day,
       agentId: scopedAgentId,
@@ -373,4 +391,26 @@ export function parseHostUsageAggregates(content: string, agentId: Exclude<Agent
       outputTokens: count(row.outputTokens),
     }, context)];
   });
+}
+
+export function parseAmpUsageAggregates(rows: AmpUsageAggregate[], context: ParseContext): UsageRecord[] {
+  return rows.map((row) => usageRecord({
+    // Amp account data can be visible from several enrolled machines. The
+    // machine-independent key lets usage_event_sources map those copies to one
+    // canonical event instead of multiplying account usage by host count.
+    eventKey: `amp:${row.threadId}:${row.day}:${encodeURIComponent(row.model)}:${encodeURIComponent(row.project)}`,
+    timestamp: `${row.day}T00:00:00Z`,
+    day: row.day,
+    agentId: "amp",
+    agentName: "Amp",
+    modelProviderId: "amp",
+    model: row.model,
+    project: row.project,
+    loggedCostUsd: null,
+    costMode: "logged-only",
+    uncachedInputTokens: row.uncachedInputTokens,
+    cachedInputTokens: row.cachedInputTokens,
+    cacheWriteTokens: row.cacheWriteTokens,
+    outputTokens: row.outputTokens,
+  }, context));
 }
