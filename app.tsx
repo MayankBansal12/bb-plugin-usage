@@ -10,8 +10,11 @@ import { ToggleGroup } from "@/components/ui/toggle-group";
 import { useMediaQuery } from "@/components/ui/hooks/use-media-query";
 import { ProviderLimitsSkeleton, UsageDashboardSkeleton } from "@/components/usage-dashboard-skeleton";
 import { ProviderLogo, BRAND_COLORS, modelLogoId } from "@/components/provider-logo";
+import { BreakdownDonut } from "@/components/breakdown-donut";
 import { paginateItems } from "@/lib/pagination";
+import { buildBreakdownDonut } from "@/lib/breakdown-donut";
 import { compareUsage, nextUsageSort, type MetricMode, type UsageSort } from "@/lib/usage-sort";
+import { cacheHitRateGroups, type CacheHitRateGroup } from "@/lib/cache-hit-rate";
 import type { UsageSyncSnapshot } from "@/lib/sync-coordinator";
 import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, usageRefreshError } from "@/lib/usage-sync-state";
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
@@ -21,6 +24,7 @@ import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-cur
 type Range = 7 | 30 | 90;
 type BreakdownMode = "model" | "project" | "day";
 type DimensionMode = "agent" | "provider";
+type CacheHitRateMode = "agent" | "model";
 
 const BREAKDOWN_PAGE_SIZE = 10;
 const SHOW_USAGE_LIMITS_STORAGE_KEY = "bb-plugin-usage:show-usage-limits";
@@ -411,8 +415,10 @@ function UsageChart({
   compactView?: boolean;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const touchStartRef = useRef<{ pointerId: number; clientX: number; clientY: number } | null>(null);
   const [measuredWidth, setMeasuredWidth] = useState(980);
   const [hoverIndex, setHoverIndex] = useState<number | null>(null);
+  const [touchPinned, setTouchPinned] = useState(false);
   const width = Math.max(compactView ? 240 : 360, measuredWidth);
   const height = compactView ? 250 : 322;
   const inset = compactView
@@ -430,6 +436,17 @@ function UsageChart({
     observer.observe(element);
     return () => observer.disconnect();
   }, []);
+
+  useEffect(() => {
+    if (!touchPinned) return;
+    const dismissOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && containerRef.current?.contains(event.target)) return;
+      setHoverIndex(null);
+      setTouchPinned(false);
+    };
+    document.addEventListener("pointerdown", dismissOutside);
+    return () => document.removeEventListener("pointerdown", dismissOutside);
+  }, [touchPinned]);
 
   for (const record of records) {
     const dimensionId = groupBy === "agent" ? record.agentId : record.modelProviderId;
@@ -485,24 +502,47 @@ function UsageChart({
   const tooltipOnRight = tooltipLeft < width * 0.6;
 
   return (
-    <div ref={containerRef} className="relative min-w-0 overflow-hidden">
+    <div ref={containerRef} className="relative min-w-0 select-none overflow-hidden">
       <svg
         width={width}
         height={height}
         className="block max-w-full touch-pan-y"
         role="img"
         aria-label={`Daily ${mode} by ${groupBy}`}
-        onPointerMove={(event) => updateHoverFromClientX(event.clientX)}
-        onPointerDown={(event) => updateHoverFromClientX(event.clientX)}
-        onPointerLeave={() => setHoverIndex(null)}
+        onPointerMove={(event) => {
+          if (event.pointerType === "touch") return;
+          setTouchPinned(false);
+          updateHoverFromClientX(event.clientX);
+        }}
+        onPointerDown={(event) => {
+          if (event.pointerType === "touch") {
+            touchStartRef.current = {
+              pointerId: event.pointerId,
+              clientX: event.clientX,
+              clientY: event.clientY,
+            };
+            return;
+          }
+          setTouchPinned(false);
+          updateHoverFromClientX(event.clientX);
+        }}
+        onPointerUp={(event) => {
+          const start = touchStartRef.current;
+          if (event.pointerType !== "touch" || start?.pointerId !== event.pointerId) return;
+          touchStartRef.current = null;
+          if (Math.hypot(event.clientX - start.clientX, event.clientY - start.clientY) > 8) return;
+          updateHoverFromClientX(event.clientX);
+          setTouchPinned(true);
+        }}
+        onPointerCancel={(event) => {
+          if (touchStartRef.current?.pointerId === event.pointerId) touchStartRef.current = null;
+        }}
+        onPointerLeave={(event) => {
+          if (event.pointerType === "touch") return;
+          setHoverIndex(null);
+        }}
       >
         <defs>
-          {providers.map((provider) => (
-            <linearGradient key={provider.id} id={`usage-area-${provider.id}`} x1="0" x2="0" y1="0" y2="1">
-              <stop offset="0%" stopColor={providerColor(provider.id)} stopOpacity="0.16" />
-              <stop offset="100%" stopColor={providerColor(provider.id)} stopOpacity="0" />
-            </linearGradient>
-          ))}
           <clipPath id="usage-chart-clip">
             <rect x={inset.left} y={inset.top} width={chartWidth} height={chartHeight} />
           </clipPath>
@@ -535,10 +575,21 @@ function UsageChart({
             const upperLine = smoothPath(upperPoints, inset.top, inset.top + chartHeight);
             const lowerLine = smoothPath(lowerPoints, inset.top, inset.top + chartHeight).replace(/^M/, "L");
             const area = `${upperLine} ${lowerLine} Z`;
-            return (
-              <path key={item.id} d={area} fill={`url(#usage-area-${item.id})`} />
-            );
+            return <path key={item.id} d={area} fill={providerColor(item.id)} fillOpacity="0.26" />;
           })}
+          {/* Hairline gaps keep collapsed bands' boundaries readable without becoming per-series lines. */}
+          {stackedSeries.map((item) => (
+            <path
+              key={item.id}
+              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
+              fill="none"
+              stroke="var(--background)"
+              strokeWidth="1"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
+            />
+          ))}
           <path
             d={smoothPath(dailyTotals.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
             fill="none"
@@ -548,19 +599,6 @@ function UsageChart({
             strokeLinejoin="round"
             vectorEffect="non-scaling-stroke"
           />
-          {/* Paint lower boundaries last so a zero-height layer cannot cover them. */}
-          {[...stackedSeries].reverse().map((item) => (
-            <path
-              key={item.id}
-              d={smoothPath(item.upperValues.map((value, index) => ({ x: x(index), y: y(value) })), inset.top, inset.top + chartHeight)}
-              fill="none"
-              stroke={providerColor(item.id)}
-              strokeWidth="2.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          ))}
         </g>
 
         {hoverIndex !== null && (
@@ -574,17 +612,20 @@ function UsageChart({
               strokeWidth="1"
               vectorEffect="non-scaling-stroke"
             />
-            {stackedSeries.filter((item) => item.values[hoverIndex] > 0).map((item) => (
-              <circle
+            {stackedSeries.flatMap((item) => {
+              const value = item.values[hoverIndex];
+              if (value <= 0) return [];
+              const midpoint = (item.lowerValues[hoverIndex] + item.upperValues[hoverIndex]) / 2;
+              return <circle
                 key={item.id}
                 cx={x(hoverIndex)}
-                cy={y(item.upperValues[hoverIndex])}
+                cy={y(midpoint)}
                 r="3.5"
                 fill={providerColor(item.id)}
                 stroke="var(--background)"
                 strokeWidth="1.5"
-              />
-            ))}
+              />;
+            })}
           </g>
         )}
 
@@ -640,7 +681,7 @@ function ProviderShareRow({
   mode,
   total,
 }: {
-  item: { id: string; name: string; cost: number; tokens: number; unknown?: boolean };
+  item: { id: string; name: string; cost: number; tokens: number; unknown?: boolean; cacheRate?: CacheHitRateGroup };
   mode: MetricMode;
   total: number;
 }) {
@@ -671,13 +712,28 @@ function ProviderShareRow({
       </div>
       <div className="mt-2 text-xs text-muted-foreground">
         {mode === "cost"
-          ? <>{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens</>
+          ? <>{percentage(item.cost, total)} of cost · {compact(item.tokens)} tokens{item.cacheRate && <> · <CacheRateValue item={item.cacheRate} /> cache hit</>}</>
           : item.unknown && item.cost === 0
-            ? <>{percentage(item.tokens, total)} of tokens · <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">cost unknown</span></>
-            : <>{percentage(item.tokens, total)} of tokens · <PricedCost cost={item.cost} unknown={item.unknown} /></>}
+            ? <>{percentage(item.tokens, total)} of tokens · <span title="Some usage has no recorded cost or known catalog rate; totals exclude that usage.">cost unknown</span>{item.cacheRate && <> · <CacheRateValue item={item.cacheRate} /> cache hit</>}</>
+            : <>{percentage(item.tokens, total)} of tokens · <PricedCost cost={item.cost} unknown={item.unknown} />{item.cacheRate && <> · <CacheRateValue item={item.cacheRate} /> cache hit</>}</>}
       </div>
     </div>
   );
+}
+
+function CacheRateValue({ item }: { item: CacheHitRateGroup }) {
+  return (
+    <span
+      className="font-medium tabular-nums"
+      title={item.rate === null ? "This agent does not report cache usage, or no input tokens were recorded." : "Cache reads divided by cache reads, cache writes, and uncached input"}
+    >
+      {item.rate === null ? "Unknown" : `${(item.rate * 100).toFixed(1)}%`}
+    </span>
+  );
+}
+
+function RowBadge({ children }: { children: React.ReactNode }) {
+  return <span className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">{children}</span>;
 }
 
 function ChartLegend({ providers }: { providers: Array<{ id: string; name: string }> }) {
@@ -1032,8 +1088,11 @@ function UsageDashboard() {
   const [chartMode, setChartMode] = useState<MetricMode>("tokens");
   const [breakdownSort, setBreakdownSort] = useState<UsageSort>({ metric: "tokens", direction: "descending" });
   const [breakdownMode, setBreakdownMode] = useState<BreakdownMode>("model");
+  const [cacheHitRateMode, setCacheHitRateMode] = useState<CacheHitRateMode>("agent");
   const [mobileSection, setMobileSection] = useState<"chart" | "breakdown">("chart");
+  const [cacheHitRatePage, setCacheHitRatePage] = useState(1);
   const [breakdownPage, setBreakdownPage] = useState(1);
+  const [breakdownHover, setBreakdownHover] = useState<string | null>(null);
   const [syncRequested, setSyncRequested] = useState(false);
   const mainRef = useRef<HTMLElement>(null);
   const [contentWidth, setContentWidth] = useState(0);
@@ -1176,9 +1235,16 @@ function UsageDashboard() {
     };
   }, [rows, range]);
 
+  const agentCacheHitRates = useMemo(() => new Map(
+    cacheHitRateGroups(rows, "agent").map((item) => [item.agentId, item]),
+  ), [rows]);
+  const modelCacheHitRates = useMemo(() => new Map(
+    cacheHitRateGroups(rows, "model").map((item) => [`${item.agentId}\0${item.modelProviderId}\0${item.model}`, item]),
+  ), [rows]);
+
   type BreakdownRow = {
     key: string; label: string; agent: string; agentId: string; provider: string; providerId: string;
-    cost: number; tokens: number; unknown?: boolean;
+    cost: number; tokens: number; unknown?: boolean; cacheRate?: CacheHitRateGroup;
     // Only project rows fold several agents into one badge; the folded ones are
     // listed here so the `+N` suffix can name them on hover.
     otherAgents?: Array<{ id: string; name: string; cost: number; tokens: number; unknown?: boolean }>;
@@ -1202,14 +1268,19 @@ function UsageDashboard() {
     const map = new Map<string, BreakdownRow>();
     for (const row of rows) {
       const key = `${row.agentId}:${row.modelProviderId}:${row.model}`;
-      const current: BreakdownRow = map.get(key) ?? { key, label: row.model === "codex-unknown" ? "Unknown" : row.model, agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName, providerId: row.modelProviderId, cost: 0, tokens: 0 };
+      const current: BreakdownRow = map.get(key) ?? {
+        key, label: row.model === "codex-unknown" ? "Unknown" : row.model,
+        agent: row.agentName, agentId: row.agentId, provider: row.modelProviderName,
+        providerId: row.modelProviderId, cost: 0, tokens: 0,
+        cacheRate: modelCacheHitRates.get(`${row.agentId}\0${row.modelProviderId}\0${row.model}`),
+      };
       current.unknown = current.unknown || row.pricingStatus === "unknown";
       current.cost += row.costUsd;
       current.tokens += row.processedTokens;
       map.set(key, current);
     }
     return [...map.values()];
-  }, [rows]);
+  }, [rows, modelCacheHitRates]);
 
   // Projects can be worked on from several agents and providers, so a row keeps
   // the dominant one by the active metric for its badge instead of claiming a
@@ -1260,6 +1331,19 @@ function UsageDashboard() {
 
   const days = useMemo(() => rangeDays(range), [range]);
 
+  // Hooks must run before the early returns below, so the donut memo lives
+  // here even though `breakdown` is only consumed after them.
+  const breakdownRows = breakdownMode === "model" ? modelBreakdown
+    : breakdownMode === "project" ? projectBreakdown
+    : dayBreakdown;
+  const breakdown = useMemo(
+    () => [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort)),
+    [breakdownRows, breakdownSort],
+  );
+  const breakdownDonut = useMemo(() => buildBreakdownDonut(breakdown, breakdownSort.metric), [breakdown, breakdownSort.metric]);
+  const cacheHitRates = useMemo(() => cacheHitRateGroups(rows, cacheHitRateMode), [rows, cacheHitRateMode]);
+
+  useEffect(() => setCacheHitRatePage(1), [cacheHitRateMode, machine, range]);
   useEffect(() => setBreakdownPage(1), [breakdownMode, machine, range]);
 
   useEffect(() => {
@@ -1315,6 +1399,7 @@ function UsageDashboard() {
       cost: dimensionRows.reduce((sum, row) => sum + row.costUsd, 0),
       tokens: dimensionRows.reduce((sum, row) => sum + row.processedTokens, 0),
       unknown: dimensionRows.some((row) => row.pricingStatus === "unknown"),
+      cacheRate: shareDimension === "agent" ? agentCacheHitRates.get(item.id) : undefined,
     };
   }).sort(byChartMetric);
   const metricTotal = chartMode === "cost" ? totals.cost : totals.processed;
@@ -1336,17 +1421,16 @@ function UsageDashboard() {
     sources: visibleSources,
     hasRecordsOutsideView: data.records.some((record) => machine === "all" || record.machineId === machine),
   });
-  const breakdownRows = breakdownMode === "model" ? modelBreakdown
-    : breakdownMode === "project" ? projectBreakdown
-    : dayBreakdown;
-  const breakdown = [...breakdownRows].sort((a, b) => compareUsage(a, b, breakdownSort));
+  const paginatedCacheHitRates = paginateItems(cacheHitRates, cacheHitRatePage, BREAKDOWN_PAGE_SIZE);
   const paginatedBreakdown = paginateItems(breakdown, breakdownPage, BREAKDOWN_PAGE_SIZE);
+  const breakdownGroupLabel = breakdownMode === "model" ? "models" : breakdownMode === "project" ? "projects" : "days";
+  const donutBesideTable = contentWidth >= 1060;
   const activeDays = new Set(rows.map((row) => row.day)).size;
   const visibleProviderLimits = providerLimits.filter((limit) => isLimitVisibleOnMachine(limit, machine));
 
   const metrics = [
     { label: "Processed tokens", value: compact(totals.processed), detail: `${compact(totals.processed / Math.max(1, activeDays))} per active day`, values: dailySeries.processed, color: FALLBACK_PROVIDER_COLORS[0] },
-    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached)} of input · ${compact(totals.cacheWrites)} writes`, values: dailySeries.cached, color: FALLBACK_PROVIDER_COLORS[1] },
+    { label: "Cached input", value: compact(totals.cached), detail: `${percentage(totals.cached, totals.cached + totals.uncached + totals.cacheWrites)} hit rate · ${compact(totals.cacheWrites)} writes`, values: dailySeries.cached, color: FALLBACK_PROVIDER_COLORS[1] },
     { label: "Output", value: compact(totals.output), detail: "Includes reasoning tokens", values: dailySeries.output, color: FALLBACK_PROVIDER_COLORS[2] },
     { label: "Cache savings", value: money(totals.cacheSavings), detail: totals.cost > 0 ? `${(totals.cacheSavings / totals.cost).toFixed(1)}× the raw token cost` : `Price sheet ${data.pricingVersion}`, cost: totals.cacheSavings, values: dailySeries.cacheSavings, color: FALLBACK_PROVIDER_COLORS[3] },
   ];
@@ -1525,6 +1609,88 @@ function UsageDashboard() {
                 ))}
               </div>
             </section>
+
+            <section>
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
+                <div>
+                  <h2 className="text-sm font-semibold">Cache hit rate</h2>
+                  <p className="mt-1 text-xs text-muted-foreground">Cache reads ÷ total input; cache creation counts as a miss.</p>
+                </div>
+                <ToggleGroup
+                  value={cacheHitRateMode}
+                  onChange={setCacheHitRateMode}
+                  label="Cache hit rate grouping"
+                  options={[{ value: "agent", label: "Agent" }, { value: "model", label: "Model" }]}
+                />
+              </div>
+              {compactView ? (
+                <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                  {paginatedCacheHitRates.items.map((item) => (
+                    <div key={item.key} className="border-t border-border/60 px-3.5 py-3 first:border-t-0">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                          <ProviderLogo id={item.model ? modelLogoId(item.model) : item.agentId} name={item.model ? undefined : item.agentName} size="sm" />
+                          <span className="truncate">{item.model ?? item.agentName}</span>
+                        </span>
+                        <CacheRateValue item={item} />
+                      </div>
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        {item.model && <RowBadge><ProviderLogo id={item.agentId} name={item.agentName} size="sm" />{item.agentName}</RowBadge>}
+                        {item.model && item.modelProviderName && <RowBadge>{item.modelProviderName}</RowBadge>}
+                        <RowBadge><span className="tabular-nums text-foreground/80">{compact(item.cachedInputTokens)}</span> cached</RowBadge>
+                        <RowBadge><span className="tabular-nums text-foreground/80">{compact(item.totalInputTokens)}</span> input</RowBadge>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
+                  <table className="w-full border-collapse text-sm" style={{ minWidth: cacheHitRateMode === "model" ? 680 : 560 }}>
+                    <thead>
+                      <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
+                        <th className="px-4 py-2.5 text-left font-medium">{cacheHitRateMode === "model" ? "Model" : "Agent"}</th>
+                        {cacheHitRateMode === "model" && <th className="px-4 py-2.5 text-left font-medium">Agent</th>}
+                        <th className="px-4 py-2.5 text-right font-medium">Hit rate</th>
+                        <th className="px-4 py-2.5 text-right font-medium">Cached input</th>
+                        <th className="px-4 py-2.5 text-right font-medium">Input tokens</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paginatedCacheHitRates.items.map((item) => (
+                        <tr key={item.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
+                          <td className="px-4 py-3 font-medium">
+                            <span className="inline-flex min-w-0 items-center gap-2">
+                              <ProviderLogo id={item.model ? modelLogoId(item.model) : item.agentId} name={item.model ? undefined : item.agentName} size="sm" />
+                              <span className="truncate">{item.model ?? item.agentName}</span>
+                            </span>
+                          </td>
+                          {cacheHitRateMode === "model" && (
+                            <td className="px-4 py-3">
+                              <AgentCell agentId={item.agentId} agent={item.agentName} mode="tokens" />
+                              {item.modelProviderName && <div className="mt-0.5 text-xs text-muted-foreground">{item.modelProviderName}</div>}
+                            </td>
+                          )}
+                          <td className="px-4 py-3 text-right"><CacheRateValue item={item} /></td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(item.cachedInputTokens)}</td>
+                          <td className="px-4 py-3 text-right tabular-nums text-muted-foreground">{compact(item.totalInputTokens)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+              {cacheHitRates.length > BREAKDOWN_PAGE_SIZE && (
+                <div className="mt-4 flex flex-wrap items-center justify-center gap-2 text-xs tabular-nums text-muted-foreground sm:justify-end">
+                  <span>{paginatedCacheHitRates.rangeStart}–{paginatedCacheHitRates.rangeEnd} of {paginatedCacheHitRates.totalItems}</span>
+                  <button type="button" aria-label="Previous cache hit rate page" title="Previous page" disabled={!paginatedCacheHitRates.canPrevious} onClick={() => setCacheHitRatePage(paginatedCacheHitRates.page - 1)} className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40">
+                    <Icon name="ChevronLeft" className="size-3.5" aria-hidden="true" />
+                  </button>
+                  <button type="button" aria-label="Next cache hit rate page" title="Next page" disabled={!paginatedCacheHitRates.canNext} onClick={() => setCacheHitRatePage(paginatedCacheHitRates.page + 1)} className="inline-flex size-7 items-center justify-center rounded-md border border-border/70 transition-[background-color,color,transform] duration-150 ease-out hover:bg-muted/50 hover:text-foreground active:scale-[0.96] disabled:pointer-events-none disabled:opacity-40">
+                    <Icon name="ChevronRight" className="size-3.5" aria-hidden="true" />
+                  </button>
+                </div>
+              )}
+            </section>
             </>
             )}
 
@@ -1542,6 +1708,9 @@ function UsageDashboard() {
 
               {compactView ? (
                 <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+                  <div className="flex justify-center border-b border-border/60 px-3.5 py-4">
+                    <BreakdownDonut donut={breakdownDonut} rows={breakdown} mode={breakdownSort.metric} groupLabel={breakdownGroupLabel} hoveredKey={breakdownHover} onHoverKey={setBreakdownHover} formatValue={breakdownSort.metric === "cost" ? (value) => <CostValue value={value} /> : (value) => compact(value)} />
+                  </div>
                   <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
                     <span>Sort by</span>
                     <div className="flex items-center gap-3" role="group" aria-label="Breakdown sorting">
@@ -1550,8 +1719,9 @@ function UsageDashboard() {
                     </div>
                   </div>
                   {paginatedBreakdown.items.map((row) => (
-                    <div key={row.key} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
+                    <div key={row.key} className={`border-b border-border/60 px-3.5 py-3 transition-colors last:border-b-0 ${breakdownHover === row.key ? "bg-muted/30" : ""}`} onMouseEnter={() => setBreakdownHover(row.key)} onMouseLeave={() => setBreakdownHover(null)}>
                       <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
+                        <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: breakdownDonut.colorByKey.get(row.key) }} />
                         {breakdownMode === "model" && <ProviderLogo id={modelLogoId(row.label)} size="sm" />}
                         <span className="truncate" title={row.label}>{row.label}</span>
                       </div>
@@ -1559,6 +1729,9 @@ function UsageDashboard() {
                         <div className="mt-1.5 text-xs">
                           <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
                         </div>
+                      )}
+                      {breakdownMode === "model" && row.cacheRate && (
+                        <div className="mt-1.5 text-xs text-muted-foreground"><CacheRateValue item={row.cacheRate} /> cache hit</div>
                       )}
                       <div className="mt-3 grid grid-cols-2 gap-4">
                         <BreakdownValue metric="tokens" row={row} totals={totals} />
@@ -1570,8 +1743,12 @@ function UsageDashboard() {
                   ))}
                 </div>
               ) : (
-                <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
-                  <table className="w-full border-collapse text-sm" aria-label="Usage breakdown" style={{ minWidth: breakdownMode === "day" ? 440 : 600 }}>
+                <div className={`mt-3 ${CARD_CLASSES} ${donutBesideTable ? "flex items-stretch" : ""}`}>
+                  <div className={`flex shrink-0 items-center justify-center px-5 py-4 ${donutBesideTable ? "border-r border-border/60" : "border-b border-border/60"}`}>
+                    <BreakdownDonut donut={breakdownDonut} rows={breakdown} mode={breakdownSort.metric} groupLabel={breakdownGroupLabel} hoveredKey={breakdownHover} onHoverKey={setBreakdownHover} formatValue={breakdownSort.metric === "cost" ? (value) => <CostValue value={value} /> : (value) => compact(value)} />
+                  </div>
+                  <div className="min-w-0 flex-1 overflow-x-auto">
+                  <table className="w-full border-collapse text-sm" aria-label="Usage breakdown" style={{ minWidth: breakdownMode === "day" ? 440 : breakdownMode === "model" ? 700 : 600 }}>
                     <thead>
                       <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
                         <th scope="col" className="px-4 py-2.5 text-left font-medium">
@@ -1579,6 +1756,9 @@ function UsageDashboard() {
                         </th>
                         {breakdownMode !== "day" && (
                           <th scope="col" className="px-4 py-2.5 text-left font-medium">Agent</th>
+                        )}
+                        {breakdownMode === "model" && (
+                          <th scope="col" className="px-4 py-2.5 text-right font-medium">Cache hit</th>
                         )}
                         {(["tokens", "cost"] as const).map((metric) => (
                           <th key={metric} scope="col" aria-sort={breakdownSort.metric === metric ? breakdownSort.direction : undefined} className="px-3 py-1 text-right font-medium">
@@ -1589,21 +1769,27 @@ function UsageDashboard() {
                     </thead>
                     <tbody>
                       {paginatedBreakdown.items.map((row) => (
-                        <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
+                        <tr key={row.key} className={`border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0 ${breakdownHover === row.key ? "bg-muted/20" : ""}`} onMouseEnter={() => setBreakdownHover(row.key)} onMouseLeave={() => setBreakdownHover(null)}>
                           <td className="px-4 py-3 font-medium">
-                            {breakdownMode === "model" ? (
-                              <span className="inline-flex min-w-0 items-center gap-2">
+                            <span className="inline-flex min-w-0 items-center gap-2">
+                              <span className="size-2 shrink-0 rounded-full" style={{ backgroundColor: breakdownDonut.colorByKey.get(row.key) }} />
+                              {breakdownMode === "model" ? (
+                                <>
                                 <ProviderLogo id={modelLogoId(row.label)} size="sm" />
                                 <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
-                              </span>
-                            ) : (
+                                </>
+                              ) : (
                               <span className="truncate" title={row.label}>{row.label}</span>
-                            )}
+                              )}
+                            </span>
                           </td>
                           {breakdownMode !== "day" && (
                             <td className="px-4 py-3">
                               <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
                             </td>
+                          )}
+                          {breakdownMode === "model" && (
+                            <td className="px-4 py-3 text-right">{row.cacheRate && <CacheRateValue item={row.cacheRate} />}</td>
                           )}
                           <td className="px-4 py-3 align-top text-right">
                             <BreakdownValue metric="tokens" row={row} totals={totals} />
@@ -1615,6 +1801,7 @@ function UsageDashboard() {
                       ))}
                     </tbody>
                   </table>
+                  </div>
                 </div>
               )}
 
