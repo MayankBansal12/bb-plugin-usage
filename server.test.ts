@@ -749,7 +749,7 @@ describe("host command output", () => {
       { id: "host-1", name: "Machine" },
       "printf result",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
     )).resolves.toBe(text);
 
     expect(get).toHaveBeenCalledOnce();
@@ -777,7 +777,7 @@ describe("host command output", () => {
       { id: "host-1", name: "Machine" },
       "exit 127",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
     )).rejects.toThrow("OpenCode query failed");
     expect(close).toHaveBeenCalledOnce();
   });
@@ -798,7 +798,7 @@ describe("host command output", () => {
       { id: "host-1", name: "Machine" },
       "exit 1",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
     )).rejects.toThrow("CLI compatibility error");
   });
 
@@ -818,7 +818,7 @@ describe("host command output", () => {
       { id: "host-1", name: "Stalled machine" },
       "opencode db query",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1, pollMs: 1, home: "/home/user" },
     )).rejects.toThrow("timed out");
     expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
   });
@@ -927,22 +927,6 @@ describe("host command output", () => {
     expect(bb.sdk.terminals.close).not.toHaveBeenCalled();
   });
 
-  it("resolves the machine home directory for staging when the caller does not provide it", async () => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const { bb, stagedFiles } = stagedRun("ok\n__BB_HOST_COMMAND_DONE__:0\n");
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
-    )).resolves.toContain("__BB_HOST_COMMAND_DONE__:0");
-
-    expect(bb.sdk.hosts.directory).toHaveBeenCalledWith({ hostId: "host-1", signal: expect.any(AbortSignal) });
-    expect([...stagedFiles.keys()][0]).toMatch(/^\/resolved\/home\/\.cache\/bb-plugin-usage\/host-command-/);
-  });
-
   it.each([
     { outcome: "conflict" as const, currentSha256: "mismatch" },
     { outcome: "written" as const, sha256: "wrong", sizeBytes: 1 },
@@ -1002,9 +986,156 @@ describe("host command output", () => {
       { id: "host-1", name: "Machine" },
       "printf small",
       new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1 },
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
     )).resolves.toContain("small");
     expect(write).not.toHaveBeenCalled();
+  });
+});
+
+describe("Windows host command output", () => {
+  const windowsHome = "C:\\Users\\me";
+
+  // Simulates a Windows host: files live in a map, and the collector "runs"
+  // when the terminal is polled, writing whatever `finish` returns.
+  function windowsRun(options: {
+    finish?: (runDirectory: string, files: Map<string, string>) => void;
+    states?: string[];
+    terminalText?: string;
+    unreadable?: string[];
+    home?: string;
+  } = {}) {
+    const files = new Map<string, string>();
+    let runDirectory = "";
+    let polls = 0;
+    const write = vi.fn(async (args: { path: string; content: string }) => {
+      files.set(args.path, args.content);
+      runDirectory = args.path.replace(/\/command\.sh$/, "");
+      return { outcome: "written" as const, sha256: "", sizeBytes: args.content.length };
+    });
+    const read = vi.fn(async (args: { path: string }) => {
+      const content = files.get(args.path);
+      if (content === undefined || options.unreadable?.some((suffix) => args.path.endsWith(suffix))) {
+        throw new Error(`ENOENT: ${args.path}`);
+      }
+      return { content, contentEncoding: "utf8" as const, sizeBytes: Buffer.byteLength(content), path: args.path, sha256: "" };
+    });
+    const remove = vi.fn(async (args: { path: string }) => {
+      for (const path of files.keys()) if (path.startsWith(`${args.path}/`)) files.delete(path);
+    });
+    const get = vi.fn(async () => {
+      const status = options.states?.[Math.min(polls, options.states.length - 1)] ?? "running";
+      if (polls === 0) options.finish?.(runDirectory, files);
+      polls += 1;
+      return { id: "terminal-1", status };
+    });
+    const bb = {
+      sdk: {
+        files: { write, read, remove },
+        terminals: {
+          create: vi.fn(async (input: { start: { command: string } }) => ({ id: "terminal-1", status: "starting", input })),
+          get,
+          output: vi.fn(async () => ({
+            chunks: [{ seq: 1, dataBase64: Buffer.from(options.terminalText ?? "").toString("base64") }],
+            truncated: false,
+          })),
+          close: vi.fn(async () => undefined),
+        },
+      },
+    } as unknown as BbPluginApi;
+    const run = (command = "printf result") => runHostCommand(
+      bb,
+      { id: "host-1", name: "Windows machine" },
+      command,
+      new AbortController().signal,
+      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: options.home ?? windowsHome },
+    );
+    return { bb, files, run, runDirectory: () => runDirectory };
+  }
+
+  const finishWith = (output: string, status: string) => (runDirectory: string, files: Map<string, string>) => {
+    files.set(`${runDirectory}/output.txt`, output);
+    files.set(`${runDirectory}/status`, status);
+  };
+
+  it("runs the command under sh through a file-backed launcher and cleans up", async () => {
+    const { bb, files, run, runDirectory } = windowsRun({ finish: finishWith("scan result\n", "0") });
+
+    await expect(run("printf result")).resolves.toBe("scan result\n");
+
+    expect(runDirectory()).toMatch(/^C:\/Users\/me\/\.cache\/bb-plugin-usage\/runs\/[0-9a-f-]{36}$/);
+    const script = vi.mocked(bb.sdk.files.write).mock.calls[0]![0].content;
+    expect(script.startsWith("HOME='C:/Users/me'; export HOME; ")).toBe(true);
+    expect(script).toContain(`( printf result ) > '${runDirectory()}/output.txt' 2>&1`);
+    expect(script).toContain(`mv -f '${runDirectory()}/status.tmp' '${runDirectory()}/status'`);
+
+    const launcher = vi.mocked(bb.sdk.terminals.create).mock.calls[0]![0].start;
+    expect(launcher).toMatchObject({ mode: "command" });
+    const encoded = (launcher as { command: string }).command
+      .match(/^powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ([A-Za-z0-9+/=]+)$/)?.[1];
+    expect(encoded).toBeDefined();
+    const decoded = Buffer.from(encoded!, "base64").toString("utf16le");
+    expect(decoded).toContain(`& $bbSh '${runDirectory()}/command.sh'`);
+    expect(decoded).toContain("exit $LASTEXITCODE");
+
+    expect(bb.sdk.terminals.output).not.toHaveBeenCalled();
+    expect(bb.sdk.terminals.close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
+    expect(bb.sdk.files.remove).toHaveBeenCalledWith({ hostId: "host-1", path: runDirectory(), recursive: true });
+    expect(files.size).toBe(0);
+  });
+
+  it.each([
+    ["an ASCII apostrophe", "C:\\Users\\O'Brien Smith", "O''Brien Smith"],
+    ["a curly apostrophe", "C:\\Users\\O\u2019Brien Smith", "O\u2019\u2019Brien Smith"],
+  ])("quotes a home path with %s for PowerShell and sh", async (_label, home, escaped) => {
+    const { bb, run, runDirectory } = windowsRun({ home, finish: finishWith("ok\n", "0") });
+
+    await expect(run()).resolves.toBe("ok\n");
+
+    const launcher = (vi.mocked(bb.sdk.terminals.create).mock.calls[0]![0].start as { command: string }).command;
+    const decoded = Buffer.from(launcher.split(" ").at(-1)!, "base64").toString("utf16le");
+    const quotedDirectory = runDirectory().replace(/^C:\/Users\/[^/]+/, `C:/Users/${escaped}`);
+    expect(decoded).toContain(`& $bbSh '${quotedDirectory}/command.sh'`);
+    expect(decoded).toContain(`-LiteralPath '${quotedDirectory}/status'`);
+    // Native node and python receive $HOME paths verbatim, so HOME must be a
+    // C:/ path rather than an MSYS /c/ path that conversion might skip.
+    const script = vi.mocked(bb.sdk.files.write).mock.calls[0]![0].content;
+    expect(script.startsWith(`HOME='${home.replace(/\\/g, "/").replace(/'/g, `'"'"'`)}'; export HOME; `)).toBe(true);
+  });
+
+  it("surfaces the collector diagnostic for a nonzero exit status", async () => {
+    const { run } = windowsRun({ finish: finishWith("__BB_USAGE_ERROR__:Node.js is required\n", "127") });
+
+    await expect(run()).rejects.toThrow("Node.js is required");
+  });
+
+  it("collects a status written just before the terminal exits", async () => {
+    const { run } = windowsRun({ finish: finishWith("late result\n", "0"), states: ["exited"] });
+
+    await expect(run()).resolves.toBe("late result\n");
+  });
+
+  it("reports the launcher's terminal output when it exits without a status", async () => {
+    const { bb, run } = windowsRun({
+      states: ["exited"],
+      terminalText: "\x1b[31mpowershell.exe: The term is not recognized\x1b[0m\r\n",
+    });
+
+    await expect(run()).rejects.toThrow("Usage test stopped before its output could be collected: powershell.exe: The term is not recognized");
+    expect(bb.sdk.files.remove).toHaveBeenCalledOnce();
+  });
+
+  it("fails instead of returning empty output when the output file cannot be read", async () => {
+    const { run } = windowsRun({ finish: finishWith("scan result\n", "0"), unreadable: ["/output.txt"] });
+
+    await expect(run()).rejects.toThrow("Usage test finished but its output could not be read.");
+  });
+
+  it("does not launch a terminal when the command cannot be staged", async () => {
+    const { bb, run } = windowsRun();
+    vi.mocked(bb.sdk.files.write).mockRejectedValueOnce(new Error("disk full"));
+
+    await expect(run()).rejects.toThrow("Usage test could not stage its command on Windows machine: disk full");
+    expect(bb.sdk.terminals.create).not.toHaveBeenCalled();
   });
 });
 
@@ -1149,6 +1280,7 @@ describe("OpenCode query", () => {
       bb,
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
+      "/home/user",
       new AbortController().signal,
       async () => { throw new Error("query stalled"); },
     )).resolves.toBeUndefined();
@@ -1163,6 +1295,7 @@ describe("OpenCode query", () => {
       bb,
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
+      "/home/user",
       new AbortController().signal,
       async () => { throw new Error("OpenCode CLI is required to collect OpenCode usage."); },
     )).resolves.toBeUndefined();
@@ -1178,6 +1311,7 @@ describe("OpenCode query", () => {
       bb,
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
+      "/home/user",
       new AbortController().signal,
       async () => "__BB_USAGE_BEGIN__\n[{}]\n__BB_USAGE_END__:0\n__BB_HOST_COMMAND_DONE__:0\n",
     )).resolves.toBeUndefined();
@@ -1542,7 +1676,7 @@ describe("OpenCode Go limits", () => {
     const info = vi.fn();
     const bb = { log: { info, warn: vi.fn(), debug: vi.fn() } } as unknown as BbPluginApi;
 
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
 
     const row = db.prepare("SELECT machine_id, machine_name, plan_label, windows_json FROM opencode_go_limits").get() as {
       machine_id: string; machine_name: string; plan_label: string; windows_json: string;
@@ -1569,7 +1703,7 @@ describe("OpenCode Go limits", () => {
       "",
     ].join("\n");
 
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => output);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => output);
 
     expect(loadStoredOpenCodeGoLimits(db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, new Set(["host-1"])))
       .toEqual([expect.objectContaining({ accountIdentity: "a".repeat(64) })]);
@@ -1579,9 +1713,9 @@ describe("OpenCode Go limits", () => {
     const db = goLimitsDb();
     const warn = vi.fn();
     const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
 
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => {
       throw new Error("Usage: OpenCode Go limits timed out after 60 seconds.");
     });
 
@@ -1599,13 +1733,13 @@ describe("OpenCode Go limits", () => {
     const db = goLimitsDb();
     const warn = vi.fn();
     const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
 
     for (const diagnostic of [
       "collector failed near no-opencode-go-credential handling",
       "no-opencode-go-plan response was malformed",
     ]) {
-      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => {
         throw new Error(diagnostic);
       });
     }
@@ -1619,10 +1753,10 @@ describe("OpenCode Go limits", () => {
     const db = goLimitsDb();
     const debug = vi.fn();
     const bb = { log: { info: vi.fn(), warn: vi.fn(), debug } } as unknown as BbPluginApi;
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
 
     for (const diagnostic of ["no-opencode-go-credential", "no-opencode-go-plan"]) {
-      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => {
         throw new Error(diagnostic);
       });
     }
@@ -1687,12 +1821,12 @@ describe("Grok limit snapshots", () => {
       const bb = { log: { warn } } as unknown as BbPluginApi;
       const machine = { id: "host-grok", name: "Grok machine" };
       const connected = new Set([machine.id]);
-      await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => { throw new Error("Node.js is required"); });
+      await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => { throw new Error("Node.js is required"); });
       expect(loadStoredGrokLimits(db, connected)).toEqual([]);
       expect(db.prepare("SELECT error FROM grok_limits").get()).toEqual({ error: "Node.js is required" });
       expect(warn).toHaveBeenCalled();
       const snapshot = { accountIdentity: "a".repeat(64), windows: [{ label: "Weekly credits", usedPercent: 0, resetsAt: null }] };
-      await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
+      await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
       expect(loadStoredGrokLimits(db, connected)).toEqual([expect.objectContaining({ status: "ok", error: null, windows: snapshot.windows })]);
     } finally { db.close(); }
   });
@@ -1703,12 +1837,12 @@ describe("Grok limit snapshots", () => {
     const bb = { log: { warn: vi.fn() } } as unknown as BbPluginApi;
     const machine = { id: "host-grok", name: "Grok machine" };
     const snapshot = { accountIdentity: "a".repeat(64), windows: [{ label: "Weekly credits", usedPercent: 40, resetsAt: null }] };
-    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
+    await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([expect.objectContaining({ status: "ok", windows: snapshot.windows, accountIdentity: snapshot.accountIdentity })]);
-    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => { throw new Error("Request failed"); });
+    await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => { throw new Error("Request failed"); });
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([expect.objectContaining({ status: "error", windows: snapshot.windows, error: "Request failed" })]);
     expect(loadStoredGrokLimits(db, new Set())).toEqual([]);
-    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
+    await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([]);
     db.close();
   });
