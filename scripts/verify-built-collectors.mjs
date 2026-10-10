@@ -68,7 +68,7 @@ test("production JSON commands scan logs and reuse the metadata cache", (t) => {
 
 test("production JSON commands accept absent roots for every JSON agent", (t) => {
   const home = temporaryHome(t);
-  for (const agentId of ["codex", "claude", "copilot", "freebuff", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
+  for (const agentId of ["codex", "claude", "copilot", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]) {
     const result = scan(run(jsonAgentCommand({
       agentId, roots: [join(home, "absent")], cachePath: join(home, `${agentId}.json`), sinceDay: "2026-09-01",
     }), home));

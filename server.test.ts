@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { z } from "zod";
 
 vi.mock("@bb/plugin-sdk", () => ({
   defineRpcContract: <T>(contract: T) => contract,
@@ -18,7 +19,7 @@ import plugin, {
   kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
-import { getSourceIssueMessage } from "./lib/usage-view-state";
+import { getEmptyUsageView, getSourceIssueMessage } from "./lib/usage-view-state";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -92,11 +93,6 @@ describe("JSON agent roots", () => {
       "/home/user/.copilot/session-state",
     ]);
   });
-  it("points Freebuff at the bridge's own usage log directory", () => {
-    expect(jsonAgentRoots("/home/user", "freebuff", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
-      "/home/user/.freebuff",
-    ]);
-  });
   it("includes active and archived Codex sessions", () => {
     expect(jsonAgentRoots("/home/user", "codex", { piSessionRoots: "", primeSessionRoots: "" })).toEqual([
       "/home/user/.codex/sessions",
@@ -167,6 +163,93 @@ describe("JSON agent roots", () => {
   });
 });
 
+describe("Freebuff retirement upgrade", () => {
+  it.each([
+    ["offline", false], ["unavailable", false], ["partial", false],
+    ["offline", true], ["unavailable", true], ["partial", true],
+  ] as const)("clears stale %s states while preserving history=%s", async (status, withHistory) => {
+    const db = new Database(":memory:");
+    const machines = [{ id: "host-1", name: "Machine", status: "connected" }];
+    const now = new Date().toISOString();
+    let handlers: { dashboard: () => Promise<z.infer<typeof rpcContract.dashboard.output>> } | undefined;
+    let appliedMigrations = 0;
+    let historyBefore: unknown;
+    let activeStatesBefore: unknown;
+    const history = () => ({
+      events: db.prepare("SELECT * FROM usage_events ORDER BY event_key").all(),
+      sources: db.prepare("SELECT * FROM usage_sources ORDER BY source_id").all(),
+      mappings: db.prepare("SELECT * FROM usage_event_sources ORDER BY event_key, source_id").all(),
+    });
+    const activeStates = () => db.prepare("SELECT * FROM usage_sync_state WHERE provider_id <> 'freebuff' ORDER BY machine_id, provider_id").all();
+    const bb = {
+      settings: { define: vi.fn() },
+      storage: {
+        database: () => db,
+        migrate: (_db: unknown, statements: string[]) => {
+          if (appliedMigrations === 0) {
+            // The released plugin has nine migrations. Seed an existing user's
+            // database before running any appended upgrade migrations.
+            for (const statement of statements.slice(0, 9)) db.exec(statement);
+            appliedMigrations = 9;
+            const insertState = db.prepare(`INSERT INTO usage_sync_state
+              (machine_id, provider_id, status, last_attempt_at, last_success_at, record_count, error)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`);
+            for (const hostId of ["host-1", "host-2"]) {
+              insertState.run(hostId, "freebuff", status, now, null, 0, status === "offline" ? null : "Previous scan failed");
+            }
+            for (const agentId of ["kilocode", "codex-work"]) {
+              insertState.run("host-1", agentId, "no-data", now, now, 0, null);
+            }
+            if (withHistory) {
+              db.prepare(`INSERT INTO usage_events
+                (event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,
+                 processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens,
+                 model_provider_id, model_provider_name, logged_cost_usd, pricing_status, project)
+                VALUES ('legacy-freebuff', ?, ?, 'freebuff', 'Freebuff', 'mimo-2.6-flash', 0.0042, 0,
+                  1950, 400, 0, 1200, 350, 'freebuff', 'Freebuff', 0.0042, 'logged', 'project')`)
+                .run(now, now.slice(0, 10));
+              db.prepare(`INSERT INTO usage_sources
+                (source_id, machine_id, machine_name, provider_id, root_reference, content_sha, last_seen_generation, last_success_at)
+                VALUES ('legacy-source', 'host-1', 'Machine', 'freebuff', 'root-hash', 'content-hash', 'generation', ?)`)
+                .run(now);
+              db.prepare("INSERT INTO usage_event_sources VALUES ('legacy-freebuff', 'legacy-source')").run();
+            }
+            historyBefore = history();
+            activeStatesBefore = activeStates();
+          }
+          for (const statement of statements.slice(appliedMigrations)) db.exec(statement);
+          appliedMigrations = statements.length;
+        },
+      },
+      rpc: { register: (_contract: unknown, registered: unknown) => { handlers = registered as typeof handlers; } },
+      sdk: { hosts: { list: async () => machines } },
+      background: { service: vi.fn() },
+    } as unknown as BbPluginApi;
+
+    try {
+      // Cleanup must work before a sync and remain correct on restart.
+      for (let startup = 0; startup < 2; startup++) {
+        await plugin(bb);
+        const dashboard = await handlers!.dashboard();
+        expect(dashboard.sources.map((source) => source.agentId)).toEqual(["codex-work", "kilocode"]);
+        expect(activeStates()).toEqual(activeStatesBefore);
+        expect(history()).toEqual(historyBefore);
+        expect(getSourceIssueMessage(dashboard.machines, dashboard.sources)).toBeNull();
+        expect(getEmptyUsageView({
+          machines: dashboard.machines, sources: dashboard.sources, hasRecordsOutsideView: dashboard.records.length > 0,
+        }).kind).toBe(withHistory ? "filtered" : "no-data");
+        expect(dashboard.records).toHaveLength(withHistory ? 1 : 0);
+        if (withHistory) {
+          expect(dashboard.records[0]).toMatchObject({ agentId: "freebuff", costUsd: 0.0042, processedTokens: 1950 });
+          expect(dashboard.agents).toContainEqual({ id: "freebuff", name: "Freebuff" });
+        }
+      }
+    } finally {
+      db.close();
+    }
+  });
+});
+
 describe("sync RPC", () => {
   it("returns before a slow collection completes", async () => {
     let handlers: { sync: () => unknown } | undefined;
@@ -192,7 +275,7 @@ describe("sync RPC", () => {
     expect(bb.sdk.hosts.list).toHaveBeenCalledOnce();
   });
 
-  it.each(["antigravity", "copilot", "freebuff", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
+  it.each(["antigravity", "copilot", "kilocode"])("dispatches %s through syncAll and stores its usage", async (targetAgent) => {
     // Regression test for the exact gap flagged in review on
     // https://github.com/MayankBansal12/bb-plugin-usage/pull/21: AGENTS and
     // jsonAgentRoots knew about "antigravity", but syncAll()'s Promise.all
