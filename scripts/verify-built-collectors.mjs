@@ -205,7 +205,7 @@ test("production Grok command normalizes billing without bundler helpers", async
   await syncGrokLimits(
     { log: { warn: (message) => warnings.push(message) } },
     { prepare: () => ({ run: (...values) => writes.push(values) }) },
-    { id: "test-host", name: "Test" }, AbortSignal.timeout(15_000),
+    { id: "test-host", name: "Test" }, home, AbortSignal.timeout(15_000),
     async (_bb, _machine, command) => run(command, home, { GROK_AUTH_PATH: authPath, NODE_OPTIONS: `--require=${preload}` }),
   );
   assert.deepEqual(warnings, []);
