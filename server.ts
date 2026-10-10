@@ -1,6 +1,6 @@
 import { grokLimitsCommand, grokLimitSnapshotSchema } from "./lib/grok-limits";
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
 import { z } from "zod";
 import {
@@ -105,12 +105,12 @@ export const grokLimitsMigration = `CREATE TABLE IF NOT EXISTS grok_limits (
 );`;
 
 export async function syncGrokLimits(
-  bb: BbPluginApi, db: Database, machine: Machine, signal: AbortSignal,
+  bb: BbPluginApi, db: Database, machine: Machine, home: string, signal: AbortSignal,
   executeHostCommand = runHostCommand,
 ) {
   try {
     const output = await executeHostCommand(bb, machine, grokLimitsCommand(), signal, {
-      title: "Usage: Grok Build limits", timeoutMs: 60_000,
+      title: "Usage: Grok Build limits", timeoutMs: 60_000, home,
     });
     const diagnostic = output.match(/__BB_USAGE_ERROR__:([^\r\n]+)/)?.[1]?.trim();
     if (diagnostic) throw new Error(diagnostic);
@@ -577,6 +577,7 @@ export async function syncDevin(
     const output = await executeHostCommand(bb, machine, devinCommand(home), signal, {
       title: "Usage: Devin scan",
       timeoutMs: DEVIN_SYNC_TIMEOUT_MS,
+      home,
     });
     const scan = extractHostJsonScan(output);
     if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
@@ -641,6 +642,7 @@ export async function syncKilocode(
     const output = await executeHostCommand(bb, machine, kilocodeCommand(home), signal, {
       title: "Usage: Kilo Code scan",
       timeoutMs: KILOCODE_SYNC_TIMEOUT_MS,
+      home,
     });
     const scan = extractHostJsonScan(output);
     if (scan.agentId !== agentId) throw new Error(`Host usage scan returned ${scan.agentId} data for ${agentId}.`);
@@ -678,7 +680,9 @@ function delay(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
 }
 
-type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number; home?: string };
+// `home` is the machine home from hosts.directory. It locates staged files and
+// selects the Windows runner, so every caller must pass it.
+type HostCommandOptions = { title: string; timeoutMs: number; pollMs?: number; home: string };
 
 function heldHostCommand(command: string) {
   return `( ${command} ); bb_usage_status=$?; printf '\\n%s:%s\\n' '__BB_HOST_COMMAND_DONE__' "$bb_usage_status"; while :; do sleep 3600; done`;
@@ -697,13 +701,10 @@ async function stageHostCommand(
   bb: BbPluginApi,
   machine: Machine,
   command: string,
-  home: string | undefined,
-  signal: AbortSignal,
+  home: string,
 ) {
-  const resolvedHome = home
-    ?? (await bb.sdk.hosts.directory({ hostId: machine.id, signal })).directory;
   const sha256 = createHash("sha256").update(command).digest("hex");
-  const path = `${resolvedHome}/.cache/bb-plugin-usage/host-command-${sha256}.sh`;
+  const path = `${home}/.cache/bb-plugin-usage/host-command-${sha256}.sh`;
   const result = await bb.sdk.files.write({
     hostId: machine.id,
     path,
@@ -723,6 +724,137 @@ function terminalOutputText(output: Awaited<ReturnType<BbPluginApi["sdk"]["termi
     .map((chunk) => Buffer.from(chunk.dataBase64, "base64").toString("utf8")).join("");
 }
 
+function completedHostCommandText(text: string, exitCode: number, title: string) {
+  if (exitCode !== 0) {
+    const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
+      ?? text.replace(/__BB_HOST_COMMAND_DONE__:\d+/g, "").trim().slice(-300);
+    throw new Error(diagnostic || `${title} exited with code ${exitCode}.`);
+  }
+  return text;
+}
+
+// Windows hosts open terminals in PowerShell or cmd, which cannot parse the
+// POSIX collectors, and ConPTY re-renders long output with cursor sequences
+// that corrupt the base64 scan payloads. There the collector runs under Git
+// for Windows' sh, and its output and exit status travel through files read
+// back with files.read instead of through the terminal.
+function isWindowsPath(path: string) {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
+}
+
+// PowerShell also treats curly and low-9 apostrophes as single quotes.
+function powerShellQuote(value: string) {
+  return `'${value.replace(/['\u2018\u2019\u201a\u201b]/g, "$&$&")}'`;
+}
+
+// -EncodedCommand (base64 UTF-16LE) parses the same from PowerShell and cmd,
+// so the launcher needs no quoting for whichever shell the terminal opens.
+function windowsLauncher(scriptPath: string, outputPath: string, statusPath: string) {
+  const missing = "__BB_USAGE_ERROR__:Git for Windows (sh.exe) is required to collect usage on Windows.";
+  const script = [
+    String.raw`$bbRoots = @()`,
+    String.raw`$bbGit = Get-Command git.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1`,
+    String.raw`if ($bbGit) { $bbDir = Split-Path -Parent $bbGit.Source; $bbRoots += (Split-Path -Parent $bbDir); $bbRoots += (Split-Path -Parent (Split-Path -Parent $bbDir)) }`,
+    String.raw`$bbRoots += "$env:ProgramFiles\Git", "$env:LOCALAPPDATA\Programs\Git"`,
+    String.raw`$bbSh = $null; $bbBin = $null`,
+    String.raw`foreach ($bbRoot in $bbRoots) { if (-not $bbSh -and $bbRoot -and (Test-Path -LiteralPath "$bbRoot\usr\bin\sh.exe")) { $bbBin = "$bbRoot\usr\bin"; $bbSh = "$bbBin\sh.exe" } }`,
+    String.raw`if (-not $bbSh) { $bbCmd = Get-Command sh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1; if ($bbCmd) { $bbSh = $bbCmd.Source; $bbBin = Split-Path -Parent $bbSh } }`,
+    `if (-not $bbSh) { Set-Content -LiteralPath ${powerShellQuote(outputPath)} -Value ${powerShellQuote(missing)}; Set-Content -LiteralPath ${powerShellQuote(statusPath)} -Value '127' -NoNewline; exit 127 }`,
+    String.raw`$env:PATH = "$bbBin;$env:PATH"`,
+    `& $bbSh ${powerShellQuote(scriptPath)}`,
+    String.raw`exit $LASTEXITCODE`,
+  ].join("; ");
+  return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${Buffer.from(script, "utf16le").toString("base64")}`;
+}
+
+async function readHostFile(bb: BbPluginApi, machine: Machine, path: string, signal: AbortSignal) {
+  try {
+    const file = await bb.sdk.files.read({ hostId: machine.id, path, signal });
+    return { text: Buffer.from(file.content, file.contentEncoding).toString("utf8"), sizeBytes: file.sizeBytes };
+  } catch {
+    signal.throwIfAborted();
+    return null;
+  }
+}
+
+async function runWindowsHostCommand(
+  bb: BbPluginApi,
+  machine: Machine,
+  command: string,
+  signal: AbortSignal,
+  options: HostCommandOptions,
+) {
+  const home = options.home.replace(/\\/g, "/").replace(/\/+$/, "");
+  const runDirectory = `${home}/.cache/bb-plugin-usage/runs/${randomUUID()}`;
+  const scriptPath = `${runDirectory}/command.sh`;
+  const outputPath = `${runDirectory}/output.txt`;
+  const statusPath = `${runDirectory}/status`;
+  // HOME in C:/ form keeps `$HOME/...` arguments valid for native node and
+  // python; MSYS's /c/ conversion is skipped for paths containing quotes.
+  const script = `HOME=${shellQuote(home)}; export HOME; ( ${command} ) > ${shellQuote(outputPath)} 2>&1; bb_usage_status=$?; printf '%s' "$bb_usage_status" > ${shellQuote(`${statusPath}.tmp`)} && mv -f ${shellQuote(`${statusPath}.tmp`)} ${shellQuote(statusPath)}\n`;
+  let terminalId: string | null = null;
+  try {
+    await bb.sdk.files.write({
+      hostId: machine.id,
+      path: scriptPath,
+      content: script,
+      contentEncoding: "utf8",
+      createParents: true,
+      expectedSha256: null,
+      mode: 0o600,
+    }).catch((error) => {
+      throw new Error(`${options.title} could not stage its command on ${machine.name}: ${errorMessage(error)}`);
+    });
+    signal.throwIfAborted();
+    const terminal = await bb.sdk.terminals.create({
+      scope: { kind: "host_path", hostId: machine.id, cwd: null },
+      cols: 120,
+      rows: 24,
+      title: options.title,
+      start: { mode: "command", command: windowsLauncher(scriptPath, outputPath, statusPath) },
+    });
+    terminalId = terminal.id;
+    const collect = async () => {
+      const status = await readHostFile(bb, machine, statusPath, signal);
+      if (!status || !/^\d+$/.test(status.text.trim())) return null;
+      const output = await readHostFile(bb, machine, outputPath, signal);
+      if (!output) throw new Error(`${options.title} finished but its output could not be read.`);
+      if (output.sizeBytes > 900_000) throw new Error(`${options.title} exceeded the 900 KB output limit.`);
+      return completedHostCommandText(output.text, Number(status.text.trim()), options.title);
+    };
+    const deadline = Date.now() + options.timeoutMs;
+    while (Date.now() < deadline) {
+      const result = await collect();
+      if (result !== null) return result;
+      const state = await bb.sdk.terminals.get({ terminalId: terminal.id, signal });
+      if (state.status !== "running" && state.status !== "starting" && state.status !== "disconnected") {
+        // The status file is written just before the shell exits, so look once
+        // more before reporting the launcher's own output as the failure.
+        const late = await collect();
+        if (late !== null) return late;
+        const output = await bb.sdk.terminals.output({ terminalId: terminal.id, tailBytes: 4000, limitChunks: 200, signal })
+          .then(terminalOutputText).catch(() => "");
+        const diagnostic = stripTerminalControls(output).replace(/\s+/g, " ").trim().slice(-300);
+        throw new Error(`${options.title} stopped before its output could be collected${diagnostic ? `: ${diagnostic}` : "."}`);
+      }
+      await delay(options.pollMs ?? 250);
+    }
+    throw new Error(`${options.title} timed out after ${Math.ceil(options.timeoutMs / 1000)} seconds.`);
+  } finally {
+    if (terminalId) {
+      await bb.sdk.terminals.close({ terminalId, mode: "force" }).catch(() => { /* already closed by the host */ });
+    }
+    await bb.sdk.files.remove({ hostId: machine.id, path: runDirectory, recursive: true }).catch(() => { /* best effort */ });
+  }
+}
+
+function stripTerminalControls(text: string) {
+  return text
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+    .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+    .replace(/\x1b[@-_]/g, "");
+}
+
 export async function runHostCommand(
   bb: BbPluginApi,
   machine: Machine,
@@ -730,12 +862,13 @@ export async function runHostCommand(
   signal: AbortSignal,
   options: HostCommandOptions,
 ) {
+  if (isWindowsPath(options.home)) return runWindowsHostCommand(bb, machine, command, signal, options);
   let startCommand = heldHostCommand(command);
   if (startCommand.length > HOST_COMMAND_MAX_CHARS) {
     // An oversized command can never be submitted, so a staging failure is
     // the real error; sending the inline command anyway would only reproduce
     // the contract's 10,000-character rejection.
-    const staged = await stageHostCommand(bb, machine, command, options.home, signal)
+    const staged = await stageHostCommand(bb, machine, command, options.home)
       .catch((error) => {
         throw new Error(`${options.title} could not stage its command on ${machine.name}: ${errorMessage(error)}`);
       });
@@ -763,15 +896,7 @@ export async function runHostCommand(
         if (output.truncated) throw new Error(`${options.title} exceeded the 900 KB output limit.`);
         const text = terminalOutputText(output);
         const completion = text.match(/__BB_HOST_COMMAND_DONE__:(\d+)/);
-        if (completion) {
-          const exitCode = Number(completion[1]);
-          if (exitCode !== 0) {
-            const diagnostic = text.match(/__BB_USAGE_ERROR__:(.+)/)?.[1]?.trim()
-              ?? text.replace(/__BB_HOST_COMMAND_DONE__:\d+/g, "").trim().slice(-300);
-            throw new Error(diagnostic || `${options.title} exited with code ${exitCode}.`);
-          }
-          return text;
-        }
+        if (completion) return completedHostCommandText(text, Number(completion[1]), options.title);
       } else if (state.status !== "starting" && state.status !== "disconnected") {
         throw new Error(`${options.title} stopped before its output could be collected.`);
       }
@@ -862,6 +987,7 @@ export async function syncOpenCode(
   bb: BbPluginApi,
   db: Database,
   machine: Machine,
+  home: string,
   signal: AbortSignal,
   executeHostCommand = runHostCommand,
 ) {
@@ -872,6 +998,7 @@ export async function syncOpenCode(
     const output = await executeHostCommand(bb, machine, openCodeCommand(), signal, {
       title: "Usage: OpenCode scan",
       timeoutMs: OPENCODE_SYNC_TIMEOUT_MS,
+      home,
     });
     const json = extractOpenCodeJson(output);
     const records = parseOpenCode(json, { machineId: machine.id, machineName: machine.name });
@@ -913,6 +1040,7 @@ export async function syncOpenCodeGo(
   bb: BbPluginApi,
   db: Database,
   machine: Machine,
+  home: string,
   signal: AbortSignal,
   executeHostCommand = runHostCommand,
 ) {
@@ -921,6 +1049,7 @@ export async function syncOpenCodeGo(
     const output = await executeHostCommand(bb, machine, openCodeGoUsageCommand(), signal, {
       title: "Usage: OpenCode Go limits",
       timeoutMs: OPENCODE_GO_SYNC_TIMEOUT_MS,
+      home,
     });
     const windows = parseOpenCodeGoUsage(extractOpenCodeJson(output));
     if (windows.length === 0) throw new Error("OpenCode Go usage response contained no limit windows.");
@@ -1123,9 +1252,9 @@ export default async function plugin(bb: BbPluginApi) {
           syncJsonAgent(bb, db, machine, home, "thaura", collectorSettings, timeoutSignal(JSON_AGENT_SYNC_TIMEOUT_MS, serviceSignal)),
           syncDevin(bb, db, machine, home, timeoutSignal(DEVIN_SYNC_TIMEOUT_MS, serviceSignal)),
           syncKilocode(bb, db, machine, home, timeoutSignal(KILOCODE_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncOpenCode(bb, db, machine, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
-          syncGrokLimits(bb, db, machine, timeoutSignal(60_000, serviceSignal)),
-          syncOpenCodeGo(bb, db, machine, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncOpenCode(bb, db, machine, home, timeoutSignal(OPENCODE_SYNC_TIMEOUT_MS, serviceSignal)),
+          syncGrokLimits(bb, db, machine, home, timeoutSignal(60_000, serviceSignal)),
+          syncOpenCodeGo(bb, db, machine, home, timeoutSignal(OPENCODE_GO_SYNC_TIMEOUT_MS, serviceSignal)),
         ]);
       }
       return new Date().toISOString();
