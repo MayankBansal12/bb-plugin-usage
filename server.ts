@@ -290,6 +290,9 @@ CREATE TABLE IF NOT EXISTS opencode_go_limit_state (
 );`;
 const openCodeGoFingerprintMigration = `
 ALTER TABLE opencode_go_limits ADD COLUMN account_fingerprint TEXT;`;
+// Retired agents no longer refresh their scan status. Drop their stale
+// warnings while preserving collected usage and its source mappings.
+const freebuffRetirementMigration = `DELETE FROM usage_sync_state WHERE provider_id='freebuff';`;
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -1074,7 +1077,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, freebuffRetirementMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),
