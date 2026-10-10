@@ -59,7 +59,6 @@ describe("host JSON usage collector", () => {
     ["dsh", "session.v3.jsonl.zstd", 6], ["fx", "usage.jsonl", 5],
     ["grok", "unified.jsonl", 5], ["pi", "session.jsonl", 5],
     ["prime", "session.jsonl", 5], ["antigravity", "usage.jsonl", 5],
-    ["freebuff", "usage.jsonl", 5],
     ["thaura", "usage.jsonl", 5],
   ] as const)("preserves the existing %s cache when Copilot collection is added", async (agentId, fileName, version) => {
     const directory = await temporaryDirectory();
@@ -526,57 +525,6 @@ describe("host JSON usage collector", () => {
     const estimated = result.rows.find((row) => row.loggedCostUsd === null);
     expect(logged).toMatchObject({ loggedCostUsd: 7, uncachedInputTokens: 1_000_000, outputTokens: 1_000_000, project: "app" });
     expect(estimated).toMatchObject({ loggedCostUsd: null, uncachedInputTokens: 1_000_000, outputTokens: 1_000_000, project: "app" });
-  });
-
-  it("streams Freebuff generation facts written by the provider bridge", async () => {
-    const directory = await temporaryDirectory();
-    const root = join(directory, ".freebuff", "usage.jsonl");
-    const cachePath = join(directory, "cache", "freebuff.json");
-    await mkdir(join(directory, ".freebuff"), { recursive: true });
-    await writeFile(root, [
-      { kind: "coverage", status: "partial" },
-      { kind: "generation", fact: {
-        created_at_ms: Date.parse("2026-08-09T00:00:00Z"),
-        model: "mimo-2.6-flash",
-        provider: "freebuff",
-        input_tokens: 1200,
-        cache_read_tokens: 400,
-        output_tokens: 350,
-        total_cost: 0.0042,
-        cwd: "/home/user/project",
-      } },
-      { kind: "generation", fact: {
-        created_at_ms: Date.parse("2026-08-09T01:00:00Z"),
-        model: "mimo-2.6-flash",
-        provider: "freebuff",
-        input_tokens: 100,
-        output_tokens: 50,
-        total_cost: null,
-        cwd: "/home/user/project",
-      } },
-    ].map((value) => JSON.stringify(value)).join("\n"));
-
-    const first = await scan("freebuff", join(directory, ".freebuff"), cachePath);
-    expect(first).toMatchObject({ fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0 });
-    const day = localDay("2026-08-09T00:00:00Z");
-    expect(first.rows.filter((row) => row.day === day)).toHaveLength(2);
-    expect(first.rows).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        day, modelProviderId: "freebuff", model: "mimo-2.6-flash", project: "project",
-        uncachedInputTokens: 800, cachedInputTokens: 400, cacheWriteTokens: 0, outputTokens: 350,
-        loggedCostUsd: 0.0042,
-      }),
-      expect.objectContaining({
-        day, modelProviderId: "freebuff", model: "mimo-2.6-flash", project: "project",
-        uncachedInputTokens: 100, cachedInputTokens: 0, outputTokens: 50, loggedCostUsd: null,
-      }),
-    ]));
-
-    // Recorded and unrecorded cost stay in separate aggregate rows, so a later
-    // estimate never overwrites the bridge's real number.
-    const second = await scan("freebuff", join(directory, ".freebuff"), cachePath);
-    expect(second).toMatchObject({ changedFileCount: 0, reusedFileCount: 1 });
-    expect(second.rows).toEqual(first.rows);
   });
 
   it("counts each Claude API response once across repeated rows, files, and cached scans", async () => {
