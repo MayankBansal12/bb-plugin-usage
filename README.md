@@ -62,6 +62,19 @@ Missing log roots are treated as normal “no data” results. Offline machines,
 
 ## Install
 
+Cursor subscription limits can also come from BB's `acp-cursor-sdk` provider.
+BB names custom ACP providers `acp-<id>`, and this plugin only reads that exact
+key, so the `customAgents` entry must already use `"id": "cursor-sdk"`; entries
+with other IDs are not discovered here. On that entry, set `"dialect": "cursor"`
+and `"providerUsage": true`. BB then reads the native Cursor CLI credentials and
+dashboard endpoints; the adapter does not need a quota extension. SDK login
+credentials are separate, so this reports the account signed in through the
+native Cursor CLI. Native Cursor may stay disabled. When both providers are
+enabled on a machine, they contribute a single Cursor entry: native quotas are
+used when available, otherwise the SDK provider's. Matching Cursor accounts on
+different machines are still grouped into one card. Each machine's subscription
+query may take up to 20 seconds.
+
 Requires BB 0.36 or newer.
 
 ```sh

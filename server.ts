@@ -96,7 +96,7 @@ const AGENTS = [
 const LIMIT_PROVIDERS = [
   { keys: ["codex"], id: "codex", name: "Codex" },
   { keys: ["claude-code", "claudeCode"], id: "claude", name: "Claude Code" },
-  { keys: ["acp-cursor", "cursor"], id: "cursor", name: "Cursor" },
+  { keys: ["acp-cursor", "acp-cursor-sdk", "cursor"], id: "cursor", name: "Cursor" },
 ] as const;
 export const grokLimitsMigration = `CREATE TABLE IF NOT EXISTS grok_limits (
   machine_id TEXT PRIMARY KEY, machine_name TEXT NOT NULL, snapshot_json TEXT,
@@ -155,7 +155,7 @@ export function loadStoredGrokLimits(db: Database, connectedMachineIds: Set<stri
   });
 }
 
-const PROVIDER_LIMITS_TIMEOUT_MS = 5_000;
+const PROVIDER_LIMITS_TIMEOUT_MS = 20_000;
 const DASHBOARD_HOSTS_TIMEOUT_MS = 5_000;
 const SYNC_HOSTS_TIMEOUT_MS = 10_000;
 const HOST_DIRECTORY_TIMEOUT_MS = 10_000;
@@ -190,7 +190,11 @@ export async function loadProviderLimits(
     try {
       const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
       rows.push(...LIMIT_PROVIDERS.flatMap((provider): ProviderLimitSource[] => {
-        const limit = provider.keys.map((key) => usage[key]).find((candidate) => candidate !== undefined);
+        // Aliases can report the same account (e.g. native Cursor and the Cursor SDK adapter).
+        // Prefer a usable quota in key order, then fall back to the first error.
+        const candidates = provider.keys.map((key) => usage[key]).filter((candidate) => candidate !== undefined);
+        const limit = candidates.find((candidate) => candidate.status === "ok" && candidate.windows.length > 0)
+          ?? candidates.find((candidate) => candidate.status === "error");
         if (!limit) return [];
         const source = {
           machineId: machine.id,
@@ -204,7 +208,6 @@ export async function loadProviderLimits(
           planLabel: typeof limit.planLabel === "string" ? limit.planLabel : null,
         };
         if (limit.status === "ok") {
-          if (limit.windows.length === 0) return [];
           return [{ ...source, windows: limit.windows, status: "ok" as const, error: null, lastUpdatedAt: null }];
         }
         if (limit.status === "error") {
