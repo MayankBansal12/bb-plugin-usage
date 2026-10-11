@@ -191,7 +191,11 @@ export async function loadProviderLimits(
     try {
       const usage = await bb.sdk.system.usageLimits({ hostId: machine.id, signal: AbortSignal.timeout(timeoutMs) });
       rows.push(...LIMIT_PROVIDERS.flatMap((provider): ProviderLimitSource[] => {
-        const limit = provider.keys.map((key) => usage[key]).find((candidate) => candidate !== undefined);
+        // Aliases can report the same account (e.g. native Cursor and the Cursor SDK adapter).
+        // Prefer a usable quota in key order, then fall back to the first error.
+        const candidates = provider.keys.map((key) => usage[key]).filter((candidate) => candidate !== undefined);
+        const limit = candidates.find((candidate) => candidate.status === "ok" && candidate.windows.length > 0)
+          ?? candidates.find((candidate) => candidate.status === "error");
         if (!limit) return [];
         const source = {
           machineId: machine.id,
@@ -205,7 +209,6 @@ export async function loadProviderLimits(
           planLabel: typeof limit.planLabel === "string" ? limit.planLabel : null,
         };
         if (limit.status === "ok") {
-          if (limit.windows.length === 0) return [];
           return [{ ...source, windows: limit.windows, status: "ok" as const, error: null, lastUpdatedAt: null }];
         }
         if (limit.status === "error") {

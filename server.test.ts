@@ -19,6 +19,7 @@ import plugin, {
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getSourceIssueMessage } from "./lib/usage-view-state";
+import type { ProviderLimitSource } from "./lib/provider-limits";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -570,8 +571,16 @@ describe("sync RPC", () => {
 });
 
 describe("provider limit loading", () => {
+  const openDbs: Database.Database[] = [];
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    for (const db of openDbs.splice(0)) db.close();
+  });
+
   function emptyDb() {
     const db = new Database(":memory:");
+    openDbs.push(db);
     db.exec(`
       CREATE TABLE usage_sources (source_id TEXT PRIMARY KEY, machine_id TEXT NOT NULL, machine_name TEXT NOT NULL, provider_id TEXT NOT NULL);
       CREATE TABLE usage_event_sources (event_key TEXT NOT NULL, source_id TEXT NOT NULL, PRIMARY KEY (event_key, source_id));
@@ -656,58 +665,178 @@ describe("provider limit loading", () => {
     ]);
   });
 
-  it.each([
-    ["acp-cursor-sdk"],
-    ["acp-cursor", "acp-cursor-sdk"],
-  ])("shows one Cursor quota card for provider keys %j", async (...keys) => {
-    const cursorLimit = {
+  describe("aliases for the same provider", () => {
+    const nativeCursor = {
+      status: "ok",
+      planLabel: "Pro",
+      accountEmail: "native@example.com",
+      windows: [{ label: "Monthly", usedPercent: 40, resetsAt: null }],
+    };
+    const sdkCursor = {
       status: "ok",
       planLabel: "Team",
-      accountEmail: null,
+      accountEmail: "sdk@example.com",
       windows: [{ label: "Plan usage", usedPercent: 5, resetsAt: null }],
     };
-    const usageLimits = vi.fn(async () => Object.fromEntries(keys.map((key) => [key, cursorLimit])));
-    const bb = {
-      sdk: { system: { usageLimits } },
-      log: { debug: vi.fn() },
-    } as unknown as BbPluginApi;
-
-    await expect(loadProviderLimits(bb, [
-      { id: "host_1", name: "Current machine", status: "connected" },
-    ], emptyDb())).resolves.toEqual([expect.objectContaining({
-      providerId: "cursor",
+    const legacyCursor = {
       status: "ok",
-      planLabel: "Team",
-      windows: cursorLimit.windows,
-    })]);
+      planLabel: "Legacy",
+      accountEmail: null,
+      windows: [{ label: "Requests", usedPercent: 70, resetsAt: null }],
+    };
+    const okEmpty = { status: "ok", planLabel: "Free", accountEmail: null, windows: [] };
+
+    function load(usage: Record<string, unknown>) {
+      const bb = {
+        sdk: { system: { usageLimits: vi.fn(async () => usage) } },
+        log: { debug: vi.fn() },
+      } as unknown as BbPluginApi;
+      return loadProviderLimits(bb, [
+        { id: "host_1", name: "Current machine", status: "connected" },
+      ], emptyDb(), 1_000);
+    }
+
+    function cursorRow(limit: Pick<ProviderLimitSource, "planLabel" | "accountEmail" | "windows">) {
+      return {
+        machineId: "host_1",
+        providerId: "cursor",
+        status: "ok",
+        error: null,
+        planLabel: limit.planLabel,
+        accountEmail: limit.accountEmail,
+        windows: limit.windows,
+      };
+    }
+
+    it.each([
+      ["native over SDK", { "acp-cursor": nativeCursor, "acp-cursor-sdk": sdkCursor }, nativeCursor],
+      ["native over SDK and legacy", { cursor: legacyCursor, "acp-cursor-sdk": sdkCursor, "acp-cursor": nativeCursor }, nativeCursor],
+      ["SDK over legacy", { "acp-cursor-sdk": sdkCursor, cursor: legacyCursor }, sdkCursor],
+      ["SDK only", { "acp-cursor-sdk": sdkCursor }, sdkCursor],
+      ["legacy only", { cursor: legacyCursor }, legacyCursor],
+    ])("prefers %s among usable Cursor quotas", async (_name, usage, expected) => {
+      const rows = await load(usage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual(expect.objectContaining(cursorRow(expected)));
+    });
+
+    it.each([
+      ["error", { status: "error", message: "native failed", planLabel: null, accountEmail: null }],
+      ["not_installed", { status: "not_installed" }],
+      ["unauthenticated", { status: "unauthenticated" }],
+      ["expired", { status: "expired" }],
+      ["ok without windows", okEmpty],
+    ])("uses SDK quotas when native Cursor is %s", async (_name, native) => {
+      const rows = await load({ "acp-cursor": native, "acp-cursor-sdk": sdkCursor });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual(expect.objectContaining(cursorRow(sdkCursor)));
+    });
+
+    it("falls back to legacy Cursor quotas when native and SDK are unusable", async () => {
+      const rows = await load({
+        "acp-cursor": { status: "error", message: "native failed", planLabel: null, accountEmail: null },
+        "acp-cursor-sdk": { status: "unauthenticated" },
+        cursor: legacyCursor,
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual(expect.objectContaining(cursorRow(legacyCursor)));
+    });
+
+    it.each([
+      ["native", { "acp-cursor": { status: "error", message: "native failed" }, "acp-cursor-sdk": { status: "expired" } }, "native failed"],
+      ["SDK", { "acp-cursor": { status: "not_installed" }, "acp-cursor-sdk": { status: "error", message: "sdk failed" } }, "sdk failed"],
+      ["first", {
+        "acp-cursor": { status: "error", message: "native failed" },
+        "acp-cursor-sdk": { status: "error", message: "sdk failed" },
+      }, "native failed"],
+      ["SDK (native empty)", { "acp-cursor": okEmpty, "acp-cursor-sdk": { status: "error", message: "sdk failed" } }, "sdk failed"],
+    ])("reports the %s error when no Cursor alias has quotas", async (_name, usage, message) => {
+      const rows = await load(usage);
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toEqual(expect.objectContaining({ providerId: "cursor", status: "error", error: message, windows: [] }));
+    });
+
+    it("omits Cursor when every alias is unavailable or empty", async () => {
+      await expect(load({
+        "acp-cursor": { status: "not_installed" },
+        "acp-cursor-sdk": okEmpty,
+        cursor: { status: "unauthenticated" },
+      })).resolves.toEqual([]);
+    });
+
+    it("applies the same selection to Claude Code aliases", async () => {
+      const rows = await load({
+        "claude-code": { status: "error", message: "rate limited", planLabel: null, accountEmail: null },
+        claudeCode: { status: "ok", planLabel: "Max", accountEmail: null, windows: [{ label: "5 hours", usedPercent: 30, resetsAt: null }] },
+      });
+      expect(rows).toEqual([expect.objectContaining({ providerId: "claude", status: "ok", planLabel: "Max" })]);
+    });
   });
 
-  it("retains quota responses that take more than five seconds", async () => {
-    const usageLimits = vi.fn(({ signal }: { signal: AbortSignal }) => new Promise((resolve, reject) => {
-      const timer = setTimeout(() => resolve({
-        "acp-cursor": {
-          status: "ok",
-          planLabel: "Team",
-          windows: [{ label: "Plan usage", usedPercent: 5, resetsAt: null }],
-        },
-      }), 6_000);
-      signal.addEventListener("abort", () => {
-        clearTimeout(timer);
-        reject(signal.reason);
-      }, { once: true });
-    }));
-    const bb = {
-      sdk: { system: { usageLimits } },
-      log: { debug: vi.fn() },
-    } as unknown as BbPluginApi;
-    const result = loadProviderLimits(bb, [
-      { id: "host_1", name: "Current machine", status: "connected" },
-    ], emptyDb());
-    const assertion = expect(result).resolves.toEqual([
-      expect.objectContaining({ providerId: "cursor", status: "ok" }),
-    ]);
-    await assertion;
-  }, 8_000);
+  describe("request timeout", () => {
+    const quota = {
+      "acp-cursor": {
+        status: "ok",
+        planLabel: "Team",
+        accountEmail: null,
+        windows: [{ label: "Plan usage", usedPercent: 5, resetsAt: null }],
+      },
+    };
+
+    // AbortSignal.timeout runs on Node's internal timers, which fake timers do not control.
+    function fakeAbortSignalTimeout() {
+      vi.useFakeTimers();
+      return vi.spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+        const controller = new AbortController();
+        setTimeout(() => controller.abort(new DOMException("The operation timed out.", "TimeoutError")), ms);
+        return controller.signal;
+      });
+    }
+
+    function stalledUsageLimits(resolveAfterMs?: number) {
+      return vi.fn(({ signal }: { signal: AbortSignal }) => new Promise((resolve, reject) => {
+        const timer = resolveAfterMs === undefined ? undefined : setTimeout(() => resolve(quota), resolveAfterMs);
+        signal.addEventListener("abort", () => {
+          clearTimeout(timer);
+          reject(signal.reason);
+        }, { once: true });
+      }));
+    }
+
+    function bbWith(usageLimits: ReturnType<typeof stalledUsageLimits>) {
+      return { sdk: { system: { usageLimits } }, log: { debug: vi.fn() } } as unknown as BbPluginApi;
+    }
+
+    it("retains quota responses that take more than five seconds", async () => {
+      const timeout = fakeAbortSignalTimeout();
+      const result = loadProviderLimits(bbWith(stalledUsageLimits(6_000)), [
+        { id: "host_1", name: "Current machine", status: "connected" },
+      ], emptyDb());
+      await vi.advanceTimersByTimeAsync(6_000);
+      await expect(result).resolves.toEqual([
+        expect.objectContaining({ providerId: "cursor", status: "ok" }),
+      ]);
+      expect(timeout).toHaveBeenCalledWith(20_000);
+    });
+
+    it("aborts a stalled request at the 20 second default", async () => {
+      fakeAbortSignalTimeout();
+      const usageLimits = stalledUsageLimits();
+      let settled = false;
+      const result = loadProviderLimits(bbWith(usageLimits), [
+        { id: "host_1", name: "Current machine", status: "connected" },
+      ], emptyDb()).finally(() => { settled = true; });
+      const { signal } = usageLimits.mock.calls[0]![0];
+
+      await vi.advanceTimersByTimeAsync(19_999);
+      expect(signal.aborted).toBe(false);
+      expect(settled).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(signal.aborted).toBe(true);
+      await expect(result).resolves.toEqual([]);
+    });
+  });
 
   it("surfaces a provider error (e.g. rate limited) instead of hiding the provider", async () => {
     const usageLimits = vi.fn(async () => ({
