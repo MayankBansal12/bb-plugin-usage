@@ -55,7 +55,7 @@ afterEach(async () => {
 
 describe("host JSON usage collector", () => {
   it.each([
-    ["codex", "rollout-cached.jsonl", 6], ["claude", "session.jsonl", 5],
+    ["codex", "rollout-cached.jsonl", 7], ["claude", "session.jsonl", 5],
     ["dsh", "session.v3.jsonl.zstd", 6], ["fx", "usage.jsonl", 5],
     ["grok", "unified.jsonl", 5], ["pi", "session.jsonl", 5],
     ["prime", "session.jsonl", 5], ["antigravity", "usage.jsonl", 5],
@@ -205,6 +205,140 @@ describe("host JSON usage collector", () => {
     const extended = await scan("codex", roots, cachePath);
     expect(extended.rows.map((row) => row.uncachedInputTokens)).toEqual([300, 75]);
     expect((await scan("codex", roots, cachePath)).rows).toEqual(extended.rows);
+  });
+
+  describe("Codex calls with running totals", () => {
+    // Counters for one call plus the rollout's running totals after it.
+    type Call = { input: number; output: number; totalInput: number; total: number; at?: string };
+    const meta = (id: string, at: string, forkedFrom?: string) => ({
+      timestamp: at, type: "session_meta", payload: { id, cwd: "/work/project", forked_from_id: forkedFrom },
+    });
+    const call = ({ input, output, totalInput, total, at = "2026-08-09T12:00:01Z" }: Call) => ({
+      timestamp: at, type: "event_msg", payload: { type: "token_count", info: {
+        last_token_usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: output, reasoning_output_tokens: 0 },
+        total_token_usage: { input_tokens: totalInput, total_tokens: total },
+      } },
+    });
+    const rollout = (...lines: object[]) => [{ type: "turn_context", payload: { model: "gpt-5.6-sol" } }, ...lines]
+      .map((value) => JSON.stringify(value)).join("\n");
+    const first: Call = { input: 100, output: 10, totalInput: 100, total: 110, at: "2026-08-09T12:00:01Z" };
+    const second: Call = { input: 200, output: 20, totalInput: 300, total: 330, at: "2026-08-09T12:05:00Z" };
+    const forkAt = "2026-08-12T09:00:00.000Z";
+    // Older forks replay ancestor metadata and history in one burst at fork time.
+    const copied = (call: Call, ms: number) => ({ ...call, at: `2026-08-12T09:00:00.${String(ms).padStart(3, "0")}Z` });
+
+    async function scanSessions(files: Record<string, string>) {
+      const directory = await temporaryDirectory();
+      const root = join(directory, "sessions");
+      await mkdir(root, { recursive: true });
+      for (const [name, content] of Object.entries(files)) await writeFile(join(root, name), content);
+      return scan("codex", root, join(directory, "cache.json"));
+    }
+
+    it("counts a repeated token_count record in the same rollout once", async () => {
+      const result = await scanSessions({ "rollout-a.jsonl": rollout(meta("a", first.at!), call(first),
+        call({ ...first, at: "2026-08-09T12:00:21Z" }), call(second)) });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 300, outputTokens: 30 })]);
+    });
+
+    it("skips history an older fork copied from its ancestors", async () => {
+      const third: Call = { input: 400, output: 40, totalInput: 700, total: 770, at: "2026-08-12T09:00:30Z" };
+      const result = await scanSessions({
+        "rollout-parent.jsonl": rollout(meta("parent", first.at!), call(first), call(second)),
+        "rollout-child.jsonl": rollout(meta("child", forkAt, "parent"), meta("parent", forkAt),
+          call(copied(first, 1)), call(copied(second, 2)), call(third)),
+      });
+      expect(result.rows).toEqual([
+        expect.objectContaining({ day: localDay(first.at!), uncachedInputTokens: 300, outputTokens: 30 }),
+        expect.objectContaining({ day: localDay(forkAt), uncachedInputTokens: 400, outputTokens: 40 }),
+      ]);
+    });
+
+    it("skips copied history from nested forks", async () => {
+      const own: Call = { input: 50, output: 5, totalInput: 350, total: 385, at: "2026-08-12T09:00:30Z" };
+      const result = await scanSessions({
+        "rollout-root.jsonl": rollout(meta("root", first.at!), call(first), call(second)),
+        "rollout-grandchild.jsonl": rollout(meta("grandchild", forkAt, "child"), meta("child", forkAt, "root"),
+          meta("root", forkAt), call(copied(first, 1)), call(copied(second, 2)), call(own)),
+      });
+      expect(result.rows).toEqual([
+        expect.objectContaining({ uncachedInputTokens: 300, outputTokens: 30 }),
+        expect.objectContaining({ uncachedInputTokens: 50, outputTokens: 5 }),
+      ]);
+    });
+
+    it("counts identical calls made independently after a fork", async () => {
+      // Parent and fork continue from the same running totals, so their next
+      // calls can share every counter while being separate requests.
+      const after: Call = { input: 200, output: 20, totalInput: 300, total: 330, at: "2026-08-12T09:00:30Z" };
+      const result = await scanSessions({
+        "rollout-parent.jsonl": rollout(meta("parent", first.at!), call(first), call(after)),
+        "rollout-new-fork.jsonl": rollout(meta("new-fork", forkAt, "parent"), call(after)),
+        "rollout-old-fork.jsonl": rollout(meta("old-fork", forkAt, "parent"), meta("parent", forkAt),
+          call(copied(first, 1)), call(after)),
+      });
+      expect(result.rows.reduce((sum, row) => sum + row.uncachedInputTokens, 0)).toBe(700);
+    });
+
+    it("counts a call that repeats an earlier one after the running totals reset", async () => {
+      // A full context window overwrites the totals, so later calls can carry
+      // counters seen before the reset.
+      const reset = { input: 0, output: 0, totalInput: 50, total: 60 };
+      const result = await scanSessions({ "rollout-a.jsonl": rollout(meta("a", first.at!),
+        call({ ...first, input: 100, totalInput: 150, total: 160 }), call(reset),
+        call({ ...first, input: 100, totalInput: 150, total: 160, at: "2026-08-09T12:10:00Z" })) });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 200, outputTokens: 20 })]);
+    });
+
+    it("counts an older fork's own calls however busy its start was", async () => {
+      const own: Call = { input: 200, output: 20, totalInput: 300, total: 330, at: "2026-08-12T09:00:06.100Z" };
+      const live = Array.from({ length: 12 }, (_, index) => (index + 1) * 500).map((ms) => ({
+        timestamp: new Date(Date.parse(forkAt) + ms).toISOString(), type: "event_msg", payload: { type: "agent_reasoning" },
+      }));
+      const result = await scanSessions({ "rollout-fork.jsonl": rollout(meta("fork", forkAt, "parent"), meta("parent", forkAt),
+        call(copied(first, 100)), ...live, call(own)) });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 200, outputTokens: 20 })]);
+    });
+
+    it.each([[-3_600_000, 200], [1_999, 0], [2_000, 200]])("treats a call %i ms after an older fork's start as copied only inside the window", async (offset, expected) => {
+      const own: Call = { ...second, at: new Date(Date.parse(forkAt) + offset).toISOString() };
+      const result = await scanSessions({ "rollout-fork.jsonl": rollout(meta("fork", forkAt, "parent"), meta("parent", forkAt), call(own)) });
+      expect(result.rows.reduce((sum, row) => sum + row.uncachedInputTokens, 0)).toBe(expected);
+    });
+
+    it("skips a repeat of the last copied call after an older fork's window", async () => {
+      const result = await scanSessions({ "rollout-fork.jsonl": rollout(meta("fork", forkAt, "parent"), meta("parent", forkAt),
+        call(copied(first, 1)), call({ ...first, at: "2026-08-12T09:00:05Z" })) });
+      expect(result.rows).toEqual([]);
+    });
+
+    it("skips copied history stamped with numeric timestamps", async () => {
+      const at = Date.parse(forkAt);
+      const result = await scanSessions({ "rollout-fork.jsonl": rollout({ ...meta("fork", forkAt, "parent"), timestamp: at },
+        { ...meta("parent", forkAt), timestamp: at }, { ...call(first), timestamp: at + 1 }) });
+      expect(result.rows).toEqual([]);
+    });
+
+    it("counts an older fork in full when its start time is unknown", async () => {
+      const { timestamp: _, ...undated } = meta("fork", forkAt, "parent");
+      const result = await scanSessions({ "rollout-fork.jsonl": rollout(undated, meta("parent", forkAt),
+        call(copied(first, 1)), call({ ...second, at: "2026-08-12T09:00:30Z" })) });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 300, outputTokens: 30 })]);
+    });
+
+    it("does not treat a resumed session's repeated metadata as a fork", async () => {
+      const result = await scanSessions({ "rollout-a.jsonl": rollout(meta("a", first.at!), call(first),
+        meta("a", "2026-08-09T12:05:00Z"), { ...call(second), timestamp: "2026-08-09T12:05:00.001Z" }) });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 300, outputTokens: 30 })]);
+    });
+
+    it("keeps identical calls from unrelated sessions", async () => {
+      const result = await scanSessions({
+        "rollout-a.jsonl": rollout(meta("a", first.at!), call(first)),
+        "rollout-b.jsonl": rollout(meta("b", first.at!), call(first)),
+      });
+      expect(result.rows).toEqual([expect.objectContaining({ uncachedInputTokens: 200, outputTokens: 20 })]);
+    });
   });
 
   it("deduplicates Codex archive copies by rollout filename when session metadata is absent", async () => {
@@ -653,7 +787,7 @@ describe("host JSON usage collector", () => {
     const result = await scan("codex", root, cachePath);
     expect(result.reusedFileCount).toBe(0);
     expect(result.rows.map((row) => row.day)).not.toContain("1999-01-01");
-    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(6);
+    expect(JSON.parse(await readFile(cachePath, "utf8")).version).toBe(7);
   });
 
   it("decodes concatenated dsh session frames and aggregates settlement usage", async () => {

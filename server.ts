@@ -296,6 +296,11 @@ ALTER TABLE opencode_go_limits ADD COLUMN account_fingerprint TEXT;`;
 // Retired agents no longer refresh their scan status. Drop their stale
 // warnings while preserving collected usage and its source mappings.
 const freebuffRetirementMigration = `DELETE FROM usage_sync_state WHERE provider_id='freebuff';`;
+const scanRevisionMigration = `ALTER TABLE usage_sources ADD COLUMN scan_revision INTEGER;`;
+// Raise when a Codex collector fix lowers counts that earlier scans stored.
+// Rescans normally keep per-counter maxima, so the first complete scan at a
+// new revision replaces the buckets it reports instead.
+const CODEX_SCAN_REVISION = 1;
 
 function opaqueId(...parts: string[]) {
   return createHash("sha256").update(parts.join("\0")).digest("hex");
@@ -354,7 +359,8 @@ function upsertState(db: Database, machineId: string, agentId: AgentId, status: 
     .run(machineId, agentId, status, now, successful ? now : null, recordCount, error);
 }
 
-function upsertSourceEvents(db: Database, source: { id: string; rootReference: string; sha256: string; generation: string }, machine: Machine, agentId: AgentId, records: UsageRecord[]) {
+function upsertSourceEvents(db: Database, source: { id: string; rootReference: string; sha256: string; generation: string }, machine: Machine, agentId: AgentId, records: UsageRecord[], replace = false) {
+  const merged = (column: string) => replace ? `excluded.${column}` : `MAX(${column}, excluded.${column})`;
   const insertEvent = db.prepare(`INSERT INTO usage_events (
       event_key, timestamp, day, provider_id, provider_name, model, cost_usd, cache_savings_usd,
       processed_tokens, cached_input_tokens, cache_write_tokens, uncached_input_tokens, output_tokens,
@@ -363,14 +369,12 @@ function upsertSourceEvents(db: Database, source: { id: string; rootReference: s
     ON CONFLICT(event_key) DO UPDATE SET timestamp=excluded.timestamp, day=excluded.day, provider_id=excluded.provider_id,
     provider_name=excluded.provider_name, model=excluded.model, project=excluded.project,
     cost_usd=excluded.cost_usd, cache_savings_usd=excluded.cache_savings_usd,
-    processed_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens)
-      + MAX(cache_write_tokens, excluded.cache_write_tokens)
-      + MAX(uncached_input_tokens, excluded.uncached_input_tokens)
-      + MAX(output_tokens, excluded.output_tokens),
-    cached_input_tokens=MAX(cached_input_tokens, excluded.cached_input_tokens),
-    cache_write_tokens=MAX(cache_write_tokens, excluded.cache_write_tokens),
-    uncached_input_tokens=MAX(uncached_input_tokens, excluded.uncached_input_tokens),
-    output_tokens=MAX(output_tokens, excluded.output_tokens),
+    processed_tokens=${merged("cached_input_tokens")} + ${merged("cache_write_tokens")}
+      + ${merged("uncached_input_tokens")} + ${merged("output_tokens")},
+    cached_input_tokens=${merged("cached_input_tokens")},
+    cache_write_tokens=${merged("cache_write_tokens")},
+    uncached_input_tokens=${merged("uncached_input_tokens")},
+    output_tokens=${merged("output_tokens")},
     -- Logged costs are authoritative vendor figures: always take the newest,
     -- so price corrections (up or down) flow through instead of freezing at
     -- the first observed value.
@@ -526,15 +530,20 @@ async function syncJsonAgent(
     // are added, so reconciliation keeps history whose logs are no longer present.
     const sourceRoots = agentId === "codex" ? [`${home}/.codex/sessions`] : roots;
     const sourceId = opaqueId(machine.id, agentId, "host-json-scan-v1", ...sourceRoots);
+    const complete = scan.failureCount === 0;
+    const revision = (db.prepare("SELECT scan_revision revision FROM usage_sources WHERE source_id=?")
+      .get(sourceId) as { revision: number | null } | undefined)?.revision ?? 0;
+    // Buckets absent from the scan are kept: their logs may have been deleted.
+    const replace = agentId === "codex" && complete && revision < CODEX_SCAN_REVISION;
     upsertSourceEvents(db, {
       id: sourceId,
       rootReference: opaqueId(...roots),
       sha256: createHash("sha256").update(aggregateJson).digest("hex"),
       generation,
-    }, machine, agentId, records);
+    }, machine, agentId, records, replace);
+    if (replace) db.prepare("UPDATE usage_sources SET scan_revision=? WHERE source_id=?").run(CODEX_SCAN_REVISION, sourceId);
     reconcileSources(db, machine.id, agentId, generation);
 
-    const complete = scan.failureCount === 0;
     const recordCount = countForMachine(db, machine.id, agentId);
     const status = !complete ? "partial" : recordCount > 0 ? "ready" : "no-data";
     const error = scan.failureCount > 0
@@ -1209,7 +1218,7 @@ export default async function plugin(bb: BbPluginApi) {
     },
   });
   const db = bb.storage.database();
-  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, freebuffRetirementMigration]);
+  bb.storage.migrate(db, [migration, pricingMigration, syncMetadataMigration, multiAgentMigration, pricingCatalogMigration, projectMigration, openCodeGoLimitsMigration, openCodeGoFingerprintMigration, grokLimitsMigration, freebuffRetirementMigration, scanRevisionMigration]);
   activateCachedCatalog(db);
   const syncCoordinator = createSyncCoordinator({
     completedAt: readLastCompletedSyncAt(db),

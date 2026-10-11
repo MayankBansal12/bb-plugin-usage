@@ -178,7 +178,9 @@ describe("Freebuff retirement upgrade", () => {
     let activeStatesBefore: unknown;
     const history = () => ({
       events: db.prepare("SELECT * FROM usage_events ORDER BY event_key").all(),
-      sources: db.prepare("SELECT * FROM usage_sources ORDER BY source_id").all(),
+      // Later migrations may add empty columns; compare the recorded values.
+      sources: (db.prepare("SELECT * FROM usage_sources ORDER BY source_id").all() as Array<Record<string, unknown>>)
+        .map(({ scan_revision: _, ...source }) => source),
       mappings: db.prepare("SELECT * FROM usage_event_sources ORDER BY event_key, source_id").all(),
     });
     const activeStates = () => db.prepare("SELECT * FROM usage_sync_state WHERE provider_id <> 'freebuff' ORDER BY machine_id, provider_id").all();
@@ -2277,6 +2279,28 @@ describe("retained usage through the real sync path", () => {
       state.rows = [];
       await syncAgain();
       expect(totals(db)).toEqual({ count: 3, tokens: 4500, cost: 4.5 });
+    } finally { db.close(); }
+  });
+
+  it("replaces inflated Codex buckets once on the first complete scan after the dedup fix", async () => {
+    setPricingCatalog(catalog(1000), "codex-revision-v1");
+    const state = { rows: [piRow(), piRow({ project: "copied-only" })], failureCount: 0 };
+    const { db, syncAgain } = await bootHarness(state, "codex");
+    try {
+      // A database written before the fix has no revision on its Codex source.
+      db.prepare("UPDATE usage_sources SET scan_revision=NULL").run();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.rows = [piRow({ uncachedInputTokens: 400, outputTokens: 100 })];
+      state.failureCount = 1;
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 3000, cost: 3 });
+      state.failureCount = 0;
+      await syncAgain();
+      // The reported bucket drops to the corrected value; the absent one is kept.
+      expect(totals(db)).toEqual({ count: 2, tokens: 2000, cost: 2 });
+      state.rows = [piRow({ uncachedInputTokens: 300, outputTokens: 100 })];
+      await syncAgain();
+      expect(totals(db)).toEqual({ count: 2, tokens: 2000, cost: 2 });
     } finally { db.close(); }
   });
 

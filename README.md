@@ -21,7 +21,7 @@ Track coding-agent token usage and estimated API cost across every machine enrol
 
 ## Supported data sources
 
-- Codex: `rollout-*.jsonl` files recursively under both `sessions/` and `archived_sessions/` in `~/.codex` and each `~/.codex-profiles/<name>` home; each profile reports as its own agent, `Codex (<name>)`. Additional homes can be configured in plugin settings.
+- Codex: `rollout-*.jsonl` files recursively under both `sessions/` and `archived_sessions/` in `~/.codex` and each `~/.codex-profiles/<name>` home; each profile reports as its own agent, `Codex (<name>)`. Additional homes can be configured in plugin settings. A call logged twice in a row is counted once. Forks saved in Codex's older copied-history format replay their ancestors' history; that copy is skipped and counted in the original session's rollout, so it is missing if that rollout was deleted.
 - Claude Code: `~/.claude/projects/**/*.jsonl`
 - DeepSeek Harness: `~/.dsh/sessions/*/*/session.v3.jsonl.zstd` (Zstandard-compressed JSONL; requires Node.js 22.15+ on the machine)
 - Devin: `~/.local/share/devin/cli/sessions.db` — the Devin CLI's SQLite session store, opened read-only (`$XDG_DATA_HOME` is honored). Devin runs in BB through the `acp-devin` provider and writes no JSONL session logs.

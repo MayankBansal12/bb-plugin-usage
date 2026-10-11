@@ -86,10 +86,12 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
   // v6 (copilot): add session summaries.
   // v7 (copilot): uncached input subtracts cache reads and writes; rows cached
   // under v6 keep the double-counted values and must be reparsed.
+  // v7 (codex): skip history copied into older forks and back-to-back repeated
+  // token_count records, and key buckets by the rollout's own session.
   // Other agents retain their existing versions; adding Copilot must not
   // force users without Copilot to reparse unrelated session logs.
-  const cacheVersion = input.agentId === "copilot" ? 7
-    : input.agentId === "dsh" || input.agentId === "codex" ? 6 : 5;
+  const cacheVersion = input.agentId === "copilot" || input.agentId === "codex" ? 7
+    : input.agentId === "dsh" ? 6 : 5;
   const allowedAgents = new Set<HostJsonAgentId>(["codex", "claude", "copilot", "dsh", "fx", "grok", "pi", "prime", "antigravity", "thaura"]);
   if (!allowedAgents.has(input.agentId)) throw new Error("Unsupported usage agent.");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(input.sinceDay)) throw new Error("Invalid usage history boundary.");
@@ -338,6 +340,17 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
     const fileAccount = accountByPath.get(filePath);
     let codexModel = "codex-unknown";
     let codexSessionId = path.basename(filePath);
+    let codexSessionKnown = false;
+    // Older Codex forks start by replaying every ancestor's session_meta and
+    // history, re-stamped within milliseconds of the fork.
+    // Those calls already count in the ancestors' rollouts, so a fork carrying
+    // ancestor metadata skips token counts stamped within two seconds of its
+    // start. Without a usable timestamp nothing is skipped.
+    let codexForkStart = NaN;
+    let codexCopiedHistory = false;
+    // Codex can log the same call twice in a row; counters and running totals
+    // identify the repeat. Totals can reset, so only the previous call matches.
+    let codexLastCall = "";
     // Session-scoped project, learned from the first record that carries a
     // working directory and reused for later rows in the same file.
     let sessionProject = "Unknown";
@@ -368,7 +381,15 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
 
       if (input.agentId === "codex") {
         const payload = object(value.payload);
-        if (value.type === "session_meta" && payload) codexSessionId = text(payload.id, codexSessionId);
+        const stamp = typeof value.timestamp === "string" || typeof value.timestamp === "number"
+          ? new Date(value.timestamp).getTime() : NaN;
+        if (value.type === "session_meta" && payload) {
+          if (!codexSessionKnown) {
+            codexSessionId = text(payload.id, codexSessionId);
+            codexForkStart = stamp;
+          } else if (payload.id !== codexSessionId) codexCopiedHistory = true;
+          codexSessionKnown = true;
+        }
         if ((value.type === "turn_context" || value.type === "session_meta") && payload) {
           codexModel = text(payload.model, codexModel);
           if (typeof payload.cwd === "string") sessionProject = projectName(payload.cwd);
@@ -377,6 +398,13 @@ async function hostJsonCollector(encodedInput: string, dependencies: CollectorDe
         const usage = object(object(payload.info)?.last_token_usage);
         const usageDay = day(value.timestamp);
         if (!usage || !usageDay) continue;
+        const totals = object(object(payload.info)?.total_token_usage);
+        const call = finite(totals?.total_tokens) === null ? "" : JSON.stringify([usage.input_tokens,
+          usage.cached_input_tokens, usage.output_tokens, usage.reasoning_output_tokens, totals?.total_tokens, totals?.input_tokens]);
+        const repeated = call !== "" && call === codexLastCall;
+        codexLastCall = call;
+        const sinceFork = stamp - codexForkStart;
+        if (repeated || (codexCopiedHistory && sinceFork >= 0 && sinceFork < 2000)) continue;
         const inputTokens = count(usage.input_tokens);
         const cached = Math.min(inputTokens, count(usage.cached_input_tokens));
         add(rows, {
