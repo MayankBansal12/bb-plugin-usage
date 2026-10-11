@@ -347,6 +347,12 @@ export function UsageDashboardSkeleton() {
           </div>
 
           <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+            <div className="flex items-center justify-center border-b border-border/60 px-5 py-4">
+              <div className="relative size-[132px]">
+                <Shimmer className="size-full rounded-full" />
+                <div className="absolute inset-[22px] rounded-full bg-background" />
+              </div>
+            </div>
             {compactView ? (
               <div>
                 <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
@@ -359,6 +365,7 @@ export function UsageDashboardSkeleton() {
                 {[0, 1, 2, 3, 4].map((row) => (
                   <div key={row} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
                     <div className="flex items-center gap-2">
+                      <Shimmer className="size-2 shrink-0 rounded-full" />
                       <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
                       <Shimmer className="h-3.5 w-full max-w-[150px] rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
                     </div>
@@ -393,6 +400,7 @@ export function UsageDashboardSkeleton() {
                     <tr key={row} className="border-b border-border/60 last:border-0">
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">
+                          <Shimmer className="size-2 shrink-0 rounded-full" />
                           <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
                           <Shimmer className="h-3.5 w-40 rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
                         </div>
