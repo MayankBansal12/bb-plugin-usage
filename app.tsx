@@ -208,15 +208,21 @@ function UsageSortButton({ metric, sort, onSort }: {
   );
 }
 
-function BreakdownValue({ metric, row, totals }: {
+function BreakdownValue({ metric, row, totals, compactView = false }: {
   metric: MetricMode;
   row: { cost: number; tokens: number; unknown?: boolean };
   totals: { cost: number; processed: number; unknownTokens: number };
+  compactView?: boolean;
 }) {
   const unknownCost = row.unknown && row.cost === 0;
   return (
-    <div className="whitespace-nowrap tabular-nums">
-      <div className="text-sm font-medium">
+    <div className={`min-w-0 tabular-nums ${compactView ? "" : "whitespace-nowrap"}`}>
+      {compactView && (
+        <div className="mb-1 text-[11px] text-muted-foreground">
+          {metric === "tokens" ? "Tokens" : "Cost"}
+        </div>
+      )}
+      <div className="break-words text-sm font-medium">
         {metric === "tokens" ? compact(row.tokens) : <PricedCost cost={row.cost} unknown={row.unknown} />}
       </div>
       {(metric === "tokens" || !unknownCost) && (
@@ -224,7 +230,7 @@ function BreakdownValue({ metric, row, totals }: {
           className="mt-0.5 text-[11px] font-normal text-muted-foreground"
           title={metric === "cost" && totals.unknownTokens > 0 ? "Share of priced cost; usage with unknown pricing is excluded." : undefined}
         >
-          {metric === "tokens" ? `${percentage(row.tokens, totals.processed)} of tokens` : `${percentage(row.cost, totals.cost)} of cost`}
+          {percentage(metric === "tokens" ? row.tokens : row.cost, metric === "tokens" ? totals.processed : totals.cost)} of {compactView ? "total" : metric}
         </div>
       )}
     </div>
@@ -706,15 +712,17 @@ function AgentCell({
   agent,
   others,
   mode,
+  showLogo = true,
 }: {
   agentId: string;
   agent: string;
   others?: Array<{ id: string; name: string; cost: number; tokens: number; unknown?: boolean }>;
   mode: MetricMode;
+  showLogo?: boolean;
 }) {
   return (
-    <span className="inline-flex min-w-0 items-center gap-2 text-muted-foreground">
-      <ProviderLogo id={agentId} name={agent} size="sm" />
+    <span className="inline-flex min-w-0 max-w-full items-center gap-2 text-muted-foreground">
+      {showLogo && <ProviderLogo id={agentId} name={agent} size="sm" />}
       <span className="truncate">{agent}</span>
       {others && others.length > 0 && (
         <TooltipProvider>
@@ -1386,13 +1394,25 @@ function UsageDashboard() {
         ) : (
           <>
             {stackedView && (
-              <ToggleGroup
-                value={mobileSection}
-                onChange={setMobileSection}
-                label="Dashboard section"
-                fill
-                options={[{ value: "chart", label: "Usage chart" }, { value: "breakdown", label: "Breakdown" }]}
-              />
+              <div className={compactView ? "" : "flex flex-wrap items-center justify-between gap-3"}>
+                <ToggleGroup
+                  value={mobileSection}
+                  onChange={setMobileSection}
+                  label="Dashboard section"
+                  fill={compactView}
+                  options={[{ value: "chart", label: "Usage chart" }, { value: "breakdown", label: "Breakdown" }]}
+                />
+                {!compactView && mobileSection === "breakdown" && (
+                  <div className="flex items-center gap-2">
+                    <ToggleGroup
+                      value={breakdownMode}
+                      onChange={setBreakdownMode}
+                      label="Breakdown grouping"
+                      options={[{ value: "model", label: "Model" }, { value: "project", label: "Project" }, { value: "day", label: "Day" }]}
+                    />
+                  </div>
+                )}
+              </div>
             )}
 
             {(!stackedView || mobileSection === "chart") && (
@@ -1529,49 +1549,77 @@ function UsageDashboard() {
             )}
 
             {(!stackedView || mobileSection === "breakdown") && (
-            <section>
-              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-                <h2 className="text-sm font-semibold">Breakdown</h2>
+            <section aria-label="Usage breakdown">
+              {(!stackedView || compactView) && (
                 <ToggleGroup
                   value={breakdownMode}
                   onChange={setBreakdownMode}
                   label="Breakdown grouping"
+                  fill={compactView}
                   options={[{ value: "model", label: "Model" }, { value: "project", label: "Project" }, { value: "day", label: "Day" }]}
                 />
-              </div>
+              )}
 
               {compactView ? (
-                <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
-                  <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
+                <div className="mt-2">
+                  <div className="mb-2 flex min-w-0 items-center justify-between gap-2 text-xs text-muted-foreground">
                     <span>Sort by</span>
                     <div className="flex items-center gap-3" role="group" aria-label="Breakdown sorting">
                       <UsageSortButton metric="tokens" sort={breakdownSort} onSort={sortBreakdown} />
                       <UsageSortButton metric="cost" sort={breakdownSort} onSort={sortBreakdown} />
                     </div>
                   </div>
-                  {paginatedBreakdown.items.map((row) => (
-                    <div key={row.key} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
-                      <div className="flex min-w-0 items-center gap-2 text-sm font-medium">
-                        {breakdownMode === "model" && <ProviderLogo id={modelLogoId(row.label)} size="sm" />}
-                        <span className="truncate" title={row.label}>{row.label}</span>
-                      </div>
-                      {breakdownMode !== "day" && (
-                        <div className="mt-1.5 text-xs">
-                          <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
+                  <ul className="space-y-2" aria-label={`Usage by ${breakdownMode}`}>
+                    {paginatedBreakdown.items.map((row) => (
+                      <li key={row.key} className={`min-w-0 px-3 py-3 ${CARD_CLASSES}`}>
+                        <div className="flex min-w-0 items-start gap-2.5">
+                          {breakdownMode === "model" && (
+                            <span className="mt-0.5 shrink-0">
+                              <ProviderLogo id={modelLogoId(row.label)} size="sm" />
+                            </span>
+                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="break-words text-sm font-medium leading-5 [overflow-wrap:anywhere]" title={row.label}>
+                              {row.label}
+                            </div>
+                            {breakdownMode !== "day" && (
+                              <div className="mt-0.5 flex min-w-0 text-[11px] leading-4">
+                                <AgentCell
+                                  agentId={row.agentId}
+                                  agent={row.agent}
+                                  others={row.otherAgents}
+                                  mode={breakdownSort.metric}
+                                  showLogo={breakdownMode !== "model"}
+                                />
+                              </div>
+                            )}
+                          </div>
                         </div>
-                      )}
-                      <div className="mt-3 grid grid-cols-2 gap-4">
-                        <BreakdownValue metric="tokens" row={row} totals={totals} />
-                        <div className="text-right">
-                          <BreakdownValue metric="cost" row={row} totals={totals} />
+                        <div className="mt-2.5 grid grid-cols-2 gap-3 border-t border-border/40 pt-2.5">
+                          <BreakdownValue metric="tokens" row={row} totals={totals} compactView />
+                          <div className="min-w-0 border-l border-border/40 pl-3 text-right">
+                            <BreakdownValue metric="cost" row={row} totals={totals} compactView />
+                          </div>
                         </div>
-                      </div>
-                    </div>
-                  ))}
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               ) : (
-                <div className={`mt-3 overflow-x-auto ${CARD_CLASSES}`}>
-                  <table className="w-full border-collapse text-sm" aria-label="Usage breakdown" style={{ minWidth: breakdownMode === "day" ? 440 : 600 }}>
+                <div className={`${stackedView ? "" : "mt-3"} overflow-x-auto ${CARD_CLASSES}`}>
+                  <table
+                    className={`w-full border-collapse text-sm ${stackedView ? "table-fixed" : ""}`}
+                    aria-label="Usage breakdown"
+                    style={stackedView ? undefined : { minWidth: breakdownMode === "day" ? 440 : 600 }}
+                  >
+                    {stackedView && (
+                      <colgroup>
+                        <col style={{ width: breakdownMode === "day" ? "40%" : "35%" }} />
+                        {breakdownMode !== "day" && <col style={{ width: "25%" }} />}
+                        <col style={{ width: breakdownMode === "day" ? "30%" : "20%" }} />
+                        <col style={{ width: breakdownMode === "day" ? "30%" : "20%" }} />
+                      </colgroup>
+                    )}
                     <thead>
                       <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
                         <th scope="col" className="px-4 py-2.5 text-left font-medium">
@@ -1592,12 +1640,12 @@ function UsageDashboard() {
                         <tr key={row.key} className="border-b border-border/60 transition-colors duration-150 hover:bg-muted/20 last:border-0">
                           <td className="px-4 py-3 font-medium">
                             {breakdownMode === "model" ? (
-                              <span className="inline-flex min-w-0 items-center gap-2">
+                              <span className="flex min-w-0 items-center gap-2">
                                 <ProviderLogo id={modelLogoId(row.label)} size="sm" />
                                 <span className="truncate" title={`${row.label} · ${row.provider}`}>{row.label}</span>
                               </span>
                             ) : (
-                              <span className="truncate" title={row.label}>{row.label}</span>
+                              <span className="block truncate" title={row.label}>{row.label}</span>
                             )}
                           </td>
                           {breakdownMode !== "day" && (
@@ -1605,10 +1653,10 @@ function UsageDashboard() {
                               <AgentCell agentId={row.agentId} agent={row.agent} others={row.otherAgents} mode={breakdownSort.metric} />
                             </td>
                           )}
-                          <td className="px-4 py-3 align-top text-right">
+                          <td className="px-4 py-3 text-right">
                             <BreakdownValue metric="tokens" row={row} totals={totals} />
                           </td>
-                          <td className="px-4 py-3 align-top text-right">
+                          <td className="px-4 py-3 text-right">
                             <BreakdownValue metric="cost" row={row} totals={totals} />
                           </td>
                         </tr>
