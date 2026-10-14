@@ -333,49 +333,70 @@ export function UsageDashboardSkeleton() {
         </section>
 
         {/* Match the fixed metric columns and default token sort. */}
-        <section>
-          <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2">
-            <Label className="text-sm font-semibold">Breakdown</Label>
-            <ToggleGroupPreview
-              value="model"
-              options={[
-                { value: "model", label: "Model" },
-                { value: "project", label: "Project" },
-                { value: "day", label: "Day" },
-              ]}
-            />
-          </div>
+        <section aria-label="Usage breakdown">
+          <ToggleGroupPreview
+            value="model"
+            fill={compactView}
+            options={[
+              { value: "model", label: "Model" },
+              { value: "project", label: "Project" },
+              { value: "day", label: "Day" },
+            ]}
+          />
 
-          <div className={`mt-3 overflow-hidden ${CARD_CLASSES}`}>
+          <div className={compactView ? "mt-2" : `mt-3 overflow-hidden ${CARD_CLASSES}`}>
             {compactView ? (
               <div>
-                <div className="flex items-center justify-between gap-3 border-b border-border/60 bg-muted/20 px-3.5 py-1 text-xs text-muted-foreground">
+                <div className="mb-2 flex min-w-0 items-center justify-between gap-2 text-xs text-muted-foreground">
                   <span>Sort by</span>
                   <div className="flex items-center gap-3" aria-hidden="true">
                     <span className="inline-flex min-h-8 items-center gap-1.5 px-1 font-medium text-foreground [@media(pointer:coarse)]:min-h-11">Tokens <Icon name="ArrowDown" className="size-3.5" /></span>
                     <span className="inline-flex min-h-8 items-center gap-1.5 px-1 font-medium [@media(pointer:coarse)]:min-h-11">Cost <Icon name="ArrowUpDown" className="size-3.5" /></span>
                   </div>
                 </div>
-                {[0, 1, 2, 3, 4].map((row) => (
-                  <div key={row} className="border-b border-border/60 px-3.5 py-3 last:border-b-0">
-                    <div className="flex items-center gap-2">
-                      <Shimmer className="size-[18px] shrink-0 rounded-[4px]" />
-                      <Shimmer className="h-3.5 w-full max-w-[150px] rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
-                    </div>
-                    <Shimmer className="mt-1.5 h-4 w-24 rounded" />
-                    <div className="mt-3 grid grid-cols-2 gap-4">
-                      {[0, 1].map((metric) => (
-                        <div key={metric} className={metric === 1 ? "justify-self-end" : ""}>
-                          <Shimmer className={`h-5 w-16 rounded ${metric === 1 ? "ml-auto" : ""}`} />
-                          <Shimmer className="mt-0.5 h-4 w-24 rounded" />
+                <div className="space-y-2">
+                  {[0, 1, 2, 3, 4].map((row) => (
+                    <div key={row} className={`min-w-0 px-3 py-3 ${CARD_CLASSES}`}>
+                      <div className="flex items-start gap-2.5">
+                        <Shimmer className="mt-0.5 size-[18px] shrink-0 rounded-[4px]" />
+                        <div className="min-w-0 flex-1">
+                          <div className="flex h-5 items-center">
+                            <Shimmer className="h-3.5 w-full max-w-[150px] rounded" style={{ animationDelay: `${-row * 0.18}s` }} />
+                          </div>
+                          <div className="mt-0.5 flex h-4 items-center">
+                            <Shimmer className="h-3 w-20 rounded" />
+                          </div>
                         </div>
-                      ))}
+                      </div>
+                      <div className="mt-2.5 grid grid-cols-2 gap-3 border-t border-border/40 pt-2.5">
+                        {[0, 1].map((metric) => (
+                          <div key={metric} className={metric === 1 ? "min-w-0 border-l border-border/40 pl-3 text-right" : "min-w-0"}>
+                            <div className="mb-1 text-[11px] text-muted-foreground">
+                              {metric === 0 ? "Tokens" : "Cost"}
+                            </div>
+                            <div className={`flex h-5 items-center ${metric === 1 ? "justify-end" : ""}`}>
+                              <Shimmer className="h-4 w-16 rounded" />
+                            </div>
+                            <div className={`mt-0.5 flex h-4 items-center ${metric === 1 ? "justify-end" : ""}`}>
+                              <Shimmer className="h-3 w-20 rounded" />
+                            </div>
+                          </div>
+                        ))}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  ))}
+                </div>
               </div>
             ) : (
-              <table className="w-full border-collapse text-sm">
+              <table className={`w-full border-collapse text-sm ${stackedView ? "table-fixed" : ""}`}>
+                {stackedView && (
+                  <colgroup>
+                    <col style={{ width: "35%" }} />
+                    <col style={{ width: "25%" }} />
+                    <col style={{ width: "20%" }} />
+                    <col style={{ width: "20%" }} />
+                  </colgroup>
+                )}
                 <thead>
                   <tr className="border-b border-border bg-muted/20 text-xs text-muted-foreground">
                     <th className="px-4 py-2.5 text-left font-medium">Model</th>
