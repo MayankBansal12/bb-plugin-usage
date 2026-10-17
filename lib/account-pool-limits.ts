@@ -124,6 +124,8 @@ export function mergeAccountPoolLimits(local: UnifiedProviderLimit[], pooled: Un
       windows: mergeLimitWindows([pool, { windows: localWindowsForPool(match, pool) }]),
       planLabel: pool.planLabel ?? match.planLabel,
       machines: match.machines,
+      ...(match.resetCredits && pool.planLabel?.trim().toLowerCase() === match.planLabel?.trim().toLowerCase()
+        ? { resetCredits: match.resetCredits } : {}),
     };
   });
   return [...local.filter((limit) => !merged.has(limit.id)), ...limits];
@@ -153,7 +155,11 @@ export function createAccountPoolLimitsLoader(bb: BbPluginApi, timeoutMs = 5000)
       const message = reason instanceof Error ? reason.message : String(reason);
       bb.log.debug(`Account Pooler limits unavailable: ${message}`);
       return {
-        limits: cached,
+        limits: cached.map((limit) => ({
+          ...limit,
+          status: "error" as const,
+          error: limit.error ?? "Account Pooler couldn’t refresh. Showing the last reported values.",
+        })),
         error: `Couldn’t refresh Account Pooler limits.${cached.length ? " Showing the last reported pool limits." : ""}`,
       };
     } finally {

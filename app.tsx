@@ -3,7 +3,9 @@ import type { ReactNode } from "react";
 import { definePluginApp, useRealtime, useRealtimeConnectionState, useRpc } from "@bb/plugin-sdk/app";
 import type { rpcContract } from "./server";
 import { Icon } from "@/components/ui/icon";
+import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { ToggleGroup } from "@/components/ui/toggle-group";
@@ -17,6 +19,8 @@ import { isUsageSyncInProgress, shouldPollUsage, shouldShowInitialUsageLoading, 
 import { getEmptyUsageView, getSourceIssueMessage } from "@/lib/usage-view-state";
 import { clampPercent, formatLimitReset, formatLimitValue, isLimitVisibleOnMachine, maskEmailAddresses, type UnifiedProviderLimit } from "@/lib/provider-limits";
 import { formatLocalMoney, localCurrency, usdToLocalRate } from "@/lib/local-currency";
+import { providerResetAction, resetCreditExpiry } from "@/lib/provider-resets";
+import { limitAccountLabel, limitCardNotice, limitStatusTag, type LimitCardNotice } from "@/lib/limit-card";
 
 type Range = 7 | 30 | 90;
 type BreakdownMode = "model" | "project" | "day";
@@ -757,14 +761,57 @@ function AgentCell({
   );
 }
 
-function LimitBadge({ children, title }: { children: ReactNode; title?: string }) {
+function LimitBadge({ children, title, tone = "muted", dot = false }: {
+  children: ReactNode;
+  title?: string;
+  tone?: "muted" | "danger";
+  dot?: boolean;
+}) {
   return (
     <span
-      className="inline-flex min-w-0 max-w-full items-center truncate rounded-md border border-border/50 bg-muted/40 px-1.5 py-0.5 text-[10px] leading-none text-muted-foreground"
+      className={`inline-flex h-5 min-w-0 max-w-full items-center gap-1 rounded-md border px-1.5 text-[11px] leading-none ${tone === "danger"
+        ? "border-destructive/30 bg-destructive/10 text-destructive"
+        : "border-border/50 bg-muted/40 text-muted-foreground"}`}
       title={title}
     >
-      {children}
+      {dot && <span className="size-1.5 shrink-0 rounded-full bg-destructive" aria-hidden="true" />}
+      <span className="truncate">{children}</span>
     </span>
+  );
+}
+
+function LimitNotice({ notice, account }: { notice: LimitCardNotice; account: string }) {
+  return (
+    <Dialog>
+      <div className="mt-3 flex items-start gap-2 border-t border-border/50 pt-3">
+        <Icon name="AlertCircle" className="mt-1 size-3.5 shrink-0 text-destructive" aria-hidden="true" />
+        <div className="min-w-0 flex-1 py-0.5 text-xs leading-4">
+          <p className="text-foreground/80 [overflow-wrap:anywhere]">{notice.title}</p>
+          {notice.stale && <p className="mt-0.5 text-muted-foreground">{notice.stale.label}</p>}
+        </div>
+        <DialogTrigger asChild>
+          <button type="button" className="-mr-1 shrink-0 rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            aria-label={`View error details for ${account}`}>
+            Details
+          </button>
+        </DialogTrigger>
+      </div>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>{notice.title}</DialogTitle>
+          <DialogDescription className="[overflow-wrap:anywhere]">{account}</DialogDescription>
+        </DialogHeader>
+        <div className="max-h-[50vh] space-y-3 overflow-y-auto text-sm leading-5 text-muted-foreground">
+          {notice.details.map((line, index) => (
+            <p key={index} className="whitespace-pre-wrap [overflow-wrap:anywhere]">{line}</p>
+          ))}
+          {notice.stale?.at && <p>Last updated {new Date(notice.stale.at).toLocaleString()}</p>}
+        </div>
+        <div className="flex justify-end">
+          <DialogClose asChild><Button size="sm" variant="outline">Close</Button></DialogClose>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 
@@ -773,21 +820,28 @@ function ProviderLimits({
   contentWidth,
   loading,
   error,
+  stale,
+  onResetOpen,
 }: {
   limits: ProviderLimitData;
   contentWidth: number;
   loading: boolean;
   error: string | null;
+  stale: boolean;
+  onResetOpen: () => void;
 }) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const showMachineTags = limits.some((limit) => limit.machines.length > 1)
     || new Set(limits.flatMap((limit) => limit.machines.map((machine) => machine.machineId))).size > 1;
-  const availableColumns =
-    contentWidth > 0 && contentWidth < 640 ? 1 : contentWidth > 0 && contentWidth < 900 ? 2 : 3;
+  const availableColumns = contentWidth >= 1120 ? 3 : contentWidth >= 760 ? 2 : 1;
   const columnCount = Math.max(1, Math.min(availableColumns, limits.length || 1));
-  const showBadges = showMachineTags || limits.some((limit) => limit.poolAccount);
 
   return (
-    <section className="rounded-xl border border-border/70 bg-muted/[0.08] p-4 sm:p-5" aria-labelledby="provider-limits-title">
+    <section className="min-w-0" aria-labelledby="provider-limits-title">
       <div className="flex items-baseline justify-between gap-3">
         <h2 id="provider-limits-title" className="text-sm font-medium">Usage limits</h2>
         <span className="text-xs text-muted-foreground">Current plan windows</span>
@@ -801,88 +855,70 @@ function ProviderLimits({
         <p className="mt-2 text-xs text-muted-foreground">No usage limits are available from connected machines or Account Pooler.</p>
       ) : (
         <div
-          className="mt-4 grid gap-3"
-          style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))` }}
+          className="mt-3 grid items-start gap-3"
+          style={{ gridTemplateColumns: `repeat(${columnCount}, minmax(0, 480px))` }}
         >
           {limits.map((limit) => {
-            const accountLabel = maskEmailAddresses(limit.poolAccount?.label ?? limit.accountEmail ?? "");
-            const badgeRow = Boolean(limit.poolAccount) || showMachineTags || (columnCount > 1 && showBadges);
-            const poolStatus = limit.poolAccount?.status;
+            const accountLabel = limitAccountLabel(limit);
+            const notice = limitCardNotice(limit, now, stale);
+            const statusTag = limitStatusTag(limit);
+            const machineTags = showMachineTags ? limit.machines : [];
+            const resetOffer = !stale && limit.resetCredits ? resetCreditExpiry(limit.resetCredits, now) : null;
+            const resetAction = stale ? null : providerResetAction(limit, now);
+            const noticeAccount = accountLabel || maskEmailAddresses(limit.machines.map((machine) => machine.machineName).join(", "));
             return (
               <div
                 key={limit.id}
-                className="grid min-w-0 gap-y-1 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
-                style={{ gridRow: `span ${2 + Number(badgeRow)}`, gridTemplateRows: "subgrid" }}
+                className="min-w-0 rounded-lg border border-border/60 bg-muted/20 p-4"
+                data-limit-card={limit.id}
               >
-                <div className="flex min-w-0 items-center justify-between gap-3">
-                  <span className="flex min-w-0 max-w-[45%] shrink-0 items-center gap-2">
-                    <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
-                    <span className="truncate text-xs font-medium">{limit.providerName}</span>
-                  </span>
-                  <div className="ml-auto flex min-w-0 flex-1 items-center justify-end gap-2">
-                    {accountLabel && (
-                      <span className="truncate text-[11px] leading-4 text-muted-foreground" title={accountLabel}>
-                        {accountLabel}
-                      </span>
-                    )}
-                    {limit.planLabel && (
-                      <div className="flex max-w-[45%] shrink-0">
-                        <LimitBadge title={maskEmailAddresses(limit.planLabel)}>{maskEmailAddresses(limit.planLabel)}</LimitBadge>
-                      </div>
-                    )}
-                  </div>
+                <div className="flex min-w-0 items-center gap-2">
+                  <ProviderLogo id={limit.providerId} name={limit.providerName} size="sm" />
+                  <span className="min-w-0 flex-1 truncate text-sm font-medium">{limit.providerName}</span>
+                  {limit.planLabel && (
+                    <span className="flex max-w-[45%] shrink-0">
+                      <LimitBadge title={maskEmailAddresses(limit.planLabel)}>{maskEmailAddresses(limit.planLabel)}</LimitBadge>
+                    </span>
+                  )}
                 </div>
-                {badgeRow && (
-                  <div className="flex min-h-4 flex-wrap content-start items-start gap-1">
-                    {limit.poolAccount && <LimitBadge title="Shared across machines">Account Pooler</LimitBadge>}
-                    {showMachineTags && limit.machines.map((machine) => (
-                      <LimitBadge
-                        key={machine.machineId}
-                        title={maskEmailAddresses(machine.error ? `${machine.machineName}: ${machine.error}` : machine.machineName)}
-                      >
-                        {maskEmailAddresses(machine.machineName)}
-                      </LimitBadge>
-                    ))}
-                    {poolStatus && poolStatus !== "ready" && (
-                      <LimitBadge>{poolStatus === "exhausted" ? "Limit reached" : poolStatus.charAt(0).toUpperCase() + poolStatus.slice(1)}</LimitBadge>
-                    )}
-                  </div>
-                )}
-                <div className="min-w-0 self-start pt-0.5">
-                  {limit.error && (
-                    <div className="mb-2 flex min-w-0 items-start gap-1.5">
-                      <Icon name="AlertCircle" className="mt-px size-3.5 shrink-0 text-destructive" aria-hidden="true" />
-                      <p className="min-w-0 flex-1 text-[10px] leading-4 text-destructive/90 [overflow-wrap:anywhere]">
-                        {maskEmailAddresses(limit.poolAccount
-                          ? `Account Pooler couldn’t refresh ${limit.providerName} limits: ${limit.error}`
-                          : limit.status === "error"
-                            ? `Couldn’t load ${limit.providerName} limits: ${limit.error}`
-                            : `Some machines couldn’t refresh ${limit.providerName}: ${limit.machines
-                              .filter((machine) => machine.status === "error")
-                              .map((machine) => machine.machineName).join(", ")}. ${limit.error}`)}
-                        {limit.status === "error" && limit.windows.length > 0
-                          ? limit.poolAccount
-                            ? " Showing available limits."
-                            : ` Showing cached values${limit.lastUpdatedAt ? ` from ${new Date(limit.lastUpdatedAt).toLocaleString()}` : ""}.`
-                          : ""}
-                      </p>
+                <div className="min-w-0">
+                  {accountLabel ? (
+                    <p className="pt-1 text-xs leading-4 text-muted-foreground [overflow-wrap:anywhere]">{accountLabel}</p>
+                  ) : null}
+                </div>
+                <div className="min-w-0">
+                  {(limit.poolAccount || machineTags.length > 0 || statusTag) && (
+                    <div className="flex flex-wrap gap-1 pt-2">
+                      {limit.poolAccount && <LimitBadge title="Shared across machines">Account Pooler</LimitBadge>}
+                      {machineTags.map((machine) => (
+                        <LimitBadge
+                          key={machine.machineId}
+                          dot={machine.status === "error" || Boolean(machine.error)}
+                          title={maskEmailAddresses(machine.error ? `${machine.machineName}: ${machine.error}` : machine.machineName)}
+                        >
+                          {maskEmailAddresses(machine.machineName)}
+                        </LimitBadge>
+                      ))}
+                      {statusTag && <LimitBadge tone={statusTag.tone}>{statusTag.label}</LimitBadge>}
                     </div>
                   )}
+                </div>
+                <div className="min-w-0">
                   {limit.windows.length > 0 && (
-                    <div className="space-y-1.5">
+                    <div className={`space-y-3 pt-4 ${limit.poolAccount?.status === "disabled" || (notice?.stale && !notice.stale.partial) ? "opacity-60" : ""}`}>
                       {limit.windows.map((window, index) => {
-                        const reset = formatLimitReset(window.resetsAt);
+                        const reset = formatLimitReset(window.resetsAt, now);
                         const usedPercent = clampPercent(window.usedPercent);
                         return (
                           <div key={`${window.label}:${index}`}>
-                            <div className="flex items-center justify-between gap-3 text-[10px] leading-4">
-                              <span className="truncate text-muted-foreground">{window.label}{reset ? ` · ${reset}` : ""}</span>
+                            <div className="flex items-center justify-between gap-3 text-xs leading-4">
+                              <span className="truncate text-muted-foreground" title={window.resetsAt ? new Date(window.resetsAt).toLocaleString() : undefined}>{window.label}{reset ? ` · ${reset}` : ""}</span>
                               <span className="shrink-0 tabular-nums text-foreground/80">{formatLimitValue(window)}</span>
                             </div>
                             <div
                               className="mt-1 h-1.5 overflow-hidden rounded-full bg-muted"
                               role="progressbar"
-                              aria-label={maskEmailAddresses(`${limit.providerName} ${limit.poolAccount?.label ?? limit.accountEmail ?? limit.planLabel ?? limit.machines.map((machine) => machine.machineName).join(", ")} ${window.label}`)}
+                              aria-label={maskEmailAddresses(`${limit.providerName} ${accountLabel || limit.planLabel || limit.machines.map((machine) => machine.machineName).join(", ")} ${window.label}`)}
                               aria-valuemin={0}
                               aria-valuemax={100}
                               aria-valuenow={Math.round(usedPercent)}
@@ -901,7 +937,30 @@ function ProviderLimits({
                     </div>
                   )}
                   {limit.windows.length === 0 && limit.poolAccount && !limit.error && (
-                    <p className="text-[10px] leading-4 text-muted-foreground">{limit.poolAccount.emptyMessage}</p>
+                    <p className="pt-4 text-xs leading-4 text-muted-foreground">{limit.poolAccount.emptyMessage}</p>
+                  )}
+                </div>
+                {notice && <LimitNotice notice={notice} account={`${limit.providerName}${noticeAccount ? ` · ${noticeAccount}` : ""}`} />}
+                <div className="min-w-0">
+                  {(resetOffer || resetAction) && (
+                    <div className={`flex flex-wrap items-center justify-between gap-x-3 gap-y-2 text-xs leading-4 ${notice ? "mt-3" : "mt-4 border-t border-border/50 pt-3"}`}>
+                      {resetOffer && (
+                        <span className="min-w-0">
+                          <span className="text-foreground/90">{resetOffer.count} {resetOffer.count === 1 ? "reset" : "resets"} available</span>
+                          <span className="text-muted-foreground" title={resetOffer.expiresAt ? new Date(resetOffer.expiresAt).toLocaleString() : undefined}>
+                            {" · "}{resetOffer.label}
+                          </span>
+                        </span>
+                      )}
+                      {resetAction && (
+                        <Button asChild size="sm" variant="outline" className="ml-auto h-8 shrink-0 gap-1.5 px-2.5 text-xs">
+                          <a href={resetAction.href} target="_blank" rel="noopener noreferrer" onClick={onResetOpen}
+                            aria-label={`${resetAction.label} for ${limit.providerName}${accountLabel ? ` (${accountLabel})` : ""}, opens the provider’s usage page`}>
+                            {resetAction.label}<Icon name="ExternalLink" className="size-3" aria-hidden="true" />
+                          </a>
+                        </Button>
+                      )}
+                    </div>
                   )}
                 </div>
               </div>
@@ -1034,7 +1093,9 @@ function UsageDashboard() {
   const [providerLimits, setProviderLimits] = useState<ProviderLimitData>([]);
   const [providerLimitsError, setProviderLimitsError] = useState<string | null>(null);
   const [providerLimitsLoading, setProviderLimitsLoading] = useState(false);
+  const [providerLimitsStale, setProviderLimitsStale] = useState(false);
   const providerLimitsRequestId = useRef(0);
+  const refreshAfterReset = useRef(false);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
   const [chartMode, setChartMode] = useState<MetricMode>("tokens");
@@ -1069,14 +1130,30 @@ function UsageDashboard() {
       const nextLimits = await rpc.call("providerLimits");
       if (providerLimitsRequestId.current !== requestId) return;
       setProviderLimits(nextLimits.limits);
+      setProviderLimitsStale(false);
       setProviderLimitsError(nextLimits.accountPoolError);
     } catch (reason) {
       if (providerLimitsRequestId.current !== requestId) return;
+      setProviderLimitsStale(true);
       setProviderLimitsError(`Couldn’t refresh usage limits: ${reason instanceof Error ? reason.message : String(reason)}`);
     } finally {
       if (providerLimitsRequestId.current === requestId) setProviderLimitsLoading(false);
     }
   }, [rpc]);
+
+  useEffect(() => {
+    const refresh = () => {
+      if (!showUsageLimits || !refreshAfterReset.current || document.visibilityState !== "visible") return;
+      refreshAfterReset.current = false;
+      void loadProviderLimits();
+    };
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [loadProviderLimits, showUsageLimits]);
 
   const sync = useCallback(() => {
     setSyncRequested(true);
@@ -1373,6 +1450,8 @@ function UsageDashboard() {
             contentWidth={contentWidth}
             loading={providerLimitsLoading}
             error={providerLimitsError}
+            stale={providerLimitsStale}
+            onResetOpen={() => { refreshAfterReset.current = true; }}
           />
         )}
 

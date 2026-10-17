@@ -18,7 +18,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { jsonAgentCommand, devinCommand, kilocodeCommand, syncGrokLimits } = await import("../dist/server.js");
+const { jsonAgentCommand, devinCommand, kilocodeCommand, syncGrokLimits, loadCodexResetCredits } = await import("../dist/server.js");
 hooks.deregister();
 
 function temporaryHome(t) {
@@ -39,6 +39,42 @@ function scan(output) {
   assert.ok(encoded, `Missing scan result: ${output}`);
   return JSON.parse(gunzipSync(Buffer.from(encoded, "base64")));
 }
+
+test("production Codex reset collection reads and normalizes the CLI protocol", async (t) => {
+  const fixtureDir = temporaryHome(t);
+  const bin = join(fixtureDir, "bin");
+  mkdirSync(bin);
+  symlinkSync(process.execPath, join(bin, "node"));
+  writeFileSync(join(bin, "codex"), `#!/usr/bin/env node
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const { id, method } = JSON.parse(line);
+  if (method === 'initialized') return;
+  const responses = {
+    initialize: {},
+    'account/read': { account: { type: 'chatgpt', email: 'user@example.com', planType: 'pro' } },
+    'account/rateLimits/read': { rateLimitResetCredits: { availableCount: 1, credits: [
+      { id: 'private-id', status: 'available', resetType: 'codexRateLimits', expiresAt: 1800000000 }
+    ] } }
+  };
+  if (!Object.hasOwn(responses, method)) process.exit(1);
+  console.log(JSON.stringify({ id, result: responses[method] }));
+});`, { mode: 0o755 });
+  const bb = { sdk: { hosts: { directory: async () => ({ directory: fixtureDir }) } }, log: { debug() {} } };
+  const limits = [{
+    id: 'personal', providerId: 'codex', providerName: 'Codex', accountEmail: 'user@example.com',
+    planLabel: 'Pro', windows: [], status: 'ok', error: null, lastUpdatedAt: null,
+    machines: [{ machineId: 'local', machineName: 'Local', status: 'ok' }],
+  }];
+  const [result] = await loadCodexResetCredits(bb, limits, async (_bb, _machine, command) => {
+    return execFileSync('/bin/sh', ['-c', command], {
+      encoding: 'utf8', timeout: 15000, env: { ...process.env, PATH: bin, NODE_OPTIONS: '' },
+    });
+  });
+  assert.deepEqual(result.resetCredits, {
+    availableCount: 1, credits: [{ expiresAt: new Date(1800000000000).toISOString() }],
+  });
+  assert.doesNotMatch(JSON.stringify(result), /private-id/);
+});
 
 test("production JSON commands scan logs and reuse the metadata cache", (t) => {
   const home = temporaryHome(t);

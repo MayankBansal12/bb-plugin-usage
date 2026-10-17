@@ -21,6 +21,8 @@ import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
 import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/account-pool-limits";
+import { codexResetsCommand, parseCodexResetSnapshot, resetCreditsSchema } from "./lib/codex-resets";
+import type { UnifiedProviderLimit } from "./lib/provider-limits";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -44,6 +46,7 @@ const providerLimitWindowSchema = z.object({
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
+  resetCredits: resetCreditsSchema.optional(),
   poolAccount: z.object({ id: z.string(), label: z.string(), status: z.string(), emptyMessage: z.string() }).optional(),
   id: z.string(),
   providerId: z.string(), providerName: z.string(),
@@ -240,6 +243,36 @@ export async function loadProviderLimits(
     return rows;
   }));
   return machineRows.flat();
+}
+
+export async function loadCodexResetCredits(
+  bb: BbPluginApi,
+  limits: UnifiedProviderLimit[],
+  executeHostCommand = runHostCommand,
+): Promise<UnifiedProviderLimit[]> {
+  return Promise.all(limits.map(async (limit) => {
+    if (limit.providerId !== "codex" || limit.status !== "ok" || !limit.accountEmail) return limit;
+    const snapshots = await Promise.all(limit.machines.filter((machine) => machine.status === "ok").map(async (machine) => {
+      try {
+        const signal = AbortSignal.timeout(15_000);
+        const home = (await bb.sdk.hosts.directory({ hostId: machine.machineId, signal })).directory;
+        const output = await executeHostCommand(bb, { id: machine.machineId, name: machine.machineName }, codexResetsCommand(), signal, {
+          title: "Usage: Codex reset credits", timeoutMs: 12_000, home,
+        });
+        return parseCodexResetSnapshot(output);
+      } catch {
+        bb.log.debug(`Codex reset details unavailable on ${machine.machineName}.`);
+        return null;
+      }
+    }));
+    // BB currently identifies subscriptions by email. Workspace accounts can
+    // share an email, so only attach verified details to personal subscriptions.
+    const snapshot = snapshots.find((snapshot) => snapshot
+      && ["free", "go", "plus", "pro", "prolite", "promax"].includes(snapshot.planType)
+      && snapshot.accountEmail.trim().toLowerCase() === limit.accountEmail!.trim().toLowerCase()
+      && snapshot.planType === limit.planLabel?.trim().toLowerCase());
+    return snapshot ? { ...limit, resetCredits: snapshot.resetCredits } : limit;
+  }));
 }
 
 const migration = `
@@ -1306,11 +1339,11 @@ export default async function plugin(bb: BbPluginApi) {
           const connectedMachineIds = new Set(
             machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
           );
-          return groupProviderLimits([
+          return loadCodexResetCredits(bb, groupProviderLimits([
             ...await loadProviderLimits(bb, machines, db),
             ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
             ...loadStoredGrokLimits(db, connectedMachineIds),
-          ]);
+          ]));
         })(),
         loadAccountPoolLimits(),
       ]);
