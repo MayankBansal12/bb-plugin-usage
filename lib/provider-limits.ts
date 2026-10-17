@@ -1,3 +1,5 @@
+import type { ProviderResetCredits } from "./provider-resets";
+
 export type ProviderLimitWindow = {
   label: string;
   usedPercent: number;
@@ -25,6 +27,7 @@ export type ProviderLimitSource = {
 };
 
 export type UnifiedProviderLimit = {
+  resetCredits?: ProviderResetCredits;
   poolAccount?: {
     id: string;
     label: string;

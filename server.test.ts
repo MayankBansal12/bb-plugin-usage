@@ -15,12 +15,12 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
+  rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadCodexResetCredits, loadStoredOpenCodeGoLimits,
   kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getEmptyUsageView, getSourceIssueMessage } from "./lib/usage-view-state";
-import type { ProviderLimitSource } from "./lib/provider-limits";
+import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -996,6 +996,63 @@ describe("provider limit loading", () => {
     expect(sources).toHaveLength(2);
     expect(maxActiveCalls).toBe(2);
     expect(usageLimits.mock.calls.map((call) => call[0].hostId)).toEqual(["host_1", "host_2"]);
+  });
+});
+
+describe("Codex reset account matching", () => {
+  const base: ProviderLimitSource = {
+    machineId: "laptop", machineName: "Laptop", agentId: "codex", agentName: "Codex",
+    providerId: "codex", providerName: "Codex", accountEmail: "user@example.com", accountIdentity: null,
+    planLabel: "Pro", windows: [{ label: "Weekly", usedPercent: 95, resetsAt: null }],
+    status: "ok", error: null, lastUpdatedAt: null,
+  };
+  const bb = {
+    sdk: { hosts: { directory: vi.fn(async () => ({ directory: "/home/user" })) } },
+    log: { debug: vi.fn() },
+  } as unknown as BbPluginApi;
+  const output = (accountEmail: string, planType: string) => `__BB_CODEX_RESETS_BEGIN__\n${JSON.stringify({
+    accountEmail, planType, resetCredits: { availableCount: 1, credits: [{ expiresAt: null }] },
+  })}\n__BB_CODEX_RESETS_END__`;
+
+  it("attaches verified details to the matching account and serializes them through RPC", async () => {
+    const execute = vi.fn(async () => output(" USER@EXAMPLE.COM ", "pro"));
+    const limits = await loadCodexResetCredits(bb, groupProviderLimits([base]), execute);
+    expect(limits[0]?.resetCredits).toEqual({ availableCount: 1, credits: [{ expiresAt: null }] });
+    const wire = rpcContract.providerLimits.output.parse({ limits, accountPoolError: null });
+    expect(wire.limits[0]?.resetCredits).toEqual(limits[0]?.resetCredits);
+    expect(execute).toHaveBeenCalledWith(bb, { id: "laptop", name: "Laptop" }, expect.any(String), expect.any(AbortSignal),
+      expect.objectContaining({ title: "Usage: Codex reset credits", home: "/home/user" }));
+  });
+
+  it.each([
+    { accountEmail: "other@example.com", planType: "pro", planLabel: "Pro" },
+    { accountEmail: "user@example.com", planType: "plus", planLabel: "Pro" },
+    { accountEmail: "user@example.com", planType: "business", planLabel: "Business" },
+    { accountEmail: "user@example.com", planType: "pro", planLabel: null },
+  ])("does not infer eligibility across accounts or workspace plans: %j", async ({ accountEmail, planType, planLabel }) => {
+    const limits = groupProviderLimits([{ ...base, planLabel }]);
+    expect(await loadCodexResetCredits(bb, limits, async () => output(accountEmail, planType))).toEqual(limits);
+  });
+
+  it("keeps quota cards when the CLI is absent, old, or fails", async () => {
+    const limits = groupProviderLimits([base]);
+    expect(await loadCodexResetCredits(bb, limits, async () => "")).toEqual(limits);
+    expect(await loadCodexResetCredits(bb, limits, async () => { throw new Error("host unavailable"); })).toEqual(limits);
+  });
+
+  it("skips unidentified accounts, errored providers, and other providers", async () => {
+    const execute = vi.fn(async () => "");
+    for (const source of [
+      { ...base, accountEmail: null }, { ...base, status: "error" as const },
+      { ...base, providerId: "claude" },
+    ]) await loadCodexResetCredits(bb, groupProviderLimits([source]), execute);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("uses a responsive matching host without adding shared reset counts together", async () => {
+    const limits = groupProviderLimits([base, { ...base, machineId: "desktop", machineName: "Desktop" }]);
+    const execute: typeof runHostCommand = async (_bb, machine) => machine.id === "desktop" ? "" : output("user@example.com", "pro");
+    expect((await loadCodexResetCredits(bb, limits, execute))[0]?.resetCredits?.availableCount).toBe(1);
   });
 });
 

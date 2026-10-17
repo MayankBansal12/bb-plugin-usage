@@ -2,6 +2,8 @@ import type { BbPluginApi } from "@bb/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { accountPoolLimits, createAccountPoolLimitsLoader, mergeAccountPoolLimits, poolAccountsSchema } from "./account-pool-limits";
 import { groupProviderLimits, isLimitVisibleOnMachine } from "./provider-limits";
+import { providerResetAction } from "./provider-resets";
+import { limitCardNotice } from "./limit-card";
 
 function account(overrides: Partial<(typeof poolAccountsSchema)["_output"][number]> = {}) {
   return {
@@ -103,6 +105,20 @@ describe("Account Pooler limits", () => {
     expect(limits[0]?.windows[1]?.usedPercent).toBe(37);
     expect(isLimitVisibleOnMachine(limits[0]!, "different-machine")).toBe(true);
     expect(isLimitVisibleOnMachine(localLimits()[0]!, "different-machine")).toBe(false);
+  });
+
+  it("carries verified reset credits only into an unambiguous matching plan", () => {
+    const local = localLimits();
+    local[0]!.resetCredits = { availableCount: 2, credits: null };
+    expect(mergeAccountPoolLimits(local, accountPoolLimits([account({ subscriptionType: "plus" })]))[0]?.resetCredits)
+      .toEqual(local[0]!.resetCredits);
+    for (const subscriptionType of [null, "business"]) {
+      expect(mergeAccountPoolLimits(local, accountPoolLimits([account({ subscriptionType })]))[0]?.resetCredits).toBeUndefined();
+    }
+    const ambiguous = mergeAccountPoolLimits(local, accountPoolLimits([
+      account({ subscriptionType: "plus" }), account({ id: "duplicate", subscriptionType: "plus" }),
+    ]));
+    expect(ambiguous.filter((limit) => limit.poolAccount).every((limit) => !limit.resetCredits)).toBe(true);
   });
 
   it.each([
@@ -212,10 +228,30 @@ describe("optional pool integration", () => {
     const first = await load();
     callRpc.mockRejectedValueOnce(new Error("Pool reload in progress"));
     const failed = await load();
-    expect(failed.limits).toEqual(first.limits);
+    expect(failed.limits[0]).toMatchObject({
+      windows: first.limits[0]!.windows, lastUpdatedAt: first.limits[0]!.lastUpdatedAt,
+      status: "error", error: expect.stringContaining("couldn’t refresh"),
+    });
     expect(failed.error).toContain("last reported");
     callRpc.mockResolvedValueOnce([]);
     expect(await load()).toEqual({ limits: [], error: null });
+  });
+
+  it("marks cached exhausted accounts stale, hides their action, and restores it after recovery", async () => {
+    const { load, callRpc } = setup();
+    const accounts = [account({ limitWindows: [{ ...codexWindows[0]!, utilization: 1 }], status: "exhausted" })];
+    callRpc.mockResolvedValue(accounts);
+    const now = resetAt - 60_000;
+    const fresh = (await load()).limits[0]!;
+    expect(providerResetAction(fresh, now)?.label).toBe("Reset options");
+    callRpc.mockRejectedValueOnce(new Error("Pool unavailable"));
+    const stale = (await load()).limits[0]!;
+    expect(providerResetAction(stale, now)).toBeNull();
+    expect(limitCardNotice(stale, now)?.stale?.label).toContain("Showing values from");
+    expect(stale.lastUpdatedAt).toBe(fresh.lastUpdatedAt);
+    const recovered = (await load()).limits[0]!;
+    expect(limitCardNotice(recovered, now)).toBeNull();
+    expect(providerResetAction(recovered, now)?.label).toBe("Reset options");
   });
 
   it("bounds a stalled pool RPC and reports failure without hiding other providers", async () => {
