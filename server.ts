@@ -21,6 +21,8 @@ import { createSyncCoordinator } from "./lib/sync-coordinator";
 import { persistLastCompletedSyncAt, readLastCompletedSyncAt, syncMetadataMigration } from "./lib/sync-metadata";
 import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
 import { createAccountPoolLimitsLoader, mergeAccountPoolLimits } from "./lib/account-pool-limits";
+import { codexResetsCommand, parseCodexResetSnapshot, resetCreditsSchema } from "./lib/codex-resets";
+import type { UnifiedProviderLimit } from "./lib/provider-limits";
 
 const usageRecordSchema = z.object({
   day: z.string(), agentId: z.string(), agentName: z.string(),
@@ -44,6 +46,7 @@ const providerLimitWindowSchema = z.object({
   cost: z.object({ usedUsdCents: z.number(), limitUsdCents: z.number() }).optional(),
 });
 const providerLimitSchema = z.object({
+  resetCredits: resetCreditsSchema.optional(),
   poolAccount: z.object({ id: z.string(), label: z.string(), status: z.string(), emptyMessage: z.string() }).optional(),
   id: z.string(),
   providerId: z.string(), providerName: z.string(),
@@ -67,7 +70,7 @@ export const rpcContract = defineRpcContract({
     records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema),
     sync: syncStateSchema, notice: z.string(),
   }) },
-  providerLimits: { input: z.null(), output: z.object({
+  providerLimits: { input: z.object({ refreshPoolAccountId: z.string().min(1).max(200) }).strict().nullable(), output: z.object({
     limits: z.array(providerLimitSchema), accountPoolError: z.string().nullable(),
   }) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
@@ -240,6 +243,36 @@ export async function loadProviderLimits(
     return rows;
   }));
   return machineRows.flat();
+}
+
+export async function loadCodexResetCredits(
+  bb: BbPluginApi,
+  limits: UnifiedProviderLimit[],
+  executeHostCommand = runHostCommand,
+): Promise<UnifiedProviderLimit[]> {
+  return Promise.all(limits.map(async (limit) => {
+    if (limit.providerId !== "codex" || limit.status !== "ok" || !limit.accountEmail) return limit;
+    const snapshots = await Promise.all(limit.machines.filter((machine) => machine.status === "ok").map(async (machine) => {
+      try {
+        const signal = AbortSignal.timeout(15_000);
+        const home = (await bb.sdk.hosts.directory({ hostId: machine.machineId, signal })).directory;
+        const output = await executeHostCommand(bb, { id: machine.machineId, name: machine.machineName }, codexResetsCommand(), signal, {
+          title: "Usage: Codex reset credits", timeoutMs: 12_000, home,
+        });
+        return parseCodexResetSnapshot(output);
+      } catch {
+        bb.log.debug(`Codex reset details unavailable on ${machine.machineName}.`);
+        return null;
+      }
+    }));
+    // BB currently identifies subscriptions by email. Workspace accounts can
+    // share an email, so only attach verified details to personal subscriptions.
+    const snapshot = snapshots.find((snapshot) => snapshot
+      && ["free", "go", "plus", "pro", "prolite", "promax"].includes(snapshot.planType)
+      && snapshot.accountEmail.trim().toLowerCase() === limit.accountEmail!.trim().toLowerCase()
+      && snapshot.planType === limit.planLabel?.trim().toLowerCase());
+    return snapshot ? { ...limit, resetCredits: snapshot.resetCredits } : limit;
+  }));
 }
 
 const migration = `
@@ -1297,29 +1330,35 @@ export default async function plugin(bb: BbPluginApi) {
 
   const loadAccountPoolLimits = createAccountPoolLimitsLoader(bb);
   let providerLimitsRequest: Promise<z.infer<typeof rpcContract.providerLimits.output>> | null = null;
-  const readProviderLimits = async () => {
-    if (providerLimitsRequest) return providerLimitsRequest;
-    providerLimitsRequest = (async () => {
+  const readProviderLimits = async (input?: { refreshPoolAccountId: string } | null) => {
+    const refreshAccountId = input?.refreshPoolAccountId;
+    // A targeted refresh must not reuse a read that started before the reset.
+    if (providerLimitsRequest && !refreshAccountId) return providerLimitsRequest;
+    const request = (async () => {
       const [local, pool] = await Promise.all([
         (async () => {
           const machines = await loadMachines();
           const connectedMachineIds = new Set(
             machines.filter((machine) => machine.status === "connected").map((machine) => machine.id),
           );
-          return groupProviderLimits([
+          return loadCodexResetCredits(bb, groupProviderLimits([
             ...await loadProviderLimits(bb, machines, db),
             ...loadStoredOpenCodeGoLimits(db, connectedMachineIds),
             ...loadStoredGrokLimits(db, connectedMachineIds),
-          ]);
+          ]));
         })(),
-        loadAccountPoolLimits(),
+        loadAccountPoolLimits({ refreshAccountId }),
       ]);
-      return { limits: mergeAccountPoolLimits(local, pool.limits), accountPoolError: pool.error };
+      return {
+        limits: mergeAccountPoolLimits(local, pool.limits, pool.refreshedAccountId),
+        accountPoolError: pool.error,
+      };
     })();
+    providerLimitsRequest = request;
     try {
-      return await providerLimitsRequest;
+      return await request;
     } finally {
-      providerLimitsRequest = null;
+      if (providerLimitsRequest === request) providerLimitsRequest = null;
     }
   };
 

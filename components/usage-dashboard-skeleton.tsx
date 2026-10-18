@@ -157,14 +157,15 @@ export function ShimmerStyles() {
 export function ProviderLimitsSkeleton({ columns }: { columns: number }) {
   const cards = Array.from({ length: Math.max(1, Math.min(3, columns)) }, (_, index) => index);
   const nameWidths = [104, 88, 96];
-  const planWidths = [52, 40, 46];
+  const planWidths = [40, 32, 36];
+  const accountWidths = [112, 132, 96];
   const barWidths = [64, 38, 52];
   return (
     <div
       role="status"
       aria-label="Loading provider limits"
-      className="mt-4 grid gap-3"
-      style={{ gridTemplateColumns: `repeat(${cards.length}, minmax(0, 1fr))` }}
+      className="mt-3 grid items-start gap-3"
+      style={{ gridTemplateColumns: `repeat(${cards.length}, minmax(0, 480px))` }}
     >
       <ShimmerStyles />
       <span className="sr-only">Loading provider limits…</span>
@@ -172,23 +173,26 @@ export function ProviderLimitsSkeleton({ columns }: { columns: number }) {
         <div
           key={card}
           aria-hidden="true"
-          className="min-w-0 rounded-lg border border-border/60 bg-muted/20 px-3 py-2.5"
+          className="min-w-0 rounded-lg border border-border/60 bg-muted/20 p-4"
         >
           <div className="flex min-w-0 items-center justify-between gap-3">
             <span className="flex min-w-0 items-center gap-2">
               <Shimmer className="size-[15px] shrink-0 rounded-[4px]" />
               <Shimmer className="h-3 rounded" style={{ width: nameWidths[card % nameWidths.length] }} />
             </span>
-            <Shimmer className="h-2.5 shrink-0 rounded" style={{ width: planWidths[card % planWidths.length] }} />
+            <Shimmer className="h-5 shrink-0 rounded-md" style={{ width: planWidths[card % planWidths.length] }} />
           </div>
-          <div className="mt-1.5 flex flex-wrap gap-1">
-            <Shimmer className="h-[18px] w-20 rounded-md" />
-            <Shimmer className="h-[18px] w-16 rounded-md" style={{ animationDelay: "-0.3s" }} />
+          <div className="flex h-4 items-center pt-0.5">
+            <Shimmer className="h-2.5 rounded" style={{ width: accountWidths[card % accountWidths.length] }} />
           </div>
-          <div className="mt-1.5 space-y-1.5">
+          <div className="flex flex-wrap gap-1 pt-2">
+            <Shimmer className="h-5 w-20 rounded-md" />
+            <Shimmer className="h-5 w-16 rounded-md" style={{ animationDelay: "-0.3s" }} />
+          </div>
+          <div className="space-y-3 pt-4">
             {[0, 1].map((row) => (
               <div key={row}>
-                <div className="flex items-center justify-between gap-3">
+                <div className="flex h-4 items-center justify-between gap-3">
                   <Shimmer className="h-2.5 w-24 rounded" style={{ animationDelay: `${-(card + row) * 0.2}s` }} />
                   <Shimmer className="h-2.5 w-12 shrink-0 rounded" style={{ animationDelay: `${-(card + row) * 0.2}s` }} />
                 </div>

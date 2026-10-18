@@ -15,12 +15,13 @@ vi.mock("@bb/plugin-sdk", () => ({
 }));
 
 import plugin, {
-  rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadStoredOpenCodeGoLimits,
+  rpcContract, dashboardRecordsSql, devinCommand, extractOpenCodeJson, jsonAgentRoots, loadProviderLimits, loadCodexResetCredits, loadStoredOpenCodeGoLimits,
   kilocodeCommand, openCodeCommand, openCodeSql, openCodeV2Sql, runHostCommand, syncDevin, syncKilocode, syncOpenCode, syncOpenCodeGo,
 } from "./server";
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 import { getEmptyUsageView, getSourceIssueMessage } from "./lib/usage-view-state";
-import type { ProviderLimitSource } from "./lib/provider-limits";
+import { groupProviderLimits, type ProviderLimitSource } from "./lib/provider-limits";
+import { providerResetAction } from "./lib/provider-resets";
 
 function localDay(ts: number): string {
   const d = new Date(ts);
@@ -996,6 +997,63 @@ describe("provider limit loading", () => {
     expect(sources).toHaveLength(2);
     expect(maxActiveCalls).toBe(2);
     expect(usageLimits.mock.calls.map((call) => call[0].hostId)).toEqual(["host_1", "host_2"]);
+  });
+});
+
+describe("Codex reset account matching", () => {
+  const base: ProviderLimitSource = {
+    machineId: "laptop", machineName: "Laptop", agentId: "codex", agentName: "Codex",
+    providerId: "codex", providerName: "Codex", accountEmail: "user@example.com", accountIdentity: null,
+    planLabel: "Pro", windows: [{ label: "Weekly", usedPercent: 95, resetsAt: null }],
+    status: "ok", error: null, lastUpdatedAt: null,
+  };
+  const bb = {
+    sdk: { hosts: { directory: vi.fn(async () => ({ directory: "/home/user" })) } },
+    log: { debug: vi.fn() },
+  } as unknown as BbPluginApi;
+  const output = (accountEmail: string, planType: string) => `__BB_CODEX_RESETS_BEGIN__\n${JSON.stringify({
+    accountEmail, planType, resetCredits: { availableCount: 1, credits: [{ expiresAt: null }] },
+  })}\n__BB_CODEX_RESETS_END__`;
+
+  it("attaches verified details to the matching account and serializes them through RPC", async () => {
+    const execute = vi.fn(async () => output(" USER@EXAMPLE.COM ", "pro"));
+    const limits = await loadCodexResetCredits(bb, groupProviderLimits([base]), execute);
+    expect(limits[0]?.resetCredits).toEqual({ availableCount: 1, credits: [{ expiresAt: null }] });
+    const wire = rpcContract.providerLimits.output.parse({ limits, accountPoolError: null });
+    expect(wire.limits[0]?.resetCredits).toEqual(limits[0]?.resetCredits);
+    expect(execute).toHaveBeenCalledWith(bb, { id: "laptop", name: "Laptop" }, expect.any(String), expect.any(AbortSignal),
+      expect.objectContaining({ title: "Usage: Codex reset credits", home: "/home/user" }));
+  });
+
+  it.each([
+    { accountEmail: "other@example.com", planType: "pro", planLabel: "Pro" },
+    { accountEmail: "user@example.com", planType: "plus", planLabel: "Pro" },
+    { accountEmail: "user@example.com", planType: "business", planLabel: "Business" },
+    { accountEmail: "user@example.com", planType: "pro", planLabel: null },
+  ])("does not infer eligibility across accounts or workspace plans: %j", async ({ accountEmail, planType, planLabel }) => {
+    const limits = groupProviderLimits([{ ...base, planLabel }]);
+    expect(await loadCodexResetCredits(bb, limits, async () => output(accountEmail, planType))).toEqual(limits);
+  });
+
+  it("keeps quota cards when the CLI is absent, old, or fails", async () => {
+    const limits = groupProviderLimits([base]);
+    expect(await loadCodexResetCredits(bb, limits, async () => "")).toEqual(limits);
+    expect(await loadCodexResetCredits(bb, limits, async () => { throw new Error("host unavailable"); })).toEqual(limits);
+  });
+
+  it("skips unidentified accounts, errored providers, and other providers", async () => {
+    const execute = vi.fn(async () => "");
+    for (const source of [
+      { ...base, accountEmail: null }, { ...base, status: "error" as const },
+      { ...base, providerId: "claude" },
+    ]) await loadCodexResetCredits(bb, groupProviderLimits([source]), execute);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("uses a responsive matching host without adding shared reset counts together", async () => {
+    const limits = groupProviderLimits([base, { ...base, machineId: "desktop", machineName: "Desktop" }]);
+    const execute: typeof runHostCommand = async (_bb, machine) => machine.id === "desktop" ? "" : output("user@example.com", "pro");
+    expect((await loadCodexResetCredits(bb, limits, execute))[0]?.resetCredits?.availableCount).toBe(1);
   });
 });
 
@@ -2174,6 +2232,131 @@ describe("Account Pooler limits RPC integration", () => {
       expect(unobserved.limits.find((limit) => limit.accountEmail === localEmail)?.windows).toEqual([
         { label: "Weekly limit", usedPercent: 80, resetsAt: "2026-09-20T12:00:00.000Z" },
       ]);
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe("provider limits after a reset", () => {
+  const resetsAt = "2026-09-20T12:00:00.000Z";
+  const poolAccountId = "6f1c2b9e-4b8f-4f7a-9d55-0c4c7b1d2e3f";
+
+  function setup() {
+    const db = new Database(":memory:");
+    let read: ((input?: { refreshPoolAccountId: string } | null) => Promise<unknown>) | undefined;
+    // Stored pool quota, as returned by account.list until an upstream refresh.
+    const stored = {
+      id: poolAccountId, provider: "codex", kind: "oauth", label: "Pooled Codex",
+      email: "user@example.com", subscriptionType: "pro", enabled: true, status: "exhausted", error: null as string | null,
+      observedAt: Date.parse("2026-09-13T12:00:00Z") as number | null, fiveHourUtilization: null, fiveHourResetAt: null,
+      sevenDayUtilization: null, sevenDayResetAt: null, familyWeekly: {},
+      limitWindows: [{ slot: "primary", windowMinutes: 10080, utilization: 1, resetAt: Date.parse(resetsAt), status: null }],
+    };
+    let refreshUpstream = async () => {
+      stored.limitWindows = [{ ...stored.limitWindows[0]!, utilization: 0 }];
+      stored.status = "ready";
+      stored.observedAt = Date.now();
+    };
+    const callRpc = vi.fn(async ({ method }: { method: string }) => {
+      if (method === "account.list") return [structuredClone(stored)];
+      if (method === "account.refreshUsage") {
+        await refreshUpstream();
+        return { account: structuredClone(stored) };
+      }
+      throw new Error(`Unexpected ${method}`);
+    });
+    const bb = {
+      settings: { define: vi.fn() },
+      storage: {
+        database: () => db,
+        migrate: (_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); },
+      },
+      rpc: { register: (_contract: unknown, handlers: { providerLimits: typeof read }) => { read = handlers.providerLimits; } },
+      sdk: {
+        hosts: { list: vi.fn().mockResolvedValue([{ id: "laptop", name: "Laptop", status: "connected" }]) },
+        plugins: { list: vi.fn().mockResolvedValue({ plugins: [{ id: "account-pool", enabled: true }] }), callRpc },
+        // The local bridge still reports the pre-reset reading for the same cycle.
+        system: { usageLimits: vi.fn().mockResolvedValue({ codex: {
+          status: "ok", accountEmail: "user@example.com", planLabel: "pro",
+          windows: [{ label: "Weekly limit", usedPercent: 100, resetsAt }],
+        } }) },
+      },
+      background: { service: vi.fn() },
+      log: { debug: vi.fn(), warn: vi.fn() },
+    } as unknown as BbPluginApi;
+    return {
+      db, callRpc, stored, bb,
+      setRefresh: (refresh: typeof refreshUpstream) => { refreshUpstream = refresh; },
+      read: async (input?: { refreshPoolAccountId: string } | null) => {
+        rpcContract.providerLimits.input.parse(input ?? null);
+        return rpcContract.providerLimits.output.parse(await read!(input));
+      },
+    };
+  }
+
+  it("refreshes the reset account upstream so a cleared quota replaces the stored and local readings", async () => {
+    const { db, bb, callRpc, read } = setup();
+    const now = Date.parse("2026-09-15T12:00:00Z");
+    try {
+      await plugin(bb);
+      const before = (await read()).limits;
+      expect(before).toHaveLength(1);
+      expect(before[0]!.windows).toEqual([{ label: "Weekly", usedPercent: 100, resetsAt }]);
+      expect(providerResetAction(before[0]!, now)?.label).toBe("Reset options");
+      expect(callRpc.mock.calls.map(([call]) => call.method)).toEqual(["account.list"]);
+
+      const after = await read({ refreshPoolAccountId: poolAccountId });
+      expect(after.accountPoolError).toBeNull();
+      expect(callRpc.mock.calls.slice(1).map(([call]) => call)).toEqual([
+        expect.objectContaining({ method: "account.refreshUsage", input: { accountId: poolAccountId } }),
+        expect.objectContaining({ method: "account.list" }),
+      ]);
+      expect(after.limits[0]).toMatchObject({ status: "ok", windows: [{ label: "Weekly", usedPercent: 0, resetsAt }] });
+      expect(providerResetAction(after.limits[0]!, now)).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("marks the reset account stale when the upstream refresh fails or is skipped", async () => {
+    for (const refresh of [
+      async () => { throw new Error("upstream failed"); },
+      // account.refreshUsage resolves without a new observation when the read fails or is skipped.
+      async () => {},
+    ]) {
+      const { db, bb, read, setRefresh } = setup();
+      setRefresh(refresh);
+      try {
+        await plugin(bb);
+        const result = await read({ refreshPoolAccountId: poolAccountId });
+        expect(result.accountPoolError).toContain("Showing the last reported values");
+        expect(result.limits[0]).toMatchObject({ status: "error", windows: [{ label: "Weekly", usedPercent: 100 }] });
+        expect(providerResetAction(result.limits[0]!, Date.parse("2026-09-15T12:00:00Z"))).toBeNull();
+      } finally {
+        db.close();
+      }
+    }
+  });
+
+  it("does not answer a reset refresh with a read that started before it", async () => {
+    const { db, bb, callRpc, read } = setup();
+    try {
+      await plugin(bb);
+      let releaseList!: () => void;
+      const listStarted = new Promise<void>((resolve) => {
+        callRpc.mockImplementationOnce(async () => {
+          resolve();
+          await new Promise<void>((release) => { releaseList = release; });
+          return [];
+        });
+      });
+      const earlier = read();
+      await listStarted;
+      const refreshed = read({ refreshPoolAccountId: poolAccountId });
+      releaseList();
+      await earlier;
+      expect((await refreshed).limits[0]!.windows).toEqual([{ label: "Weekly", usedPercent: 0, resetsAt }]);
     } finally {
       db.close();
     }
