@@ -109,7 +109,9 @@ function localWindowsForPool(local: UnifiedProviderLimit, pool: UnifiedProviderL
   });
 }
 
-export function mergeAccountPoolLimits(local: UnifiedProviderLimit[], pooled: UnifiedProviderLimit[]) {
+export function mergeAccountPoolLimits(
+  local: UnifiedProviderLimit[], pooled: UnifiedProviderLimit[], refreshedAccountId?: string,
+) {
   const merged = new Set<string>();
   const limits = pooled.map((pool) => {
     const key = emailKey(pool);
@@ -121,7 +123,12 @@ export function mergeAccountPoolLimits(local: UnifiedProviderLimit[], pooled: Un
       ...pool,
       // A pool summary may be partial or cached. Preserve both sources using
       // the same reset-cycle rules as subscriptions shared across machines.
-      windows: mergeLimitWindows([pool, { windows: localWindowsForPool(match, pool) }]),
+      // A reading just refreshed upstream is authoritative for its windows,
+      // since a redeemed reset can lower usage without moving the reset time.
+      windows: refreshedAccountId !== undefined && pool.poolAccount?.id === refreshedAccountId
+        ? [...pool.windows, ...localWindowsForPool(match, pool)
+          .filter((window) => !pool.windows.some((candidate) => candidate.label.trim().toLowerCase() === window.label.trim().toLowerCase()))]
+        : mergeLimitWindows([pool, { windows: localWindowsForPool(match, pool) }]),
       planLabel: pool.planLabel ?? match.planLabel,
       machines: match.machines,
       ...(match.resetCredits && pool.planLabel?.trim().toLowerCase() === match.planLabel?.trim().toLowerCase()
@@ -131,26 +138,70 @@ export function mergeAccountPoolLimits(local: UnifiedProviderLimit[], pooled: Un
   return [...local.filter((limit) => !merged.has(limit.id)), ...limits];
 }
 
-export function createAccountPoolLimitsLoader(bb: BbPluginApi, timeoutMs = 5000) {
+const refreshedAccountSchema = z.object({ account: poolAccountsSchema.element.nullable() });
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error(message)), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export function createAccountPoolLimitsLoader(bb: BbPluginApi, timeoutMs = 5000, refreshTimeoutMs = 15_000) {
   let cached: UnifiedProviderLimit[] = [];
-  return async (): Promise<{ limits: UnifiedProviderLimit[]; error: string | null }> => {
-    let timer: ReturnType<typeof setTimeout> | undefined;
+  return async (options: { refreshAccountId?: string } = {}): Promise<{
+    limits: UnifiedProviderLimit[]; error: string | null; refreshedAccountId?: string;
+  }> => {
     try {
-      const request = async () => {
-        const installed = await bb.sdk.plugins.list({ signal: AbortSignal.timeout(timeoutMs) });
-        if (!installed.plugins.some((plugin) => plugin.id === "account-pool" && plugin.enabled)) return [];
-        const accounts = await bb.sdk.plugins.callRpc({
-          pluginId: "account-pool", method: "account.list", input: null, outputSchema: poolAccountsSchema,
-        });
-        return accountPoolLimits(accounts);
+      const installed = await withTimeout(
+        bb.sdk.plugins.list({ signal: AbortSignal.timeout(timeoutMs) }), timeoutMs, "The account list timed out.",
+      );
+      if (!installed.plugins.some((plugin) => plugin.id === "account-pool" && plugin.enabled)) {
+        cached = [];
+        return { limits: cached, error: null };
+      }
+      // account.list only returns stored quotas, so a reset made on the
+      // provider's site stays hidden until the pool's next background poll
+      // unless the account is refreshed upstream first.
+      let refreshedAccountId: string | undefined;
+      let refreshError: string | null = null;
+      if (options.refreshAccountId) {
+        const startedAt = Date.now();
+        try {
+          const { account } = await withTimeout(bb.sdk.plugins.callRpc({
+            pluginId: "account-pool", method: "account.refreshUsage",
+            input: { accountId: options.refreshAccountId }, outputSchema: refreshedAccountSchema,
+          }), refreshTimeoutMs, "The account refresh timed out.");
+          // The pool resolves even when the upstream read fails or is skipped,
+          // so only a new error-free observation counts as refreshed.
+          if (account && !account.error && account.status !== "error"
+            && account.observedAt !== null && account.observedAt >= startedAt) {
+            refreshedAccountId = account.id;
+          } else if (account) {
+            refreshError = "Account Pooler couldn’t confirm fresh limits for this account. Showing the last reported values.";
+          }
+        } catch (reason) {
+          bb.log.debug(`Account Pooler refresh unavailable: ${reason instanceof Error ? reason.message : String(reason)}`);
+          refreshError = "Couldn’t refresh this Account Pooler account. Showing the last reported values.";
+        }
+      }
+      const accounts = await withTimeout(bb.sdk.plugins.callRpc({
+        pluginId: "account-pool", method: "account.list", input: null, outputSchema: poolAccountsSchema,
+      }), timeoutMs, "The account list timed out.");
+      cached = accountPoolLimits(accounts);
+      if (!refreshError) return { limits: cached, error: null, ...(refreshedAccountId ? { refreshedAccountId } : {}) };
+      // The stored reading may predate the reset, so it must not look current.
+      return {
+        limits: cached.map((limit) => limit.poolAccount?.id === options.refreshAccountId
+          ? { ...limit, status: "error" as const, error: limit.error ?? refreshError }
+          : limit),
+        error: refreshError,
       };
-      cached = await Promise.race([
-        request(),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error("The account list timed out.")), timeoutMs);
-        }),
-      ]);
-      return { limits: cached, error: null };
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
       bb.log.debug(`Account Pooler limits unavailable: ${message}`);
@@ -162,8 +213,6 @@ export function createAccountPoolLimitsLoader(bb: BbPluginApi, timeoutMs = 5000)
         })),
         error: `Couldn’t refresh Account Pooler limits.${cached.length ? " Showing the last reported pool limits." : ""}`,
       };
-    } finally {
-      clearTimeout(timer);
     }
   };
 }

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { codexResetCollectorSource } from "./host-scripts.generated";
+import { codexLaunchSource, codexResetCollectorSource } from "./host-scripts.generated";
 
 export const resetCreditsSchema = z.object({
   availableCount: z.number().int().nonnegative().max(100_000),
@@ -18,19 +18,62 @@ export function parseCodexResetSnapshot(output: string) {
   try { return snapshotSchema.parse(JSON.parse(json)); } catch { return null; }
 }
 
+// Compiled before bundling and serialized beside the collector, so it may only
+// use Node built-ins. Node can run .exe files found on PATH but not the .cmd
+// shims npm installs on Windows; those need cmd.exe with fixed, quoted args.
+export function codexLaunch(
+  platform: string,
+  env: Record<string, string | undefined>,
+  isFile: (path: string) => boolean,
+): { command: string; args: string[]; windowsVerbatimArguments?: boolean } | null {
+  if (platform !== "win32") return { command: "codex", args: ["app-server"] };
+  const value = (name: string) => env[Object.keys(env).find((key) => key.toUpperCase() === name) ?? name];
+  const extensions = (value("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";")
+    .map((extension) => extension.trim().toLowerCase())
+    .filter((extension) => [".com", ".exe", ".bat", ".cmd"].includes(extension));
+  for (const entry of (value("PATH") ?? "").split(";")) {
+    const directory = entry.trim().replace(/^"(.*)"$/, "$1").replace(/[\\/]+$/, "");
+    // Relative entries depend on the working directory; % and " would be
+    // reinterpreted by cmd.exe even inside quotes.
+    if (!/^(?:[a-zA-Z]:|\\\\)/.test(directory) || /["%\r\n]/.test(directory)) continue;
+    for (const extension of extensions) {
+      const path = `${directory}\\codex${extension}`;
+      if (!isFile(path)) continue;
+      if (extension === ".exe" || extension === ".com") return { command: path, args: ["app-server"] };
+      const shell = value("COMSPEC");
+      return {
+        command: shell && /^[a-zA-Z]:\\[^"%]+\.exe$/i.test(shell) ? shell : "cmd.exe",
+        args: ["/d", "/s", "/c", `""${path}" app-server"`],
+        windowsVerbatimArguments: true,
+      };
+    }
+  }
+  return null;
+}
+
 // Compiled before bundling. Only read requests are sent to the official CLI;
 // neither credentials nor unfiltered protocol payloads leave the host.
 export async function codexResetCollector() {
   const { spawn } = require("node:child_process") as typeof import("node:child_process");
+  const { statSync } = require("node:fs") as typeof import("node:fs");
   const { createInterface } = require("node:readline") as typeof import("node:readline");
   const { homedir } = require("node:os") as typeof import("node:os");
-  const child = spawn("codex", ["app-server"], { cwd: homedir(), stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+  const launch = codexLaunch(process.platform, process.env, (path) => {
+    try { return statSync(path).isFile(); } catch { return false; }
+  });
+  if (!launch) return;
+  const child = spawn(launch.command, launch.args, {
+    cwd: homedir(), stdio: ["pipe", "pipe", "ignore"], windowsHide: true,
+    windowsVerbatimArguments: launch.windowsVerbatimArguments ?? false,
+  });
   const lines = createInterface({ input: child.stdout });
   let nextId = 0;
   let received = 0;
   let failure: Error | null = null;
   const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
-  const stop = () => { child.kill("SIGKILL"); };
+  // Killing cmd.exe leaves its Codex child holding the pipes; closing them lets
+  // this process exit, and Node's Windows job object then ends the whole tree.
+  const stop = () => { child.kill("SIGKILL"); child.stdin.destroy(); child.stdout.destroy(); };
   const fail = () => {
     failure = new Error("Codex reset details unavailable.");
     for (const request of pending.values()) request.reject(failure);
@@ -105,6 +148,6 @@ export async function codexResetCollector() {
 }
 
 export function codexResetsCommand() {
-  const script = `${codexResetCollectorSource}\ncodexResetCollector().catch(() => {});`;
+  const script = `${codexLaunchSource}\n${codexResetCollectorSource}\ncodexResetCollector().catch(() => {});`;
   return `set +x; node -e '${script.replace(/'/g, `'\\''`)}'`;
 }

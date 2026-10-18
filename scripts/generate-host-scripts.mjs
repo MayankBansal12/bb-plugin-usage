@@ -9,6 +9,7 @@ const functions = [
   ["lib/devin-sqlite-collector.ts", "devinSqliteCollector"],
   ["lib/kilocode-sqlite-collector.ts", "kilocodeSqliteCollector"],
   ["lib/grok-limits.ts", "normalizeGrokBilling"],
+  ["lib/codex-resets.ts", "codexLaunch"],
   ["lib/codex-resets.ts", "codexResetCollector"],
 ];
 const root = new URL("../", import.meta.url);

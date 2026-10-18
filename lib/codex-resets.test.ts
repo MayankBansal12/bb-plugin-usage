@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { codexResetsCommand, parseCodexResetSnapshot } from "./codex-resets";
+import { codexLaunch, codexResetsCommand, parseCodexResetSnapshot } from "./codex-resets";
 
 const run = promisify(execFile);
 const dirs: string[] = [];
@@ -134,4 +134,80 @@ describe("Codex reset collection", () => {
       { availableCount: 1, credits: [{ expiresAt: "invalid" }] },
     ]) expect(parseCodexResetSnapshot(wrap({ accountEmail: "user@example.com", planType: "pro", resetCredits }))).toBeNull();
   });
+});
+
+describe("Codex launcher selection", () => {
+  const files = (...paths: string[]) => (path: string) => paths.includes(path);
+
+  it("keeps the direct PATH launch outside Windows", () => {
+    expect(codexLaunch("linux", { PATH: "/usr/bin" }, () => false)).toEqual({ command: "codex", args: ["app-server"] });
+    expect(codexLaunch("darwin", {}, () => false)).toEqual({ command: "codex", args: ["app-server"] });
+  });
+
+  it("runs a native executable directly and an npm shim through cmd.exe with fixed quoting", () => {
+    const env = { Path: "C:\\Tools;\"C:\\Program Files\\nodejs\\\";C:\\Users\\Me\\AppData\\Roaming\\npm\\", PATHEXT: ".COM;.EXE;.BAT;.CMD;.PS1" };
+    expect(codexLaunch("win32", env, files("C:\\Program Files\\nodejs\\codex.exe", "C:\\Users\\Me\\AppData\\Roaming\\npm\\codex.cmd")))
+      .toEqual({ command: "C:\\Program Files\\nodejs\\codex.exe", args: ["app-server"] });
+    expect(codexLaunch("win32", { ...env, ComSpec: "C:\\Windows\\system32\\cmd.exe" }, files("C:\\Users\\Me\\AppData\\Roaming\\npm\\codex.cmd"))).toEqual({
+      command: "C:\\Windows\\system32\\cmd.exe",
+      args: ["/d", "/s", "/c", "\"\"C:\\Users\\Me\\AppData\\Roaming\\npm\\codex.cmd\" app-server\""],
+      windowsVerbatimArguments: true,
+    });
+  });
+
+  it("follows PATHEXT order within a directory and never launches scripts it cannot quote safely", () => {
+    const both = files("C:\\npm\\codex.cmd", "C:\\npm\\codex.exe");
+    expect(codexLaunch("win32", { PATH: "C:\\npm", PATHEXT: ".CMD;.EXE" }, both)?.command).toBe("cmd.exe");
+    expect(codexLaunch("win32", { PATH: "C:\\npm" }, both)?.command).toBe("C:\\npm\\codex.exe");
+    expect(codexLaunch("win32", { PATH: "C:\\npm", PATHEXT: ".PS1;.JS" }, both)).toBeNull();
+    expect(codexLaunch("win32", { PATH: "C:\\npm", ComSpec: "cmd & calc.exe" }, files("C:\\npm\\codex.cmd"))?.command).toBe("cmd.exe");
+    expect(codexLaunch("win32", { PATH: "npm;C:\\%USERPROFILE%\\npm" }, () => true)).toBeNull();
+    expect(codexLaunch("win32", {}, () => true)).toBeNull();
+  });
+});
+
+describe("Codex collector cleanup through a launcher", () => {
+  // Stands in for cmd.exe running the npm shim: killing the wrapper leaves the
+  // server alive and holding the pipes, and the server ignores stdin closing.
+  async function collectThroughWrapper(respond: boolean) {
+    const bin = await mkdtemp(join(tmpdir(), "bb-codex-wrapper-"));
+    dirs.push(bin);
+    const pidFile = join(bin, "server.pid");
+    await symlink(process.execPath, join(bin, "node"));
+    await writeFile(join(bin, "server.js"), `
+require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+process.on('SIGTERM', () => {});
+setInterval(() => {}, 1000);
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const request = JSON.parse(line);
+  if (request.id == null || !${respond}) return;
+  const result = request.method === 'account/read' ? { account: { type: 'chatgpt', email: 'user@example.com', planType: 'pro' } }
+    : request.method === 'account/rateLimits/read' ? { rateLimitResetCredits: { availableCount: 1, credits: null } } : {};
+  console.log(JSON.stringify({ id: request.id, result }));
+});
+`);
+    await writeFile(join(bin, "codex"), `#!/bin/sh\n"${bin}/node" "${bin}/server.js"\n`, { mode: 0o755 });
+    const started = Date.now();
+    try {
+      const { stdout } = await run("/bin/sh", ["-c", codexResetsCommand()], {
+        env: { ...process.env, PATH: `${bin}:/bin:/usr/bin`, NODE_OPTIONS: "" }, timeout: 20_000,
+      });
+      return { stdout, elapsed: Date.now() - started };
+    } finally {
+      const pid = Number(await readFile(pidFile, "utf8").catch(() => ""));
+      if (pid) try { process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
+    }
+  }
+
+  it("exits promptly after success even when the wrapped server keeps its pipes open", async () => {
+    const { stdout, elapsed } = await collectThroughWrapper(true);
+    expect(parseCodexResetSnapshot(stdout)?.resetCredits).toEqual({ availableCount: 1, credits: null });
+    expect(elapsed).toBeLessThan(5_000);
+  });
+
+  it("exits at the request timeout when the wrapped server never answers", async () => {
+    const { stdout, elapsed } = await collectThroughWrapper(false);
+    expect(stdout).toBe("");
+    expect(elapsed).toBeLessThan(14_000);
+  }, 20_000);
 });

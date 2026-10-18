@@ -828,7 +828,7 @@ function ProviderLimits({
   loading: boolean;
   error: string | null;
   stale: boolean;
-  onResetOpen: () => void;
+  onResetOpen: (limit: UnifiedProviderLimit) => void;
 }) {
   const [now, setNow] = useState(Date.now);
   useEffect(() => {
@@ -954,7 +954,7 @@ function ProviderLimits({
                       )}
                       {resetAction && (
                         <Button asChild size="sm" variant="outline" className="ml-auto h-8 shrink-0 gap-1.5 px-2.5 text-xs">
-                          <a href={resetAction.href} target="_blank" rel="noopener noreferrer" onClick={onResetOpen}
+                          <a href={resetAction.href} target="_blank" rel="noopener noreferrer" onClick={() => onResetOpen(limit)}
                             aria-label={`${resetAction.label} for ${limit.providerName}${accountLabel ? ` (${accountLabel})` : ""}, opens the provider’s usage page`}>
                             {resetAction.label}<Icon name="ExternalLink" className="size-3" aria-hidden="true" />
                           </a>
@@ -1095,7 +1095,8 @@ function UsageDashboard() {
   const [providerLimitsLoading, setProviderLimitsLoading] = useState(false);
   const [providerLimitsStale, setProviderLimitsStale] = useState(false);
   const providerLimitsRequestId = useRef(0);
-  const refreshAfterReset = useRef(false);
+  // Set when a reset page opens; null pool id means only local limits apply.
+  const refreshAfterReset = useRef<{ poolAccountId: string | null } | null>(null);
   const { range, machine, showUsageLimits } = useUsageToolbar();
   const [chartGroup, setChartGroup] = useState<DimensionMode>("agent");
   const [chartMode, setChartMode] = useState<MetricMode>("tokens");
@@ -1122,19 +1123,26 @@ function UsageDashboard() {
     }
   }, [rpc]);
 
-  const loadProviderLimits = useCallback(async () => {
+  const loadProviderLimits = useCallback(async (refreshPoolAccountId?: string | null) => {
     const requestId = ++providerLimitsRequestId.current;
     setProviderLimitsLoading(true);
     setProviderLimitsError(null);
     try {
-      const nextLimits = await rpc.call("providerLimits");
+      const nextLimits = await rpc.call("providerLimits", refreshPoolAccountId ? { refreshPoolAccountId } : null);
       if (providerLimitsRequestId.current !== requestId) return;
       setProviderLimits(nextLimits.limits);
       setProviderLimitsStale(false);
+      // An unconfirmed pool refresh comes back as an error card; try again on the next return.
+      if (refreshPoolAccountId && !refreshAfterReset.current && nextLimits.limits.some((limit) =>
+        limit.poolAccount?.id === refreshPoolAccountId && limit.status === "error")) {
+        refreshAfterReset.current = { poolAccountId: refreshPoolAccountId };
+      }
       setProviderLimitsError(nextLimits.accountPoolError);
     } catch (reason) {
       if (providerLimitsRequestId.current !== requestId) return;
       setProviderLimitsStale(true);
+      // Retry the reset refresh on the next return unless another reset replaced it.
+      if (refreshPoolAccountId && !refreshAfterReset.current) refreshAfterReset.current = { poolAccountId: refreshPoolAccountId };
       setProviderLimitsError(`Couldn’t refresh usage limits: ${reason instanceof Error ? reason.message : String(reason)}`);
     } finally {
       if (providerLimitsRequestId.current === requestId) setProviderLimitsLoading(false);
@@ -1143,9 +1151,10 @@ function UsageDashboard() {
 
   useEffect(() => {
     const refresh = () => {
-      if (!showUsageLimits || !refreshAfterReset.current || document.visibilityState !== "visible") return;
-      refreshAfterReset.current = false;
-      void loadProviderLimits();
+      const target = refreshAfterReset.current;
+      if (!showUsageLimits || !target || document.visibilityState !== "visible") return;
+      refreshAfterReset.current = null;
+      void loadProviderLimits(target.poolAccountId);
     };
     window.addEventListener("focus", refresh);
     document.addEventListener("visibilitychange", refresh);
@@ -1451,7 +1460,7 @@ function UsageDashboard() {
             loading={providerLimitsLoading}
             error={providerLimitsError}
             stale={providerLimitsStale}
-            onResetOpen={() => { refreshAfterReset.current = true; }}
+            onResetOpen={(limit) => { refreshAfterReset.current = { poolAccountId: limit.poolAccount?.id ?? null }; }}
           />
         )}
 

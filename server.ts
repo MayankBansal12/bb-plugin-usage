@@ -70,7 +70,7 @@ export const rpcContract = defineRpcContract({
     records: z.array(usageRecordSchema), sources: z.array(sourceStateSchema),
     sync: syncStateSchema, notice: z.string(),
   }) },
-  providerLimits: { input: z.null(), output: z.object({
+  providerLimits: { input: z.object({ refreshPoolAccountId: z.string().min(1).max(200) }).strict().nullable(), output: z.object({
     limits: z.array(providerLimitSchema), accountPoolError: z.string().nullable(),
   }) },
   sync: { input: z.null(), output: z.object({ ok: z.literal(true) }) },
@@ -1330,9 +1330,11 @@ export default async function plugin(bb: BbPluginApi) {
 
   const loadAccountPoolLimits = createAccountPoolLimitsLoader(bb);
   let providerLimitsRequest: Promise<z.infer<typeof rpcContract.providerLimits.output>> | null = null;
-  const readProviderLimits = async () => {
-    if (providerLimitsRequest) return providerLimitsRequest;
-    providerLimitsRequest = (async () => {
+  const readProviderLimits = async (input?: { refreshPoolAccountId: string } | null) => {
+    const refreshAccountId = input?.refreshPoolAccountId;
+    // A targeted refresh must not reuse a read that started before the reset.
+    if (providerLimitsRequest && !refreshAccountId) return providerLimitsRequest;
+    const request = (async () => {
       const [local, pool] = await Promise.all([
         (async () => {
           const machines = await loadMachines();
@@ -1345,14 +1347,18 @@ export default async function plugin(bb: BbPluginApi) {
             ...loadStoredGrokLimits(db, connectedMachineIds),
           ]));
         })(),
-        loadAccountPoolLimits(),
+        loadAccountPoolLimits({ refreshAccountId }),
       ]);
-      return { limits: mergeAccountPoolLimits(local, pool.limits), accountPoolError: pool.error };
+      return {
+        limits: mergeAccountPoolLimits(local, pool.limits, pool.refreshedAccountId),
+        accountPoolError: pool.error,
+      };
     })();
+    providerLimitsRequest = request;
     try {
-      return await providerLimitsRequest;
+      return await request;
     } finally {
-      providerLimitsRequest = null;
+      if (providerLimitsRequest === request) providerLimitsRequest = null;
     }
   };
 
