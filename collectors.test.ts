@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi, parsePrime } from "./collectors";
+import { parseAmpUsageAggregates, parseClaude, parseCodex, parseGrok, parseHostUsageAggregates, parseOpenCode, parsePi, parsePrime } from "./collectors";
 
 import { resetPricingCatalog, setPricingCatalog } from "./lib/pricing";
 
@@ -8,6 +8,30 @@ afterEach(() => resetPricingCatalog());
 const machine = { machineId: "machine-a", machineName: "Machine A" };
 
 describe("usage collectors", () => {
+  it("keeps Amp tokens unpriced and deduplicatable across enrolled machines", () => {
+    const rows = [{
+      threadId: "T-01a0aa94-f1e7-7610-a400-f8054fe02ad5",
+      day: "2026-09-16",
+      modelProviderId: "amp" as const,
+      model: "gpt-5.6-sol",
+      project: "bb-plugin-usage",
+      loggedCostUsd: null,
+      uncachedInputTokens: 40,
+      cachedInputTokens: 60,
+      cacheWriteTokens: 5,
+      outputTokens: 20,
+    }];
+    const first = parseAmpUsageAggregates(rows, machine)[0]!;
+    const second = parseAmpUsageAggregates(rows, { machineId: "machine-b", machineName: "Machine B" })[0]!;
+
+    expect(first).toMatchObject({
+      agentId: "amp", agentName: "Amp", modelProviderId: "amp", modelProviderName: "Amp",
+      pricingStatus: "unknown", costUsd: 0, processedTokens: 125,
+    });
+    expect(second.eventKey).toBe(first.eventKey);
+    expect(second.machineId).not.toBe(first.machineId);
+  });
+
   it("parses Codex usage and separates agent from model provider", () => {
     const content = [
       { timestamp: "2026-08-09T00:00:00Z", type: "session_meta", payload: { id: "session-1" } },

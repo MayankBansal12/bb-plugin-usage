@@ -36,9 +36,18 @@ const providerAliases: Record<string, string> = {
   copilot: "github-copilot",
 };
 
-// Providers not listed on models.dev get their published rates pinned here so
-// usage still prices before (or without) a catalog entry.
+// Published first-party rates bridge catalog lag and providers absent from
+// models.dev. A live catalog price still takes precedence.
 const builtinPrices: Record<string, { name?: string; models: Record<string, Price> }> = {
+  // Amp reports exact tokens, but its credits and linked-provider subscriptions
+  // are not API-equivalent USD. Keep its models unpriced and attributed to Amp
+  // instead of inferring first-party rates from model names.
+  amp: { name: "Amp", models: {} },
+  deepseek: {
+    name: "DeepSeek",
+    // https://api-docs.deepseek.com/quick_start/pricing
+    models: { "deepseek-v4.1-flash": { input: 0.15, cached: 0.003, cacheWrite: 0.15, output: 0.6 } },
+  },
   thaura: {
     name: "Thaura",
     models: { thaura: { input: 0.5, cached: 0.5, cacheWrite: 0.5, output: 2 } },
@@ -116,6 +125,14 @@ const firstPartyProviders = [
 // from most to least specific.
 const proxyDecorationPatterns = [/-expires-on-.+$/, /-(?:low|medium|high|xhigh|max)$/];
 
+// These routing labels identify the model but append a transport-only suffix
+// and do not publish their own base rate. Only this restricted set may use the
+// underlying model's public price.
+const routedProviderDecorations: Record<string, RegExp[]> = {
+  codebuddy: [/-ioa$/],
+  "ollama-cloud": [/:[a-z0-9._-]+-cloud$/],
+};
+
 function proxyModelIds(providerId: string, model: string) {
   const seen = new Set<string>();
   const modelIds: string[] = [];
@@ -125,7 +142,7 @@ function proxyModelIds(providerId: string, model: string) {
     if (seen.has(candidate)) continue;
     seen.add(candidate);
     modelIds.push(candidate);
-    for (const pattern of proxyDecorationPatterns) {
+    for (const pattern of [...proxyDecorationPatterns, ...(routedProviderDecorations[providerId] ?? [])]) {
       const stripped = candidate.replace(pattern, "");
       if (stripped && stripped !== candidate) queue.push(stripped);
     }
@@ -133,16 +150,36 @@ function proxyModelIds(providerId: string, model: string) {
   return modelIds;
 }
 
-function matchViaFirstParty(modelIds: string[]): PricingResult | null {
+function hasRoutedProviderDecoration(providerId: string, model: string) {
+  const modelIds = normalizedModelIds(providerId, model);
+  return (routedProviderDecorations[providerId] ?? []).some((pattern) =>
+    modelIds.some((modelId) => pattern.test(modelId)));
+}
+
+// "No vendor matched" falls through to the catalog pass, but "more than one
+// vendor matched" must not: the catalog would see only its own candidates and
+// happily resolve a price that first-party matching already proved ambiguous.
+const AMBIGUOUS = Symbol("ambiguous");
+
+function matchViaFirstParty(modelIds: string[]): PricingResult | typeof AMBIGUOUS | null {
   const providers = activeProviders();
-  for (const vendorId of firstPartyProviders) {
-    const vendor = providers[vendorId];
-    if (!vendor) continue;
-    for (const modelId of modelIds) {
-      const match = matchWithinProvider(vendorId, vendor, modelId);
-      // Attribution is inferred rather than reported, hence alias status.
-      if (match) return { ...match, status: "models-dev-alias" };
+  for (const modelId of modelIds) {
+    const matches: PricingResult[] = [];
+    for (const vendorId of firstPartyProviders) {
+      const vendor = providers[vendorId];
+      if (vendor) {
+        const match = matchWithinProvider(vendorId, vendor, modelId);
+        // Attribution is inferred rather than reported, hence alias status.
+        if (match) {
+          matches.push({ ...match, status: "models-dev-alias" });
+          continue;
+        }
+      }
+      const builtin = builtinPrices[vendorId];
+      const price = builtin?.models[modelId];
+      if (price) matches.push({ modelProviderId: vendorId, modelProviderName: builtin.name ?? providerName(vendorId), price: { ...price }, status: "models-dev-alias" });
     }
+    if (matches.length > 0) return matches.length === 1 ? matches[0]! : AMBIGUOUS;
   }
   return null;
 }
@@ -170,11 +207,18 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
 
   const builtin = builtinPrices[modelProviderId]?.models[model.trim().toLowerCase()];
   if (builtin) {
-    return { modelProviderId, modelProviderName: providerName(modelProviderId, provider) || builtinPrices[modelProviderId]!.name!, price: builtin, status: "models-dev-exact" };
+    return { modelProviderId, modelProviderName: providerName(modelProviderId, provider) || builtinPrices[modelProviderId]!.name!, price: { ...builtin }, status: "models-dev-exact" };
   }
 
-  // Explicit providers must never inherit a different vendor's rates.
+  // Explicit providers must never inherit a different vendor's rates, except
+  // for the transparent routing labels declared above.
   if (provider || builtinPrices[modelProviderId]) {
+    if (hasRoutedProviderDecoration(modelProviderId, model)) {
+      const modelIds = proxyModelIds(modelProviderId, model);
+      const firstParty = matchViaFirstParty(modelIds);
+      const inferred = firstParty === AMBIGUOUS ? null : (firstParty ?? uniqueCatalogMatch(modelIds));
+      if (inferred) return inferred;
+    }
     return { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
   }
 
@@ -183,7 +227,8 @@ export function resolvePricing(rawProviderId: string, model: string): PricingRes
   // name variants, then a catalog-wide unique exact match.
   if (modelProviderId !== "unknown") {
     const modelIds = proxyModelIds(modelProviderId, model);
-    const inferred = matchViaFirstParty(modelIds) ?? uniqueCatalogMatch(modelIds);
+    const firstParty = matchViaFirstParty(modelIds);
+    const inferred = firstParty === AMBIGUOUS ? null : (firstParty ?? uniqueCatalogMatch(modelIds));
     return inferred ?? { modelProviderId, modelProviderName: providerName(modelProviderId, provider), price: null, status: "unknown" };
   }
 
