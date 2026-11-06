@@ -1,16 +1,16 @@
 import { grokLimitsMigration, syncGrokLimits, loadStoredGrokLimits } from "./server";
 import Database from "better-sqlite3";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import type { z } from "zod";
 
-vi.mock("@bb/plugin-sdk", () => ({
+vi.mock("@get-bb/plugin-sdk", () => ({
   defineRpcContract: <T>(contract: T) => contract,
 }));
 
@@ -38,7 +38,7 @@ const SCAN_END = "__BB_USAGE_SCAN_END__";
 function fakeHostScanOutput(agentId: string, rows: Array<Record<string, unknown>>) {
   const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount: 0, error: null, rows };
   const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
-  return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+  return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n`;
 }
 
 // The command is a shell wrapper around `node -e eval(gunzip(base64(...)))`
@@ -64,29 +64,15 @@ function agentIdFromCommand(command: string): string | null {
   return input.agentId ?? null;
 }
 
-function hostFileWriteMock(stagedFiles: Map<string, string>) {
-  return vi.fn(async (args: { path: string; content: string; expectedSha256?: string | null }) => {
-    const currentContent = stagedFiles.get(args.path);
-    const currentSha256 = currentContent === undefined
-      ? null
-      : createHash("sha256").update(currentContent).digest("hex");
-    if (args.expectedSha256 !== undefined && args.expectedSha256 !== currentSha256) {
-      return { outcome: "conflict" as const, currentSha256 };
-    }
-    stagedFiles.set(args.path, args.content);
-    return {
-      outcome: "written" as const,
-      sha256: createHash("sha256").update(args.content).digest("hex"),
-      sizeBytes: args.content.length,
-    };
+// Collectors reach each machine through the plugin's host worker. This stands
+// in for it and answers every `run` call with the output `respond` returns.
+function hostWorker(respond: (command: string) => string) {
+  const commands: string[] = [];
+  const call = vi.fn(async (_method: string, input: { command: string }) => {
+    commands.push(input.command);
+    return { status: "exited" as const, exitCode: 0, output: respond(input.command) };
   });
-}
-
-// Oversized commands reach the terminal as `sh '<staged path>'`; resolve that
-// back to the staged file contents before decoding which agent it belongs to.
-function commandTextFor(command: string, stagedFiles: Map<string, string>) {
-  const stagedPath = command.match(/sh '([^']+\.sh)'/)?.[1];
-  return (stagedPath ? stagedFiles.get(stagedPath) : undefined) ?? command;
+  return { experimental_client: vi.fn(() => ({ call })), commands, call };
 }
 
 describe("JSON agent roots", () => {
@@ -290,8 +276,6 @@ describe("sync RPC", () => {
     // RPC and asserts a row actually lands in the database for Antigravity.
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
-    const commandsByTerminalId = new Map<string, string>();
-    const stagedFiles = new Map<string, string>();
 
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
@@ -309,34 +293,23 @@ describe("sync RPC", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
-        files: { write: hostFileWriteMock(stagedFiles) },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
-            const agentId = agentIdFromCommand(command);
-            const text = agentId === targetAgent
-              ? fakeHostScanOutput(targetAgent, [{
-                day: new Date().toISOString().slice(0, 10),
-                modelProviderId: "google",
-                model: "gemini-4-ultra-preview",
-                loggedCostUsd: null,
-                uncachedInputTokens: 13814,
-                cachedInputTokens: 0,
-                cacheWriteTokens: 0,
-                outputTokens: 53,
-              }])
-              : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          close: vi.fn(async () => undefined),
-        },
       },
+      hosts: hostWorker((command) => {
+        const agentId = agentIdFromCommand(command);
+        const text = agentId === targetAgent
+          ? fakeHostScanOutput(targetAgent, [{
+            day: new Date().toISOString().slice(0, 10),
+            modelProviderId: "google",
+            model: "gemini-4-ultra-preview",
+            loggedCostUsd: null,
+            uncachedInputTokens: 13814,
+            cachedInputTokens: 0,
+            cacheWriteTokens: 0,
+            outputTokens: 53,
+          }])
+          : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
+        return text;
+      }),
       realtime: { publish: vi.fn() },
       background: { service: vi.fn() },
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -370,98 +343,6 @@ describe("sync RPC", () => {
       expect(bb.log.warn).not.toHaveBeenCalledWith(expect.stringContaining("/copilot:"));
     }
 
-    // The terminal contract caps start.command at 10,000 characters; every
-    // collector command must fit, whether inline or staged through files.write.
-    for (const command of commandsByTerminalId.values()) {
-      expect(command.length).toBeLessThanOrEqual(10_000);
-    }
-
-    db.close();
-  });
-
-  it("stages an oversized collector script through files.write and still records its rows", async () => {
-    // A huge configured session root inflates the serialized scan input enough
-    // that the compressed collector command no longer fits the terminal's
-    // 10,000-character limit, forcing the files.write staging path.
-    const db = new Database(":memory:");
-    let handlers: { sync: () => unknown } | undefined;
-    const commandsByTerminalId = new Map<string, string>();
-    const stagedFiles = new Map<string, string>();
-    const write = hostFileWriteMock(stagedFiles);
-
-    const bb = {
-      settings: {
-        define: vi.fn(() => ({
-          get: async () => ({ piSessionRoots: `/data/${randomBytes(6_000).toString("hex")}`, primeSessionRoots: "" }),
-        })),
-      },
-      storage: {
-        database: vi.fn(() => db),
-        migrate: vi.fn((_db: unknown, statements: string[]) => { for (const statement of statements) db.exec(statement); }),
-      },
-      rpc: {
-        register: vi.fn((_contract: unknown, registered: unknown) => {
-          handlers = registered as { sync: () => unknown };
-        }),
-      },
-      sdk: {
-        hosts: {
-          list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
-          directory: vi.fn(async () => ({ directory: "/home/user" })),
-        },
-        files: { write },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
-            const agentId = agentIdFromCommand(command);
-            const text = agentId === "pi"
-              ? fakeHostScanOutput("pi", [{
-                day: new Date().toISOString().slice(0, 10),
-                modelProviderId: "google",
-                model: "gemini-2.5-pro",
-                loggedCostUsd: null,
-                uncachedInputTokens: 100,
-                cachedInputTokens: 0,
-                cacheWriteTokens: 0,
-                outputTokens: 10,
-              }])
-              : fakeHostScanOutput(agentId ?? "codex", []);
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          close: vi.fn(async () => undefined),
-        },
-      },
-      realtime: { publish: vi.fn() },
-      background: { service: vi.fn() },
-      log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-    } as unknown as BbPluginApi;
-
-    await plugin(bb);
-    expect(handlers?.sync()).toEqual({ ok: true });
-
-    await vi.waitFor(() => {
-      const row = db.prepare("SELECT provider_id FROM usage_events WHERE provider_id = 'pi'").get();
-      expect(row).toBeTruthy();
-    }, { timeout: 2000 });
-
-    expect(write).toHaveBeenCalled();
-    for (const command of commandsByTerminalId.values()) {
-      expect(command.length).toBeLessThanOrEqual(10_000);
-    }
-    const stagedPaths = [...stagedFiles.keys()];
-    expect(stagedPaths.every((path) => path.startsWith("/home/user/.cache/bb-plugin-usage/host-command-"))).toBe(true);
-
-    const syncState = db.prepare(
-      "SELECT status, record_count recordCount FROM usage_sync_state WHERE machine_id = 'host-1' AND provider_id = 'pi'",
-    ).get();
-    expect(syncState).toEqual({ status: "ready", recordCount: 1 });
-
     db.close();
   });
 
@@ -470,8 +351,6 @@ describe("sync RPC", () => {
     // must reach syncAll()'s Promise.all, not just AGENTS/jsonAgentRoots.
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
-    const commandsByTerminalId = new Map<string, string>();
-    const stagedFiles = new Map<string, string>();
 
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
@@ -489,34 +368,23 @@ describe("sync RPC", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
-        files: { write: hostFileWriteMock(stagedFiles) },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
-            const agentId = agentIdFromCommand(command);
-            const text = agentId === "dsh"
-              ? fakeHostScanOutput("dsh", [{
-                day: new Date().toISOString().slice(0, 10),
-                modelProviderId: "deepseek",
-                model: "deepseek-v4-pro",
-                loggedCostUsd: null,
-                uncachedInputTokens: 100,
-                cachedInputTokens: 0,
-                cacheWriteTokens: 0,
-                outputTokens: 20,
-              }])
-              : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          close: vi.fn(async () => undefined),
-        },
       },
+      hosts: hostWorker((command) => {
+        const agentId = agentIdFromCommand(command);
+        const text = agentId === "dsh"
+          ? fakeHostScanOutput("dsh", [{
+            day: new Date().toISOString().slice(0, 10),
+            modelProviderId: "deepseek",
+            model: "deepseek-v4-pro",
+            loggedCostUsd: null,
+            uncachedInputTokens: 100,
+            cachedInputTokens: 0,
+            cacheWriteTokens: 0,
+            outputTokens: 20,
+          }])
+          : fakeHostScanOutput(agentId ?? "codex", []); // every other agent: empty, uninteresting scan
+        return text;
+      }),
       realtime: { publish: vi.fn() },
       background: { service: vi.fn() },
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -560,8 +428,6 @@ describe("sync RPC", () => {
       return JSON.parse(Buffer.from(inner[1]!, "base64").toString("utf8"));
     }
 
-    const commandsByTerminalId = new Map<string, string>();
-    const stagedFiles = new Map<string, string>();
     const day = new Date().toISOString().slice(0, 10);
     const aggregateRow = (account?: string) => ({
       day,
@@ -574,6 +440,12 @@ describe("sync RPC", () => {
       cachedInputTokens: 60,
       cacheWriteTokens: 5,
       outputTokens: 20,
+    });
+    const hosts = hostWorker((command) => {
+      const input = scanInputFromCommand(command);
+      return input?.agentId === "codex"
+        ? fakeHostScanOutput("codex", [aggregateRow(), aggregateRow("saiens")])
+        : fakeHostScanOutput(input?.agentId ?? "codex", []);
     });
 
     const bb = {
@@ -592,25 +464,8 @@ describe("sync RPC", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
-        files: { write: hostFileWriteMock(stagedFiles) },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
-            const input = scanInputFromCommand(command);
-            const text = input?.agentId === "codex"
-              ? fakeHostScanOutput("codex", [aggregateRow(), aggregateRow("saiens")])
-              : fakeHostScanOutput(input?.agentId ?? "codex", []);
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          close: vi.fn(async () => undefined),
-        },
       },
+      hosts,
       realtime: { publish: vi.fn() },
       background: { service: vi.fn() },
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -623,8 +478,8 @@ describe("sync RPC", () => {
       expect(db.prepare("SELECT COUNT(*) count FROM usage_events").get()).toEqual({ count: 2 });
     }, { timeout: 2000 });
 
-    const codexScan = [...commandsByTerminalId.values()]
-      .map((command) => scanInputFromCommand(commandTextFor(command, stagedFiles)))
+    const codexScan = hosts.commands
+      .map((command) => scanInputFromCommand(command))
       .find((input) => input?.agentId === "codex");
     expect(codexScan).toMatchObject({
       roots: ["/home/user/.codex/sessions", "/home/user/.codex/archived_sessions"],
@@ -1007,10 +862,7 @@ describe("Codex reset account matching", () => {
     planLabel: "Pro", windows: [{ label: "Weekly", usedPercent: 95, resetsAt: null }],
     status: "ok", error: null, lastUpdatedAt: null,
   };
-  const bb = {
-    sdk: { hosts: { directory: vi.fn(async () => ({ directory: "/home/user" })) } },
-    log: { debug: vi.fn() },
-  } as unknown as BbPluginApi;
+  const bb = { log: { debug: vi.fn() } } as unknown as BbPluginApi;
   const output = (accountEmail: string, planType: string) => `__BB_CODEX_RESETS_BEGIN__\n${JSON.stringify({
     accountEmail, planType, resetCredits: { availableCount: 1, credits: [{ expiresAt: null }] },
   })}\n__BB_CODEX_RESETS_END__`;
@@ -1022,7 +874,7 @@ describe("Codex reset account matching", () => {
     const wire = rpcContract.providerLimits.output.parse({ limits, accountPoolError: null });
     expect(wire.limits[0]?.resetCredits).toEqual(limits[0]?.resetCredits);
     expect(execute).toHaveBeenCalledWith(bb, { id: "laptop", name: "Laptop" }, expect.any(String), expect.any(AbortSignal),
-      expect.objectContaining({ title: "Usage: Codex reset credits", home: "/home/user" }));
+      expect.objectContaining({ title: "Usage: Codex reset credits" }));
   });
 
   it.each([
@@ -1058,409 +910,54 @@ describe("Codex reset account matching", () => {
 });
 
 describe("host command output", () => {
-  it("collects output while the terminal is still running, then closes it", async () => {
-    const text = "query result\n__BB_HOST_COMMAND_DONE__:0\n";
-    const create = vi.fn(async (input: unknown) => ({ id: "terminal-1", status: "starting", input }));
-    const get = vi.fn(async () => ({ id: "terminal-1", status: "running" }));
-    const output = vi.fn(async () => ({
-      chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
-      truncated: false,
-    }));
-    const close = vi.fn(async () => undefined);
-    const bb = { sdk: { terminals: { create, get, output, close } } } as unknown as BbPluginApi;
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      "printf result",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).resolves.toBe(text);
-
-    expect(get).toHaveBeenCalledOnce();
-    expect(output).toHaveBeenCalledOnce();
-    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
-    expect(create.mock.calls[0]?.[0]).toMatchObject({
-      start: { mode: "command", command: expect.stringContaining("__BB_HOST_COMMAND_DONE__") },
-    });
-  });
-
-  it("surfaces a command diagnostic before closing the held terminal", async () => {
-    const text = "__BB_USAGE_ERROR__:OpenCode query failed\n__BB_HOST_COMMAND_DONE__:1\n";
-    const close = vi.fn(async () => undefined);
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
-        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
-        close,
-      } },
-    } as unknown as BbPluginApi;
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      "exit 127",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).rejects.toThrow("OpenCode query failed");
-    expect(close).toHaveBeenCalledOnce();
-  });
-
-  it("surfaces bounded terminal output when a command has no structured diagnostic", async () => {
-    const text = "CLI compatibility error\n__BB_HOST_COMMAND_DONE__:1\n";
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
-        output: vi.fn(async () => ({ chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false })),
-        close: vi.fn(async () => undefined),
-      } },
-    } as unknown as BbPluginApi;
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      "exit 1",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).rejects.toThrow("CLI compatibility error");
-  });
-
-  it("times out and closes a stalled machine terminal", async () => {
-    const close = vi.fn(async () => undefined);
-    const bb = {
-      sdk: { terminals: {
-        create: vi.fn(async () => ({ id: "terminal-1", status: "starting" })),
-        get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
-        output: vi.fn(async () => ({ chunks: [], truncated: false })),
-        close,
-      } },
-    } as unknown as BbPluginApi;
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Stalled machine" },
-      "opencode db query",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1, pollMs: 1, home: "/home/user" },
-    )).rejects.toThrow("timed out");
-    expect(close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
-  });
-
-  function stagedRun(text: string, overrides: { write?: unknown; directory?: unknown } = {}) {
-    const stagedFiles = new Map<string, string>();
-    const create = vi.fn(async (input: { start: { command: string } }) => ({ id: "terminal-1", status: "starting", input }));
-    const bb = {
-      sdk: {
-        files: { write: overrides.write ?? hostFileWriteMock(stagedFiles) },
-        hosts: { directory: overrides.directory ?? vi.fn(async () => ({ directory: "/resolved/home" })) },
-        terminals: {
-          create,
-          get: vi.fn(async () => ({ id: "terminal-1", status: "running" })),
-          output: vi.fn(async () => ({
-            chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }],
-            truncated: false,
-          })),
-          close: vi.fn(async () => undefined),
-        },
-      },
-      log: { debug: vi.fn() },
-    } as unknown as BbPluginApi;
-    return { bb, create, stagedFiles };
-  }
-
-  it("stages oversized commands on the host and runs them with sh", async () => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const text = "scan result\n__BB_HOST_COMMAND_DONE__:0\n";
-    const { bb, create, stagedFiles } = stagedRun(text);
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).resolves.toBe(text);
-
-    const startCommand = create.mock.calls[0]![0].start.command;
-    expect(startCommand.length).toBeLessThanOrEqual(10_000);
-    expect(startCommand).toContain("__BB_HOST_COMMAND_DONE__");
-
-    const stagedPaths = [...stagedFiles.keys()];
-    expect(stagedPaths).toHaveLength(1);
-    expect(stagedPaths[0]).toMatch(/^\/home\/user\/\.cache\/bb-plugin-usage\/host-command-[0-9a-f]{64}\.sh$/);
-    expect(stagedFiles.get(stagedPaths[0]!)).toBe(command);
-    expect(startCommand).toContain(`sh '${stagedPaths[0]}'`);
-    expect(bb.sdk.files.write).toHaveBeenCalledWith(expect.objectContaining({
-      hostId: "host-1",
-      path: stagedPaths[0],
-      content: command,
-      createParents: true,
-    }));
-    expect(bb.sdk.hosts.directory).not.toHaveBeenCalled();
-  });
-
-  it("reuses an identical staged script across concurrent runs without rewriting it", async () => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const text = "scan result\n__BB_HOST_COMMAND_DONE__:0\n";
-    const { bb, create, stagedFiles } = stagedRun(text);
-    const storeFile = vi.spyOn(stagedFiles, "set");
-
-    const results = await Promise.all([0, 1].map(() => runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )));
-
-    expect(results).toEqual([text, text]);
-    expect(storeFile).toHaveBeenCalledOnce();
-    expect(stagedFiles.size).toBe(1);
-    expect(create).toHaveBeenCalledTimes(2);
-    expect(create.mock.calls[0]![0].start.command).toBe(create.mock.calls[1]![0].start.command);
-    const writes = await Promise.all(vi.mocked(bb.sdk.files.write).mock.results.map((result) => result.value));
-    expect(writes.map((result) => result.outcome)).toEqual(["written", "conflict"]);
-  });
-
-  it("does not launch a terminal when cancelled during the staging write", async () => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const controller = new AbortController();
-    const reason = new Error("Usage sync cancelled");
-    let finishWrite!: () => void;
-    const write = vi.fn(async () => {
-      await new Promise<void>((resolve) => { finishWrite = resolve; });
-      return { outcome: "written" as const, sha256: createHash("sha256").update(command).digest("hex") };
-    });
-    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
-
-    const result = runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      controller.signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    );
-    const rejection = expect(result).rejects.toBe(reason);
-    expect(write).toHaveBeenCalledOnce();
-    controller.abort(reason);
-    finishWrite();
-
-    await rejection;
-    expect(create).not.toHaveBeenCalled();
-    expect(bb.sdk.terminals.close).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    { outcome: "conflict" as const, currentSha256: "mismatch" },
-    { outcome: "written" as const, sha256: "wrong", sizeBytes: 1 },
-  ])("surfaces the staging error when the staged file cannot be verified (%s)", async (result) => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const write = vi.fn(async () => result);
-    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
-
-    // An oversized command cannot be submitted inline either, so the staging
-    // failure is reported instead of creating a terminal the host must reject.
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).rejects.toThrow("Usage test could not stage its command on Machine: the staged command file did not verify");
-
-    expect(create).not.toHaveBeenCalled();
-  });
-
-  it("surfaces the staging error when the host file write throws", async () => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const write = vi.fn(async () => { throw new Error("host.write_file unsupported"); });
-    const { bb, create } = stagedRun("unreachable\n__BB_HOST_COMMAND_DONE__:0\n", { write });
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).rejects.toThrow("Usage test could not stage its command on Machine: host.write_file unsupported");
-
-    expect(create).not.toHaveBeenCalled();
-  });
-
-  it("surfaces staged command diagnostics and exit codes identically", async () => {
-    const command = `printf '%s' '${"x".repeat(11_000)}'`;
-    const { bb } = stagedRun("__BB_USAGE_ERROR__:collector broke\n__BB_HOST_COMMAND_DONE__:1\n");
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).rejects.toThrow("collector broke");
-  });
-
-  it("keeps commands under the limit inline without touching the files API", async () => {
-    const write = vi.fn();
-    const { bb } = stagedRun("small\n__BB_HOST_COMMAND_DONE__:0\n", { write });
-
-    await expect(runHostCommand(
-      bb,
-      { id: "host-1", name: "Machine" },
-      "printf small",
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: "/home/user" },
-    )).resolves.toContain("small");
-    expect(write).not.toHaveBeenCalled();
-  });
-});
-
-describe("Windows host command output", () => {
-  const windowsHome = "C:\\Users\\me";
-
-  // Simulates a Windows host: files live in a map, and the collector "runs"
-  // when the terminal is polled, writing whatever `finish` returns.
-  function windowsRun(options: {
-    finish?: (runDirectory: string, files: Map<string, string>) => void;
-    states?: string[];
-    terminalText?: string;
-    unreadable?: string[];
-    home?: string;
-  } = {}) {
-    const files = new Map<string, string>();
-    let runDirectory = "";
-    let polls = 0;
-    const write = vi.fn(async (args: { path: string; content: string }) => {
-      files.set(args.path, args.content);
-      runDirectory = args.path.replace(/\/command\.sh$/, "");
-      return { outcome: "written" as const, sha256: "", sizeBytes: args.content.length };
-    });
-    const read = vi.fn(async (args: { path: string }) => {
-      const content = files.get(args.path);
-      if (content === undefined || options.unreadable?.some((suffix) => args.path.endsWith(suffix))) {
-        throw new Error(`ENOENT: ${args.path}`);
-      }
-      return { content, contentEncoding: "utf8" as const, sizeBytes: Buffer.byteLength(content), path: args.path, sha256: "" };
-    });
-    const remove = vi.fn(async (args: { path: string }) => {
-      for (const path of files.keys()) if (path.startsWith(`${args.path}/`)) files.delete(path);
-    });
-    const get = vi.fn(async () => {
-      const status = options.states?.[Math.min(polls, options.states.length - 1)] ?? "running";
-      if (polls === 0) options.finish?.(runDirectory, files);
-      polls += 1;
-      return { id: "terminal-1", status };
-    });
-    const bb = {
-      sdk: {
-        files: { write, read, remove },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => ({ id: "terminal-1", status: "starting", input })),
-          get,
-          output: vi.fn(async () => ({
-            chunks: [{ seq: 1, dataBase64: Buffer.from(options.terminalText ?? "").toString("base64") }],
-            truncated: false,
-          })),
-          close: vi.fn(async () => undefined),
-        },
-      },
-    } as unknown as BbPluginApi;
-    const run = (command = "printf result") => runHostCommand(
-      bb,
-      { id: "host-1", name: "Windows machine" },
-      command,
-      new AbortController().signal,
-      { title: "Usage test", timeoutMs: 1_000, pollMs: 1, home: options.home ?? windowsHome },
-    );
-    return { bb, files, run, runDirectory: () => runDirectory };
-  }
-
-  const finishWith = (output: string, status: string) => (runDirectory: string, files: Map<string, string>) => {
-    files.set(`${runDirectory}/output.txt`, output);
-    files.set(`${runDirectory}/status`, status);
+  const machine = { id: "host-1", name: "Machine" };
+  const hostReturning = (result: unknown) => {
+    const call = vi.fn(async () => result);
+    return { bb: { hosts: { experimental_client: vi.fn(() => ({ call })) } } as unknown as BbPluginApi, call };
   };
+  const run = (bb: BbPluginApi, signal = new AbortController().signal, timeoutMs = 1_000) =>
+    runHostCommand(bb, machine, "printf result", signal, { title: "Usage test", timeoutMs });
 
-  it("runs the command under sh through a file-backed launcher and cleans up", async () => {
-    const { bb, files, run, runDirectory } = windowsRun({ finish: finishWith("scan result\n", "0") });
+  it("runs the command on the machine's host worker and returns its output", async () => {
+    const { bb, call } = hostReturning({ status: "exited", exitCode: 0, output: "query result\n" });
+    const signal = new AbortController().signal;
 
-    await expect(run("printf result")).resolves.toBe("scan result\n");
-
-    expect(runDirectory()).toMatch(/^C:\/Users\/me\/\.cache\/bb-plugin-usage\/runs\/[0-9a-f-]{36}$/);
-    const script = vi.mocked(bb.sdk.files.write).mock.calls[0]![0].content;
-    expect(script.startsWith("HOME='C:/Users/me'; export HOME; ")).toBe(true);
-    expect(script).toContain(`( printf result ) > '${runDirectory()}/output.txt' 2>&1`);
-    expect(script).toContain(`mv -f '${runDirectory()}/status.tmp' '${runDirectory()}/status'`);
-
-    const launcher = vi.mocked(bb.sdk.terminals.create).mock.calls[0]![0].start;
-    expect(launcher).toMatchObject({ mode: "command" });
-    const encoded = (launcher as { command: string }).command
-      .match(/^powershell\.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ([A-Za-z0-9+/=]+)$/)?.[1];
-    expect(encoded).toBeDefined();
-    const decoded = Buffer.from(encoded!, "base64").toString("utf16le");
-    expect(decoded).toContain(`& $bbSh '${runDirectory()}/command.sh'`);
-    expect(decoded).toContain("exit $LASTEXITCODE");
-
-    expect(bb.sdk.terminals.output).not.toHaveBeenCalled();
-    expect(bb.sdk.terminals.close).toHaveBeenCalledWith({ terminalId: "terminal-1", mode: "force" });
-    expect(bb.sdk.files.remove).toHaveBeenCalledWith({ hostId: "host-1", path: runDirectory(), recursive: true });
-    expect(files.size).toBe(0);
+    await expect(run(bb, signal)).resolves.toBe("query result\n");
+    expect(call).toHaveBeenCalledWith("run", { command: "printf result" }, { hostId: "host-1", signal, timeoutMs: 1_000 });
   });
 
-  it.each([
-    ["an ASCII apostrophe", "C:\\Users\\O'Brien Smith", "O''Brien Smith"],
-    ["a curly apostrophe", "C:\\Users\\O\u2019Brien Smith", "O\u2019\u2019Brien Smith"],
-  ])("quotes a home path with %s for PowerShell and sh", async (_label, home, escaped) => {
-    const { bb, run, runDirectory } = windowsRun({ home, finish: finishWith("ok\n", "0") });
-
-    await expect(run()).resolves.toBe("ok\n");
-
-    const launcher = (vi.mocked(bb.sdk.terminals.create).mock.calls[0]![0].start as { command: string }).command;
-    const decoded = Buffer.from(launcher.split(" ").at(-1)!, "base64").toString("utf16le");
-    const quotedDirectory = runDirectory().replace(/^C:\/Users\/[^/]+/, `C:/Users/${escaped}`);
-    expect(decoded).toContain(`& $bbSh '${quotedDirectory}/command.sh'`);
-    expect(decoded).toContain(`-LiteralPath '${quotedDirectory}/status'`);
-    // Native node and python receive $HOME paths verbatim, so HOME must be a
-    // C:/ path rather than an MSYS /c/ path that conversion might skip.
-    const script = vi.mocked(bb.sdk.files.write).mock.calls[0]![0].content;
-    expect(script.startsWith(`HOME='${home.replace(/\\/g, "/").replace(/'/g, `'"'"'`)}'; export HOME; `)).toBe(true);
+  it("surfaces a command diagnostic for a nonzero exit", async () => {
+    const { bb } = hostReturning({ status: "exited", exitCode: 1, output: "__BB_USAGE_ERROR__:OpenCode query failed\n" });
+    await expect(run(bb)).rejects.toThrow("OpenCode query failed");
   });
 
-  it("surfaces the collector diagnostic for a nonzero exit status", async () => {
-    const { run } = windowsRun({ finish: finishWith("__BB_USAGE_ERROR__:Node.js is required\n", "127") });
-
-    await expect(run()).rejects.toThrow("Node.js is required");
+  it("surfaces bounded output when a failed command has no structured diagnostic", async () => {
+    const { bb } = hostReturning({ status: "exited", exitCode: 1, output: `${"x".repeat(1_000)}CLI compatibility error\n` });
+    const error = await run(bb).catch((caught: Error) => caught);
+    expect(error.message).toMatch(/CLI compatibility error$/);
+    expect(error.message.length).toBeLessThanOrEqual(300);
   });
 
-  it("collects a status written just before the terminal exits", async () => {
-    const { run } = windowsRun({ finish: finishWith("late result\n", "0"), states: ["exited"] });
-
-    await expect(run()).resolves.toBe("late result\n");
+  it("names the exit code when a failed command printed nothing", async () => {
+    const { bb } = hostReturning({ status: "exited", exitCode: 127, output: "" });
+    await expect(run(bb)).rejects.toThrow("Usage test exited with code 127.");
   });
 
-  it("reports the launcher's terminal output when it exits without a status", async () => {
-    const { bb, run } = windowsRun({
-      states: ["exited"],
-      terminalText: "\x1b[31mpowershell.exe: The term is not recognized\x1b[0m\r\n",
-    });
-
-    await expect(run()).rejects.toThrow("Usage test stopped before its output could be collected: powershell.exe: The term is not recognized");
-    expect(bb.sdk.files.remove).toHaveBeenCalledOnce();
+  it("reports the output limit", async () => {
+    const { bb } = hostReturning({ status: "output-limit" });
+    await expect(run(bb)).rejects.toThrow("Usage test exceeded the 900 KB output limit.");
   });
 
-  it("fails instead of returning empty output when the output file cannot be read", async () => {
-    const { run } = windowsRun({ finish: finishWith("scan result\n", "0"), unreadable: ["/output.txt"] });
-
-    await expect(run()).rejects.toThrow("Usage test finished but its output could not be read.");
+  it("reports a call that fails after its deadline as a timeout", async () => {
+    const call = vi.fn(() => new Promise((_resolve, reject) => setTimeout(() => reject(new Error("Host plugin call was cancelled")), 30)));
+    const bb = { hosts: { experimental_client: () => ({ call }) } } as unknown as BbPluginApi;
+    await expect(run(bb, new AbortController().signal, 10)).rejects.toThrow("Usage test timed out after 1 seconds.");
   });
 
-  it("does not launch a terminal when the command cannot be staged", async () => {
-    const { bb, run } = windowsRun();
-    vi.mocked(bb.sdk.files.write).mockRejectedValueOnce(new Error("disk full"));
-
-    await expect(run()).rejects.toThrow("Usage test could not stage its command on Windows machine: disk full");
-    expect(bb.sdk.terminals.create).not.toHaveBeenCalled();
+  it("passes other host worker failures through", async () => {
+    const call = vi.fn(async () => { throw new Error("host is not connected"); });
+    const bb = { hosts: { experimental_client: () => ({ call }) } } as unknown as BbPluginApi;
+    await expect(run(bb)).rejects.toThrow("host is not connected");
   });
 });
 
@@ -1605,7 +1102,6 @@ describe("OpenCode query", () => {
       bb,
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
-      "/home/user",
       new AbortController().signal,
       async () => { throw new Error("query stalled"); },
     )).resolves.toBeUndefined();
@@ -1620,7 +1116,6 @@ describe("OpenCode query", () => {
       bb,
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
-      "/home/user",
       new AbortController().signal,
       async () => { throw new Error("OpenCode CLI is required to collect OpenCode usage."); },
     )).resolves.toBeUndefined();
@@ -1636,7 +1131,6 @@ describe("OpenCode query", () => {
       bb,
       db as unknown as ReturnType<BbPluginApi["storage"]["database"]>,
       { id: "host-1", name: "Machine" },
-      "/home/user",
       new AbortController().signal,
       async () => "__BB_USAGE_BEGIN__\n[{}]\n__BB_USAGE_END__:0\n__BB_HOST_COMMAND_DONE__:0\n",
     )).resolves.toBeUndefined();
@@ -1833,8 +1327,6 @@ describe("SQLite collector sync (Devin, Kilo Code)", () => {
   it("dispatches a Devin scan through syncAll like the JSON agents", async () => {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown } | undefined;
-    const commandsByTerminalId = new Map<string, string>();
-    const stagedFiles = new Map<string, string>();
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ piSessionRoots: "", primeSessionRoots: "" }) })) },
       storage: {
@@ -1851,34 +1343,24 @@ describe("SQLite collector sync (Devin, Kilo Code)", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
-        files: { write: hostFileWriteMock(stagedFiles) },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const agentId = decodeCollectorInput(commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles))?.agentId;
-            const text = agentId === "devin"
-              ? fakeHostScanOutput("devin", [{
-                day: new Date().toISOString().slice(0, 10),
-                modelProviderId: "devin",
-                model: "swe-2-max",
-                project: "project-a",
-                loggedCostUsd: null,
-                uncachedInputTokens: 150,
-                cachedInputTokens: 60,
-                cacheWriteTokens: 5,
-                outputTokens: 30,
-              }])
-              : fakeHostScanOutput(agentId ?? "codex", []);
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          close: vi.fn(async () => undefined),
-        },
       },
+      hosts: hostWorker((command) => {
+        const agentId = decodeCollectorInput(command)?.agentId;
+        const text = agentId === "devin"
+          ? fakeHostScanOutput("devin", [{
+            day: new Date().toISOString().slice(0, 10),
+            modelProviderId: "devin",
+            model: "swe-2-max",
+            project: "project-a",
+            loggedCostUsd: null,
+            uncachedInputTokens: 150,
+            cachedInputTokens: 60,
+            cacheWriteTokens: 5,
+            outputTokens: 30,
+          }])
+          : fakeHostScanOutput(agentId ?? "codex", []);
+        return text;
+      }),
       realtime: { publish: vi.fn() },
       background: { service: vi.fn() },
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -2001,7 +1483,7 @@ describe("OpenCode Go limits", () => {
     const info = vi.fn();
     const bb = { log: { info, warn: vi.fn(), debug: vi.fn() } } as unknown as BbPluginApi;
 
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
 
     const row = db.prepare("SELECT machine_id, machine_name, plan_label, windows_json FROM opencode_go_limits").get() as {
       machine_id: string; machine_name: string; plan_label: string; windows_json: string;
@@ -2028,7 +1510,7 @@ describe("OpenCode Go limits", () => {
       "",
     ].join("\n");
 
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => output);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => output);
 
     expect(loadStoredOpenCodeGoLimits(db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, new Set(["host-1"])))
       .toEqual([expect.objectContaining({ accountIdentity: "a".repeat(64) })]);
@@ -2038,9 +1520,9 @@ describe("OpenCode Go limits", () => {
     const db = goLimitsDb();
     const warn = vi.fn();
     const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
 
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => {
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
       throw new Error("Usage: OpenCode Go limits timed out after 60 seconds.");
     });
 
@@ -2058,13 +1540,13 @@ describe("OpenCode Go limits", () => {
     const db = goLimitsDb();
     const warn = vi.fn();
     const bb = { log: { info: vi.fn(), warn, debug: vi.fn() } } as unknown as BbPluginApi;
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
 
     for (const diagnostic of [
       "collector failed near no-opencode-go-credential handling",
       "no-opencode-go-plan response was malformed",
     ]) {
-      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
         throw new Error(diagnostic);
       });
     }
@@ -2078,10 +1560,10 @@ describe("OpenCode Go limits", () => {
     const db = goLimitsDb();
     const debug = vi.fn();
     const bb = { log: { info: vi.fn(), warn: vi.fn(), debug } } as unknown as BbPluginApi;
-    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => markedOutput);
+    await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => markedOutput);
 
     for (const diagnostic of ["no-opencode-go-credential", "no-opencode-go-plan"]) {
-      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, "/home/user", new AbortController().signal, async () => {
+      await syncOpenCodeGo(bb, db as unknown as ReturnType<BbPluginApi["storage"]["database"]>, { id: "host-1", name: "Machine" }, new AbortController().signal, async () => {
         throw new Error(diagnostic);
       });
     }
@@ -2146,12 +1628,12 @@ describe("Grok limit snapshots", () => {
       const bb = { log: { warn } } as unknown as BbPluginApi;
       const machine = { id: "host-grok", name: "Grok machine" };
       const connected = new Set([machine.id]);
-      await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => { throw new Error("Node.js is required"); });
+      await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => { throw new Error("Node.js is required"); });
       expect(loadStoredGrokLimits(db, connected)).toEqual([]);
       expect(db.prepare("SELECT error FROM grok_limits").get()).toEqual({ error: "Node.js is required" });
       expect(warn).toHaveBeenCalled();
       const snapshot = { accountIdentity: "a".repeat(64), windows: [{ label: "Weekly credits", usedPercent: 0, resetsAt: null }] };
-      await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
+      await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
       expect(loadStoredGrokLimits(db, connected)).toEqual([expect.objectContaining({ status: "ok", error: null, windows: snapshot.windows })]);
     } finally { db.close(); }
   });
@@ -2162,12 +1644,12 @@ describe("Grok limit snapshots", () => {
     const bb = { log: { warn: vi.fn() } } as unknown as BbPluginApi;
     const machine = { id: "host-grok", name: "Grok machine" };
     const snapshot = { accountIdentity: "a".repeat(64), windows: [{ label: "Weekly credits", usedPercent: 40, resetsAt: null }] };
-    await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
+    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => `__BB_USAGE_BEGIN__\n${JSON.stringify(snapshot)}\n__BB_USAGE_END__:0`);
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([expect.objectContaining({ status: "ok", windows: snapshot.windows, accountIdentity: snapshot.accountIdentity })]);
-    await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => { throw new Error("Request failed"); });
+    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => { throw new Error("Request failed"); });
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([expect.objectContaining({ status: "error", windows: snapshot.windows, error: "Request failed" })]);
     expect(loadStoredGrokLimits(db, new Set())).toEqual([]);
-    await syncGrokLimits(bb, db, machine, "/home/user", AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
+    await syncGrokLimits(bb, db, machine, AbortSignal.timeout(1000), async () => "__BB_USAGE_ERROR__:no-grok-credential");
     expect(loadStoredGrokLimits(db, new Set([machine.id]))).toEqual([]);
     db.close();
   });
@@ -2375,7 +1857,7 @@ describe("retained usage through the real sync path", () => {
   function fakeHostScanOutputWith(agentId: string, rows: Array<Record<string, unknown>>, failureCount: number) {
     const scan = { agentId, fileCount: 1, changedFileCount: 1, reusedFileCount: 0, failureCount, error: null, rows };
     const encoded = gzipSync(Buffer.from(JSON.stringify(scan))).toString("base64");
-    return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n__BB_HOST_COMMAND_DONE__:0\n`;
+    return `${SCAN_BEGIN}\n${encoded}\n${SCAN_END}\n`;
   }
 
   // Drives the unmodified plugin factory end-to-end through its public sync()
@@ -2384,8 +1866,6 @@ describe("retained usage through the real sync path", () => {
   async function bootHarness(state: { rows: Array<Record<string, unknown>>; failureCount: number; codexHomes?: string }, targetAgent = "pi") {
     const db = new Database(":memory:");
     let handlers: { sync: () => unknown; dashboard: () => Promise<{ sync: { running: boolean } }> } | undefined;
-    const commandsByTerminalId = new Map<string, string>();
-    const stagedFiles = new Map<string, string>();
     const bb = {
       settings: { define: vi.fn(() => ({ get: async () => ({ codexHomes: state.codexHomes ?? "", piSessionRoots: "", primeSessionRoots: "" }) })) },
       storage: {
@@ -2402,25 +1882,14 @@ describe("retained usage through the real sync path", () => {
           list: vi.fn(async () => [{ id: "host-1", name: "Machine", status: "connected" }]),
           directory: vi.fn(async () => ({ directory: "/home/user" })),
         },
-        files: { write: hostFileWriteMock(stagedFiles) },
-        terminals: {
-          create: vi.fn(async (input: { start: { command: string } }) => {
-            const id = `terminal-${commandsByTerminalId.size}`;
-            commandsByTerminalId.set(id, input.start.command);
-            return { id, status: "starting" };
-          }),
-          get: vi.fn(async (args: { terminalId: string }) => ({ id: args.terminalId, status: "running" })),
-          output: vi.fn(async (args: { terminalId: string }) => {
-            const command = commandTextFor(commandsByTerminalId.get(args.terminalId) ?? "", stagedFiles);
-            const agentId = agentIdFromCommand(command);
-            const text = agentId === targetAgent
-              ? fakeHostScanOutputWith(targetAgent, state.rows, state.failureCount)
-              : fakeHostScanOutput(agentId ?? "codex", []);
-            return { chunks: [{ seq: 1, dataBase64: Buffer.from(text).toString("base64") }], truncated: false };
-          }),
-          close: vi.fn(async () => undefined),
-        },
       },
+      hosts: hostWorker((command) => {
+        const agentId = agentIdFromCommand(command);
+        const text = agentId === targetAgent
+          ? fakeHostScanOutputWith(targetAgent, state.rows, state.failureCount)
+          : fakeHostScanOutput(agentId ?? "codex", []);
+        return text;
+      }),
       realtime: { publish: vi.fn() },
       background: { service: vi.fn() },
       log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
