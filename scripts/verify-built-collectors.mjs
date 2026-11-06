@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { registerHooks } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -18,7 +18,7 @@ const hooks = registerHooks({
     return nextResolve(specifier, context);
   },
 });
-const { jsonAgentCommand, devinCommand, kilocodeCommand, syncGrokLimits, loadCodexResetCredits } = await import("../dist/server.js");
+const { ampUsageCommand, jsonAgentCommand, devinCommand, kilocodeCommand, syncGrokLimits, loadCodexResetCredits } = await import("../dist/server.js");
 hooks.deregister();
 
 function temporaryHome(t) {
@@ -74,6 +74,25 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
     availableCount: 1, credits: [{ expiresAt: new Date(1800000000000).toISOString() }],
   });
   assert.doesNotMatch(JSON.stringify(result), /private-id/);
+});
+
+function ampScan(output) {
+  const encoded = output.match(/__BB_AMP_USAGE_SCAN_BEGIN__\s+([A-Za-z0-9+/=]+)\s+__BB_AMP_USAGE_SCAN_END__/)?.[1];
+  assert.ok(encoded, `Missing Amp scan result: ${output}`);
+  return JSON.parse(gunzipSync(Buffer.from(encoded, "base64")));
+}
+
+test("production Amp command executes without bundled helper references", (t) => {
+  const home = temporaryHome(t);
+  const bin = join(home, "bin");
+  mkdirSync(bin);
+  const amp = join(bin, "amp");
+  writeFileSync(amp, "#!/bin/sh\nprintf '[]\\n'\n");
+  chmodSync(amp, 0o755);
+  const result = ampScan(run(ampUsageCommand(home), home, { PATH: `${bin}:${process.env.PATH}` }));
+  assert.equal(result.agentId, "amp");
+  assert.equal(result.failureCount, 0);
+  assert.deepEqual(result.threads, []);
 });
 
 test("production JSON commands scan logs and reuse the metadata cache", (t) => {
