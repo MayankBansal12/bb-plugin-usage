@@ -113,6 +113,70 @@ describe("proxy provider fallback", () => {
     expect(resolvePricing("openai", "gpt-5.6-sol-high")).toMatchObject({ modelProviderId: "openai", price: null, status: "unknown" });
   });
 
+  it("uses canonical prices when a supported route adds only a transport suffix", () => {
+    setPricingCatalog({
+      ...proxyFixture,
+      zai: catalogProvider({ "glm-5.3-flash": { input: 0.075, output: 0.25 } }, "Z.ai"),
+      moonshotai: catalogProvider({ "kimi-k3": { input: 3, output: 15 } }, "Moonshot AI"),
+      "ollama-cloud": { name: "Ollama Cloud", models: {
+        "deepseek-v4-flash:0731": { id: "deepseek-v4-flash:0731" },
+      } },
+      deepseek: catalogProvider({
+        "deepseek-v4-flash": { input: 0.14, output: 0.28 },
+      }, "DeepSeek"),
+    }, "test");
+
+    expect(resolvePricing("codebuddy", "glm-5.3-flash-ioa")).toMatchObject({ modelProviderId: "zai", modelProviderName: "Z.ai", status: "models-dev-alias", price: { input: 0.075, output: 0.25 } });
+    expect(resolvePricing("codebuddy", "kimi-k3-ioa")).toMatchObject({ modelProviderId: "moonshotai", modelProviderName: "Moonshot AI", status: "models-dev-alias", price: { input: 3, output: 15 } });
+    expect(resolvePricing("ollama-cloud", "deepseek-v4-flash:0731-cloud")).toMatchObject({ modelProviderId: "deepseek", status: "models-dev-alias", price: { input: 0.14, output: 0.28 } });
+  });
+
+  it("does not infer another vendor for an undecorated routed-provider model", () => {
+    setPricingCatalog({
+      moonshotai: catalogProvider({ "kimi-k3": { input: 3, output: 15 } }, "Moonshot AI"),
+      "ollama-cloud": { name: "Ollama Cloud", models: { "kimi-k3": { id: "kimi-k3" } } },
+    }, "test");
+
+    expect(resolvePricing("ollama-cloud", "kimi-k3")).toMatchObject({ modelProviderId: "ollama-cloud", status: "unknown", price: null });
+  });
+
+  it("does not choose between ambiguous first-party vendors", () => {
+    setPricingCatalog({
+      codebuddy: { name: "CodeBuddy", models: { "glm-5.1-ioa": { id: "glm-5.1-ioa" } } },
+      zai: catalogProvider({ "glm-5.1": { input: 1, output: 2 } }, "Z.ai"),
+      zhipuai: catalogProvider({ "glm-5.1": { input: 3, output: 4 } }, "Zhipu AI"),
+    }, "test");
+
+    expect(resolvePricing("codebuddy", "glm-5.1-ioa")).toMatchObject({ modelProviderId: "codebuddy", status: "unknown", price: null });
+  });
+
+  it("stays unpriced when builtin and catalog vendors disagree", () => {
+    setPricingCatalog({
+      codebuddy: { name: "CodeBuddy", models: { "deepseek-v4.1-flash-ioa": { id: "deepseek-v4.1-flash-ioa" } } },
+      zai: catalogProvider({ "deepseek-v4.1-flash": { input: 1, output: 2 } }, "Z.ai"),
+    }, "test");
+
+    // builtinPrices already carries a DeepSeek rate for this model, so the
+    // first-party pass is ambiguous; the catalog pass must not crown Z.ai.
+    expect(resolvePricing("codebuddy", "deepseek-v4.1-flash-ioa")).toMatchObject({ modelProviderId: "codebuddy", status: "unknown", price: null });
+  });
+
+  it("does not use a builtin vendor rate for an undecorated routed-provider model", () => {
+    setPricingCatalog({
+      "ollama-cloud": { name: "Ollama Cloud", models: { "deepseek-v4.1-flash": { id: "deepseek-v4.1-flash" } } },
+    }, "test");
+
+    expect(resolvePricing("ollama-cloud", "deepseek-v4.1-flash")).toMatchObject({ modelProviderId: "ollama-cloud", status: "unknown", price: null });
+  });
+
+  it("returns a fresh copy of builtin prices", () => {
+    setPricingCatalog({}, "test");
+    const first = priceFor("deepseek", "deepseek-v4.1-flash")!;
+    first.input = 99;
+
+    expect(priceFor("deepseek", "deepseek-v4.1-flash")).toEqual({ input: 0.15, cached: 0.003, cacheWrite: 0.15, output: 0.6 });
+  });
+
   it("leaves models missing from the catalog unpriced", () => {
     setPricingCatalog(proxyFixture, "test");
     for (const model of ["swe-2-max", "codex-auto-review"]) {
