@@ -64,6 +64,22 @@ describe.skipIf(process.platform === "win32")("host shell runner", () => {
     expect(readdirSync(dir)).toEqual([]);
   });
 
+  it("finishes when the shell exits with a helper still holding its output pipes", async () => {
+    const dir = tempDir();
+    const pidFile = join(dir, "child.pid");
+    // Bound a broken runner so the helper is still killed if this regresses.
+    const signal = AbortSignal.timeout(2_000);
+    await expect(runShellCommand(`sleep 30 & printf '%s' "$!" > '${pidFile}'; printf 'collected\\n'; exit 3`, {
+      tempDir: dir,
+      signal,
+    })).resolves.toEqual({ status: "exited", exitCode: 3, output: "collected\n" });
+    expect(signal.aborted).toBe(false);
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    expect(pid).toBeGreaterThan(0);
+    await expect.poll(() => isRunning(pid)).toBe(false);
+    expect(readdirSync(dir)).toEqual(["child.pid"]);
+  });
+
   it("kills the whole process tree when the call is cancelled", async () => {
     const dir = tempDir();
     const pidFile = join(dir, "child.pid");

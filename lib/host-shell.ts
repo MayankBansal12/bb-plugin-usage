@@ -101,9 +101,12 @@ export async function runShellCommand(command: string, options: HostShellOptions
       child.stdout?.on("data", collect);
       child.stderr?.on("data", collect);
       child.once("error", (error) => settle(error));
-      child.once("close", (code, signal) => {
-        // A collector may leave helpers behind in its process group.
+      child.once("exit", () => {
+        // Helpers can keep the output pipes open after the shell exits, so
+        // terminate them before waiting for close to drain the remaining data.
         if (!windows) stopProcessTree(child.pid, false);
+      });
+      child.once("close", (code, signal) => {
         settle({
           status: "exited",
           exitCode: code ?? 128 + (signal ? constants.signals[signal] : 0),
