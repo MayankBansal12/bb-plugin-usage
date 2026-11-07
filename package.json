@@ -1,6 +1,6 @@
 {
   "name": "bb-plugin-usage",
-  "version": "0.3.28",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "build": "npm run generate:collectors && bb plugin build",
