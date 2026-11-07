@@ -63,6 +63,9 @@ export async function runShellCommand(command: string, options: HostShellOptions
   const scriptPath = join(options.tempDir, `${randomUUID()}.sh`);
   await writeFile(scriptPath, script, { mode: 0o600 });
   try {
+    // Cancellation may have arrived during the write, before we can listen.
+    // Keep this check inside the try so the staged script is still removed.
+    options.signal.throwIfAborted();
     return await new Promise<HostShellResult>((resolve, reject) => {
       const child = experimental_spawnHostProcess(shell, [windows ? scriptPath.replace(/\\/g, "/") : scriptPath], {
         env: { ...process.env },

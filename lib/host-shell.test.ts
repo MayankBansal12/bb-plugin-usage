@@ -49,6 +49,21 @@ describe.skipIf(process.platform === "win32")("host shell runner", () => {
     })).resolves.toEqual({ status: "output-limit" });
   });
 
+  it("does not start a collector cancelled while its script is being written", async () => {
+    const dir = tempDir();
+    const controller = new AbortController();
+    const reason = new Error("sync cancelled during script staging");
+    const run = runShellCommand(`printf started > '${join(dir, "started")}'`, {
+      tempDir: dir,
+      signal: controller.signal,
+    });
+    // On POSIX, the first await is the script write. Cancel before it resumes.
+    controller.abort(reason);
+    await expect(run).rejects.toBe(reason);
+    // Neither the collector's marker nor its temporary script should remain.
+    expect(readdirSync(dir)).toEqual([]);
+  });
+
   it("kills the whole process tree when the call is cancelled", async () => {
     const dir = tempDir();
     const pidFile = join(dir, "child.pid");
