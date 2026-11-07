@@ -1,4 +1,4 @@
-import type { BbPluginApi } from "@bb/plugin-sdk";
+import type { BbPluginApi } from "@get-bb/plugin-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { accountPoolLimits, createAccountPoolLimitsLoader, mergeAccountPoolLimits, poolAccountsSchema } from "./account-pool-limits";
 import { groupProviderLimits, isLimitVisibleOnMachine } from "./provider-limits";
