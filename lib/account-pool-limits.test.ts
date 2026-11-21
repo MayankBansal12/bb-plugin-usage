@@ -81,6 +81,25 @@ describe("Account Pooler limits", () => {
     ]);
   });
 
+  it("accepts bb 0.50 accounts without legacy Claude summary fields", () => {
+    const {
+      fiveHourUtilization: _a, fiveHourResetAt: _b, sevenDayUtilization: _c, sevenDayResetAt: _d, ...modern
+    } = account({
+      provider: "claude", subscriptionType: "max",
+      familyWeekly: { fable: { utilization: 0.04, resetAt }, opus: null },
+      limitWindows: [
+        { slot: "primary", windowMinutes: 300, utilization: 0.71, resetAt, status: "allowed" },
+        { slot: "secondary", windowMinutes: 10080, utilization: 0.43, resetAt, status: "allowed" },
+      ],
+    });
+    const parsed = poolAccountsSchema.parse([{ ...modern, priority: 1, accountUuid: "u", inFlight: 0 }]);
+    const [limit] = accountPoolLimits(parsed);
+    expect(limit?.windows.map(({ label, usedPercent }) => ({ label, usedPercent: Math.round(usedPercent) }))).toEqual([
+      { label: "5 hours", usedPercent: 71 }, { label: "Weekly", usedPercent: 43 },
+      { label: "Weekly (Fable)", usedPercent: 4 },
+    ]);
+  });
+
   it("retains disabled, exhausted, errored, API key, and unobserved accounts", () => {
     const limits = accountPoolLimits([
       account({ id: "disabled", enabled: false }),
