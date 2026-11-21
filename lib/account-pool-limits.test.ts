@@ -100,6 +100,23 @@ describe("Account Pooler limits", () => {
     ]);
   });
 
+  it("merges a local model-family window into the pooled family quota", () => {
+    const pooled = accountPoolLimits([account({
+      provider: "claude", email: "user@example.com",
+      familyWeekly: { fable: { utilization: 0.04, resetAt } },
+      limitWindows: [{ slot: "secondary", windowMinutes: 10080, utilization: 0.03, resetAt, status: "allowed" }],
+    })]);
+    const local = groupProviderLimits([{
+      machineId: "laptop", machineName: "Laptop", agentId: "claude-code", agentName: "Claude Code",
+      providerId: "claude", providerName: "Claude Code", accountEmail: "user@example.com", accountIdentity: null,
+      planLabel: "Ultra", windows: [{ label: "Fable", usedPercent: 4, resetsAt: null }],
+      status: "ok", error: null, lastUpdatedAt: null,
+    }]);
+    const [merged] = mergeAccountPoolLimits(local, pooled);
+    const labels = merged?.windows.map((window) => window.label) ?? [];
+    expect(labels.filter((label) => /fable/i.test(label))).toEqual(["Weekly (Fable)"]);
+  });
+
   it("retains disabled, exhausted, errored, API key, and unobserved accounts", () => {
     const limits = accountPoolLimits([
       account({ id: "disabled", enabled: false }),

@@ -110,7 +110,11 @@ function localWindowsForPool(local: UnifiedProviderLimit, pool: UnifiedProviderL
   // BB's local provider bridges use these labels for the same quota windows.
   const aliases: Record<string, string> = { "weekly limit": "Weekly", "current session": "5 hours" };
   return local.windows.map((window) => {
-    const label = aliases[window.label.trim().toLowerCase()];
+    const key = window.label.trim().toLowerCase();
+    // Model-family weekly quotas arrive locally as "Fable" or "Weekly · fable".
+    const family = key.replace(/^weekly\s*[·:-]\s*/, "");
+    const label = aliases[key] ?? (/^[a-z]+$/.test(family)
+      ? `Weekly (${family.charAt(0).toUpperCase()}${family.slice(1)})` : undefined);
     return label && pool.windows.some((candidate) => candidate.label === label)
       ? { ...window, label }
       : window;
