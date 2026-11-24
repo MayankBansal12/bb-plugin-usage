@@ -18,10 +18,12 @@ export const poolAccountsSchema = z.array(z.object({
   status: z.string(),
   error: z.string().nullable(),
   observedAt: z.number().nullable(),
-  fiveHourUtilization: z.number().nullable(),
-  fiveHourResetAt: z.number().nullable(),
-  sevenDayUtilization: z.number().nullable(),
-  sevenDayResetAt: z.number().nullable(),
+  // Account Pooler in bb 0.50 dropped these legacy summary fields in favour
+  // of limitWindows; accept their absence so the whole list still validates.
+  fiveHourUtilization: z.number().nullable().optional(),
+  fiveHourResetAt: z.number().nullable().optional(),
+  sevenDayUtilization: z.number().nullable().optional(),
+  sevenDayResetAt: z.number().nullable().optional(),
   familyWeekly: z.record(z.string(), quotaSchema.nullable()),
   limitWindows: z.array(quotaSchema.extend({
     slot: z.string(),
@@ -46,19 +48,25 @@ function windowLabel(minutes: number | null, slot: string) {
 
 function accountWindows(account: PoolAccount) {
   const windows: ProviderLimitWindow[] = [];
-  const add = (label: string, utilization: number | null, resetAt: number | null) => {
-    if (utilization === null) return;
-    windows.push({ label, usedPercent: utilization * 100, resetsAt: timestamp(resetAt) });
+  const add = (label: string, utilization: number | null | undefined, resetAt: number | null | undefined) => {
+    if (utilization === null || utilization === undefined) return;
+    windows.push({ label, usedPercent: utilization * 100, resetsAt: timestamp(resetAt ?? null) });
   };
-  if (account.provider === "codex") {
+  // bb 0.50+ reports Claude's 5-hour and weekly quotas only through
+  // limitWindows (300 and 10080 minutes), like Codex.
+  const legacyClaude = account.provider !== "codex"
+    && (account.fiveHourUtilization !== undefined || account.sevenDayUtilization !== undefined);
+  if (legacyClaude) {
+    add("5 hours", account.fiveHourUtilization, account.fiveHourResetAt);
+    add("Weekly", account.sevenDayUtilization, account.sevenDayResetAt);
+  } else {
     for (const window of account.limitWindows) {
       if (window.windowMinutes === null && window.utilization === 0
         && !timestamp(window.resetAt) && window.status === null) continue;
       add(windowLabel(window.windowMinutes, window.slot), window.utilization, window.resetAt);
     }
-  } else {
-    add("5 hours", account.fiveHourUtilization, account.fiveHourResetAt);
-    add("Weekly", account.sevenDayUtilization, account.sevenDayResetAt);
+  }
+  if (account.provider !== "codex") {
     for (const [family, quota] of Object.entries(account.familyWeekly)) {
       if (quota) add(`Weekly (${family.charAt(0).toUpperCase()}${family.slice(1)})`, quota.utilization, quota.resetAt);
     }
@@ -102,7 +110,11 @@ function localWindowsForPool(local: UnifiedProviderLimit, pool: UnifiedProviderL
   // BB's local provider bridges use these labels for the same quota windows.
   const aliases: Record<string, string> = { "weekly limit": "Weekly", "current session": "5 hours" };
   return local.windows.map((window) => {
-    const label = aliases[window.label.trim().toLowerCase()];
+    const key = window.label.trim().toLowerCase();
+    // Model-family weekly quotas arrive locally as "Fable" or "Weekly · fable".
+    const family = key.replace(/^weekly\s*[·:-]\s*/, "");
+    const label = aliases[key] ?? (/^[a-z]+$/.test(family)
+      ? `Weekly (${family.charAt(0).toUpperCase()}${family.slice(1)})` : undefined);
     return label && pool.windows.some((candidate) => candidate.label === label)
       ? { ...window, label }
       : window;
